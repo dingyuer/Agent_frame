@@ -66,6 +66,12 @@ actions:
     kind: env
     resolve: none
 
+  download:
+    params: [url]
+    description: "下载指定完整 URL 的文件到任务下载目录，返回文件路径及大小。普通点击 PDF 链接只打开页面，不代替下载。下载后由系统核验全部任务条件"
+    kind: env
+    resolve: none
+
   select:
     params: [target, option]
     description: "在下拉框里选一项（target=下拉框描述，option=要选的选项文字）。优先用 DOM 定位：加可选参数 element_id（HTML id）或 target_ref（完整 ref）直接引用，走 DOM 确定性定位；都找不到时用英文 target 走视觉定位"
@@ -111,6 +117,42 @@ actions:
   get_page_source:
     params: []
     description: "按需读取当前浏览器页面的精简 DOM（脚本/样式/隐藏字段已剔除），可加可选参数 target_ref 只读该节点。只在 AX 信息不足时使用"
+    kind: browser
+    resolve: none
+
+  handle_dialog:
+    params: [accept]
+    description: "处理观察中报告的 JavaScript 对话框，accept 为 true/false；prompt 可加 prompt_text，多弹窗时指定 dialog_id"
+    kind: browser
+    resolve: none
+
+  list_tabs:
+    params: []
+    description: "列出当前任务浏览器的标签页及 tab_id，新弹窗不会自动接管当前任务页"
+    kind: browser
+    resolve: none
+
+  switch_tab:
+    params: [tab_id]
+    description: "切换到观察中已存在的 tab_id 标签页"
+    kind: browser
+    resolve: none
+
+  close_tab:
+    params: []
+    description: "关闭当前标签页并回到其父页，可选 tab_id 关闭指定任务标签页"
+    kind: browser
+    resolve: none
+
+  observe_desktop:
+    params: []
+    description: "切到桌面截图和桌面操作面，用于浏览器工具栏、权限气泡或系统文件对话框"
+    kind: browser
+    resolve: none
+
+  observe_browser:
+    params: []
+    description: "切回网页截图、AX 树和页面坐标操作面"
     kind: browser
     resolve: none
 

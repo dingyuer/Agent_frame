@@ -113,12 +113,29 @@ def _foreground_linux_mac() -> bool:
 # --------------------------------------------------------------------------- #
 # CDP 探测 + 抓取
 # --------------------------------------------------------------------------- #
+def _cdp_json(host: str, port: int, path: str, timeout: float = 4.0):
+    """CDP is a direct local/LAN control channel, independent of web proxy settings."""
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.get(f"http://{host}:{port}{path}", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+
+def cdp_websocket_endpoint(host: str, port: int = 9222, timeout: float = 4.0) -> str:
+    """Resolve the CDP WebSocket without making the Node driver use HTTP proxies."""
+    endpoint = _cdp_json(host, port, "/json/version/", timeout).get("webSocketDebuggerUrl", "")
+    if not isinstance(endpoint, str) or not endpoint.startswith(("ws://", "wss://")):
+        raise ValueError("CDP discovery did not provide a WebSocket debugger URL")
+    return endpoint
+
+
 def list_cdp_pages(host: str, port: int = 9222, timeout: float = 4.0) -> List[dict]:
     """CDP /json 端点返回打开的页面列表。失败返回 []。"""
     try:
-        r = requests.get(f"http://{host}:{port}/json", timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
+        result = _cdp_json(host, port, "/json", timeout)
+        if isinstance(result, list):
+            return [page for page in result if isinstance(page, dict)]
     except Exception:  # noqa: BLE001
         pass
     return []
@@ -138,12 +155,16 @@ def _current_page(pages: List[dict]) -> Optional[dict]:
 def _connect_browser(host: str, port: int):
     """用 playwright connect_over_cdp 连接浏览器。返回 (playwright, browser) 或抛异常。"""
     from playwright.sync_api import sync_playwright
+    endpoint = cdp_websocket_endpoint(host, port)
     p = sync_playwright().start()
     try:
-        browser = p.chromium.connect_over_cdp(f"http://{host}:{port}")
+        browser = p.chromium.connect_over_cdp(endpoint, timeout=4000)
         return p, browser
     except Exception:
-        p.stop()
+        try:
+            p.stop()
+        except Exception:
+            pass
         raise
 
 

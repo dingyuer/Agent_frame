@@ -26,7 +26,7 @@ from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa:
 from osworld_agent.adapters.task_loader import load_task_config  # noqa: E402
 from osworld_agent.viz.logging import (  # noqa: E402
     LoggingChatModel, LoggingGrounding, log_status, set_results_dir,
-    get_collected, reset_collected,
+    get_collected, reset_collected, flush_logs,
 )
 
 
@@ -101,7 +101,10 @@ def main() -> None:
 
     # 5) 组装 + 跑
     agent = Agent(decision_model=model, grounding=grounding, env=env,
-                  max_steps=args.max_steps, enable_reflection=False)
+                  max_steps=args.max_steps, enable_reflection=False,
+                  completion_spec=task_config.get("completion"),
+                  private_completion_spec=task_config.get("private_completion"),
+                  event_path=os.path.join(results_dir, "events.jsonl"))
 
     log_status({
         "event": "task_start", "instruction": instruction, "example_id": example_id,
@@ -156,6 +159,7 @@ def main() -> None:
         "result": result.score, "steps": result.steps, "success": result.success,
     })
     print(f"done: score={result.score} steps={result.steps} answer={result.final_answer!r}")
+    flush_logs(timeout=1.0)
 
 
 if __name__ == "__main__":

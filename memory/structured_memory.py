@@ -49,8 +49,7 @@ class StructuredMemory:
     def apply_state_update(self, patch: Dict[str, Any]) -> None:
         if not patch:
             return
-        if patch.get("goal"):
-            self.task_state["goal"] = patch["goal"]
+        # The original task is framework-owned and cannot be overwritten by the model.
         if patch.get("current_subgoal") is not None:
             self.task_state["current_subgoal"] = patch["current_subgoal"]
         for item in patch.get("completed_add") or []:
@@ -94,18 +93,18 @@ class StructuredMemory:
         self.action_history.append(line)
 
     # ---- 渲染给模型 ----
-    def to_text(self) -> str:
+    def to_text(self, include_plan: bool = True) -> str:
         ts = self.task_state
         lines = [
             "## 任务状态(task_state)",
             f"- 目标 goal: {ts['goal'] or '（未填）'}",
             f"- 当前子目标 current_subgoal: {ts['current_subgoal'] or '（未填）'}",
-            f"- 已完成 completed: {ts['completed'] if ts['completed'] else '[]'}",
+            f"- 模型报告进展（非系统验收）completed: {ts['completed'] if ts['completed'] else '[]'}",
             f"- 待办 pending: {ts['pending'] if ts['pending'] else '[]'}",
             "",
         ]
         # 任务计划段（planner 阶段0产出）
-        if self.plan:
+        if self.plan and include_plan:
             lines.append("## 任务计划(plan)")
             for s in (self.plan.get("steps") or []):
                 idx = s.get("idx", "?")
@@ -113,6 +112,8 @@ class StructuredMemory:
                 status = s.get("status", "pending")
                 mark = {"pending": "待办", "doing": "进行中", "done": "已完成"}.get(status, status)
                 lines.append(f"- [{mark}] {idx}. {goal}")
+                if s.get("expected_evidence"):
+                    lines.append(f"  预期证据: {s['expected_evidence']}")
             if self.plan.get("keywords"):
                 lines.append(f"- 搜索关键词 keywords: {self.plan.get('keywords')}")
             if self.plan.get("final_check"):

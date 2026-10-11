@@ -21,7 +21,9 @@ class Agent:
     def __init__(self, decision_model: ChatModel, grounding: Grounding,
                  env: Environment, max_steps: int = 20, max_retries: int = 5,
                  enable_reflection: bool = True, early_stop_repeat: int = 3,
-                 code_agent_budget: int = 20, step_callback=None):
+                 code_agent_budget: int = 20, step_callback=None,
+                 completion_spec=None, context_config=None, private_completion_spec=None,
+                 planner_model=None, event_path=None, run_manifest=None, max_replans=1):
         self.model = decision_model
         self.grounding = grounding
         self.env = env
@@ -29,25 +31,43 @@ class Agent:
         self.max_retries = max_retries
         self.enable_reflection = enable_reflection
         self.early_stop_repeat = early_stop_repeat
+        self.max_replans = max_replans
         self.step_callback = step_callback
+        self.completion_spec = completion_spec
+        self.context_config = context_config
+        self.private_completion_spec = private_completion_spec
+        self.planner_model = planner_model or decision_model
+        self.event_path = event_path
+        self.run_manifest = run_manifest
         self.os_name = getattr(env, "os_name", "linux")
         # 浏览器专用环境（WindowsEnvironment）用精简提示词：去掉表格/子Agent/技能，强化 DOM 定位
         self.browser_only = bool(getattr(env, "browser_only", False))
         self.system_prompt = build_system_prompt(os_name=self.os_name, browser_only=self.browser_only)
         self.code_agent = CodeAgent(self.model, self.env, budget=code_agent_budget)
 
-    def run(self, task: str) -> AgentResult:
+    def run(self, task: str, completion_spec=None, *, private_completion_spec=None,
+            max_steps=None, event_path=None, run_id=None) -> AgentResult:
         """执行一个任务，返回结果。主循环在 pipeline.Pipeline 里。"""
+        budget = self.max_steps if max_steps is None else max_steps
+        if type(budget) is not int or budget < 1:
+            raise ValueError("max_steps must be a positive integer")
         pipeline = Pipeline(
             model=self.model,
             grounding=self.grounding,
             env=self.env,
             system_prompt=self.system_prompt,
             code_agent=self.code_agent,
-            max_steps=self.max_steps,
+            max_steps=budget,
             max_retries=self.max_retries,
             enable_reflection=self.enable_reflection,
             early_stop_repeat=self.early_stop_repeat,
+            max_replans=self.max_replans,
             step_callback=self.step_callback,
+            completion_spec=self.completion_spec if completion_spec is None else completion_spec,
+            context_config=self.context_config,
+            private_completion_spec=self.private_completion_spec if private_completion_spec is None else private_completion_spec,
+            planner_model=self.planner_model,
+            event_path=self.event_path if event_path is None else event_path,
+            run_id=run_id, run_manifest=self.run_manifest,
         )
         return pipeline.run(task)

@@ -40,6 +40,11 @@ class ModelConfig:
     timeout: float = 180.0
     vision: bool = True              # 是否把截图喂给决策模型（纯文本模型设 false）
     disable_thinking: bool = True    # 关闭 Qwen 思考模式（避免模型生成大段 chain-of-thought 陷入循环）
+    capture_rollout: bool = False    # Request real server token IDs/logprobs; never reconstruct them.
+    policy_revision: str = ""        # Expected immutable behavior revision, checked against server metadata.
+    tokenizer_revision: str = ""
+    processor_revision: str = ""
+    chat_template_revision: str = ""
 
 
 @dataclass
@@ -60,6 +65,7 @@ class AgentConfig:
     max_retries: int = 3
     enable_reflection: bool = True
     early_stop_repeat: int = 3
+    max_replans: int = 1
 
 
 @dataclass
@@ -88,6 +94,7 @@ class ContextConfig:
     auxiliary_tokens: int = 1200
     structure_tokens: int = 5000
     tokenizer_path: str = ""  # 本地 tokenizer；不填则按 UTF-8 字节保守预算
+    require_current_image: bool = True
 
 
 @dataclass
@@ -98,6 +105,10 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    completion: Optional[Dict[str, Any]] = None
+    private_completion: Optional[Dict[str, Any]] = None
+    planner_model: Optional[ModelConfig] = None
+    event_path: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Config":
@@ -108,6 +119,10 @@ class Config:
             agent=AgentConfig(**(data.get("agent") or {})),
             env=EnvConfig(**(data.get("env") or {})),
             context=ContextConfig(**(data.get("context") or {})),
+            completion=data.get("completion"),
+            private_completion=data.get("private_completion"),
+            planner_model=ModelConfig(**data["planner_model"]) if data.get("planner_model") else None,
+            event_path=data.get("event_path"),
         )
 
     @classmethod

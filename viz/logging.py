@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 
 import requests
@@ -20,6 +22,10 @@ _next_log_id = [0]           # 全局 log id 计数器（pending→response 匹�
 _results_dir = None          # 历史截图落盘目录（runner 设置）
 _decisions = []              # 采集决策调用：{step, response, screenshot_file, elapsed}
 _groundings = []             # 采集 grounding 调用：{step, query, coord, elapsed}
+_log_queue = queue.Queue(maxsize=64)
+_log_worker = None
+_log_worker_lock = threading.Lock()
+_dropped_logs = 0
 
 
 def get_collected() -> dict:
@@ -37,14 +43,45 @@ def set_results_dir(path: str) -> None:
     _results_dir = path
 
 
-def _post(payload: dict) -> None:
+def _log_worker_main(pending) -> None:
+    """One bounded background transport; network delays never hold the agent."""
     global _session
-    if _session is None:
-        _session = requests.Session()
+    while True:
+        payload = pending.get()
+        try:
+            if _session is None:
+                _session = requests.Session()
+            _session.post(f"{SERVER_URL}/log", json=payload, timeout=(0.3, 0.7))
+        except Exception:
+            pass
+        finally:
+            pending.task_done()
+
+
+def _post(payload: dict) -> None:
+    global _log_worker, _dropped_logs
+    if _log_worker is None or not _log_worker.is_alive():
+        with _log_worker_lock:
+            if _log_worker is None or not _log_worker.is_alive():
+                _log_worker = threading.Thread(target=_log_worker_main, args=(_log_queue,),
+                                               name="agent-viz-logs", daemon=True)
+                _log_worker.start()
     try:
-        _session.post(f"{SERVER_URL}/log", json=payload, timeout=2)
-    except Exception:
-        pass
+        _log_queue.put_nowait(dict(payload))
+    except queue.Full:
+        _dropped_logs += 1
+
+
+def flush_logs(timeout: float = 1.0) -> bool:
+    """Wait at most timeout seconds; return whether all queued sends were attempted."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _log_queue.all_tasks_done:
+        while _log_queue.unfinished_tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _log_queue.all_tasks_done.wait(remaining)
+    return True
 
 
 def log_status(status: dict) -> None:
@@ -89,6 +126,10 @@ def _classify_mtype(text: str, screenshot) -> str:
     if screenshot:
         return "decision"
     t = text or ""
+    if "你是任务规划器" in t:
+        return "planner"
+    if "## 当前观察" in t and "## 任务" in t:
+        return "decision"
     if "不符合要求" in t or "漏了 next_action" in t or "重新只输出一个合法" in t:
         return "format_retry"
     if "任务完成度核对" in t:
@@ -171,8 +212,12 @@ class LoggingGrounding:
     def __init__(self, inner):
         self.inner = inner
 
+    def __getattr__(self, name):
+        """Expose endpoint capabilities without copying mutable dimensions."""
+        return getattr(self.inner, name)
+
     def locate(self, screenshot, target: str):
-        from osworld_agent.model.decision_model import encode_image
+        from ..model.decision_model import encode_image
         url = encode_image(screenshot)
         b64 = url.split("base64,", 1)[-1] if "base64," in url else None
         log_id = _new_log_id()

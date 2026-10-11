@@ -1,45 +1,586 @@
-"""任务完成验证器（程序侧确定性判断，可逐步扩展）。
+"""Deterministic completion contracts backed by fresh page or local-file evidence.
 
-设计：每个验证器是「触发关键词 → 判断函数」对。判断任务是否完成时，
-根据任务描述匹配关键词，用对应验证器检查执行结果（execution.info）。
-
-当前验证器：
-- 下载验证（download）：download 成功 + verified（文件核实落盘）。
-- 导航验证（navigation）：goto 执行成功（已导航到目标页面）。
-
-后续可扩展：表单填写验证、搜索执行验证、文件编辑验证、页面出现某元素验证……
-新增只需往 _VERIFIERS 里加一条 (关键词列表, 判断函数, 名称) 即可。
+Explicit contracts must come from trusted task configuration, never model output.
+Only complete single navigation/download instructions with an explicit HTTP(S)
+URL, or an unambiguous single-title paper download, are inferred automatically.
+Other tasks remain unknown without a contract. Private checks never enter the
+public specification or public failure report.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+import copy
+import hashlib
+import ipaddress
+import os
+import re
+import stat
+import unicodedata
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+from .task_specs import infer_paper_goal
 
 
-def _check_download(info: Dict[str, Any], task: str) -> bool:
-    """下载验证器：download 成功 + verified（程序核实落盘）。"""
-    return info.get("action") == "download" and bool(info.get("verified"))
+def _url(value):
+    if not isinstance(value, str) or not value or re.search(r"\s|[\\\x00-\x1f\x7f]", value):
+        raise ValueError("url must be an absolute HTTP(S) URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        host = parsed.hostname
+        if parsed.scheme.lower() not in ("http", "https") or not host or parsed.username or parsed.password:
+            raise ValueError
+        host = host.lower()
+        if ":" in host:
+            host = f"[{ipaddress.IPv6Address(host).compressed}]"
+        else:
+            host = host.encode("idna").decode("ascii")
+            label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            if len(host) > 253 or not all(re.fullmatch(label, part) for part in host.rstrip(".").split(".")):
+                raise ValueError
+        if port is not None and (parsed.scheme.lower(), port) not in (("http", 80), ("https", 443)):
+            host += f":{port}"
+        return urlunsplit((parsed.scheme.lower(), host, parsed.path or "/", parsed.query, parsed.fragment))
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise ValueError("url must be an absolute HTTP(S) URL without credentials") from exc
 
 
-def _check_navigation(info: Dict[str, Any], task: str) -> bool:
-    """导航验证器：goto 执行成功即已导航到目标页面。"""
-    return info.get("action") == "goto" and info.get("status") == "executed"
+def _string(value, field, *, empty=False):
+    if not isinstance(value, str) or (not empty and not value.strip()):
+        raise ValueError(f"{field} must be a {'possibly empty ' if empty else 'nonempty '}string")
+    return value
 
 
-# 验证器注册表：[(触发关键词列表, 判断函数, 验证器名)]
-_VERIFIERS = [
-    (["下载", "download"], _check_download, "download"),
-    (["打开", "访问", "导航", "进入", "goto", "open", "navigate"], _check_navigation, "navigation"),
-]
+def _normalize_spec(spec):
+    if not isinstance(spec, dict) or set(spec) != {"checks"} or not isinstance(spec["checks"], list):
+        raise ValueError("completion spec must contain only a checks list")
+    allowed = {
+        "url_equals": {"url"},
+        "element_state": {"url", "role", "name", "element_id", "value", "states"},
+        "text_present": {"url", "text"},
+        "download": {"url", "filename", "sha256", "min_bytes", "bind_to"},
+        "paper_download": {"title", "count", "format", "author", "year", "doi", "arxiv_id", "url", "min_bytes", "sha256", "bind_to"},
+    }
+    checks, ids = [], set()
+    for index, raw in enumerate(spec["checks"]):
+        if not isinstance(raw, dict) or not isinstance(raw.get("kind"), str) or raw["kind"] not in allowed:
+            raise ValueError("unknown or missing completion check kind")
+        kind = raw["kind"]
+        if set(raw) - ({"id", "kind", "scope"} | allowed[kind]):
+            raise ValueError(f"unsupported fields for {kind}")
+        check = copy.deepcopy(raw)
+        check["id"] = _string(check.get("id", f"check_{index + 1}"), "id")
+        if check["id"] in ids:
+            raise ValueError("completion check ids must be unique")
+        ids.add(check["id"])
+        check["scope"] = check.get("scope", "final")
+        if check["scope"] not in ("final", "milestone"):
+            raise ValueError("scope must be final or milestone")
+        if "url" in check:
+            check["url"] = _url(check["url"])
+        elif kind == "url_equals" or (kind == "download" and "bind_to" not in check):
+            raise ValueError(f"{kind} requires url")
+        if kind == "element_state":
+            for field in ("role", "name"):
+                _string(check.get(field), field)
+            if "element_id" in check:
+                _string(check["element_id"], "element_id")
+            if "value" in check:
+                _string(check["value"], "value", empty=True)
+            if "states" in check:
+                states = check["states"]
+                supported = {"checked", "selected", "expanded", "disabled", "focused", "required", "readonly"}
+                if (not isinstance(states, dict) or not states or set(states) - supported
+                        or any(type(v) is not bool and not (k == "checked" and v == "mixed")
+                               for k, v in states.items())):
+                    raise ValueError("states must contain supported boolean AX states (checked may be mixed)")
+            if "value" not in check and "states" not in check:
+                raise ValueError("element_state requires value or states")
+        elif kind == "text_present":
+            _string(check.get("text"), "text")
+        elif kind in ("download", "paper_download"):
+            if "bind_to" in check:
+                _string(check["bind_to"], "bind_to")
+            check["min_bytes"] = check.get("min_bytes", 1)
+            if type(check["min_bytes"]) is not int or check["min_bytes"] < 1:
+                raise ValueError("min_bytes must be a positive integer")
+            if "filename" in check:
+                name = _string(check["filename"], "filename")
+                if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+                    raise ValueError("filename must be a basename")
+            if "sha256" in check:
+                if not isinstance(check["sha256"], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", check["sha256"]):
+                    raise ValueError("sha256 must contain 64 hexadecimal characters")
+                check["sha256"] = check["sha256"].lower()
+            if kind == "paper_download":
+                check["title"] = _string(check.get("title"), "title").strip()
+                if len(check["title"]) > 500 or not any(c.isalnum() for c in check["title"]):
+                    raise ValueError("paper title must contain letters or numbers and be at most 500 characters")
+                check["count"] = check.get("count", 1)
+                if type(check["count"]) is not int or not 1 <= check["count"] <= 20:
+                    raise ValueError("paper count must be an integer between 1 and 20")
+                check["format"] = check.get("format", "pdf")
+                if check["format"] != "pdf":
+                    raise ValueError("paper_download currently supports only pdf")
+                for field in ("author", "doi", "arxiv_id"):
+                    if field in check:
+                        check[field] = _string(check[field], field).strip()
+                if "year" in check and (type(check["year"]) is not int or not 1500 <= check["year"] <= 2999):
+                    raise ValueError("paper year must be an integer between 1500 and 2999")
+                if "doi" in check:
+                    check["doi"] = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", check["doi"], flags=re.I).lower()
+                    if not re.fullmatch(r"10\.\d{4,9}/\S+", check["doi"]):
+                        raise ValueError("doi must be a valid DOI identifier")
+                if "arxiv_id" in check:
+                    check["arxiv_id"] = re.sub(r"^arxiv:\s*", "", check["arxiv_id"], flags=re.I)
+                    if not re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v\d+)?", check["arxiv_id"], re.I):
+                        raise ValueError("arxiv_id must be an arXiv identifier")
+        checks.append(check)
+    return {"checks": checks}
 
 
-def check_completion(task: str, info: Dict[str, Any]) -> str:
-    """根据任务描述 + 执行结果，判断任务是否完成。
+def _infer_spec(task):
+    paper = infer_paper_goal(task)
+    if paper:
+        return _normalize_spec({"checks": [paper]})
+    # Full-string matching deliberately rejects additional goals and implicit URLs.
+    target = r"(?P<url>https?://[A-Za-z0-9:/?#\[\]@!$&'()*+,;=._%~\-]+)"
+    patterns = (
+        ("url_equals", rf"(?:请\s*)?(?:打开|访问|进入|导航到)\s*{target}[。！]?"),
+        ("url_equals", rf"(?:please\s+)?(?:open|visit|navigate\s+to|go\s+to|goto)\s+{target}"),
+        ("download", rf"(?:请\s*)?下载\s*{target}[。！]?"),
+        ("download", rf"(?:please\s+)?download\s+{target}"),
+    )
+    for kind, pattern in patterns:
+        match = re.fullmatch(pattern, task.strip(), re.IGNORECASE)
+        if match:
+            try:
+                return _normalize_spec({"checks": [{"kind": kind, "url": match.group("url")}]})
+            except ValueError:
+                pass
+    return {"checks": []}
 
-    返回命中的验证器名（str），未命中返回空字符串。
+
+def _read_artifact(path):
+    """Read real bytes on every evaluation; do not trust executor verified/bytes."""
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return {"status": "failed", "reason": "download path is not a regular file"}
+        with open(path, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                return {"status": "failed", "reason": "download path is not a regular file"}
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+        current = os.stat(path)
+        signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+        if signature(before) != signature(after) or signature(after) != signature(current):
+            return {"status": "unknown", "reason": "download changed while being verified"}
+        return {"status": "passed", "reason": "local file read successfully", "bytes": after.st_size,
+                "sha256": digest.hexdigest(), "identity": (after.st_dev, after.st_ino)}
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError, ValueError):
+        return {"status": "failed", "reason": "downloaded file does not exist as a regular file"}
+    except OSError:
+        return {"status": "unknown", "reason": "downloaded file cannot be read"}
+
+
+def _title_key(text):
+    # Preserve punctuation and word boundaries: "C++" is not "C", and
+    # "A BC" is not "AB C". Only Unicode, casing and whitespace are normalized.
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _parse_pdf(path, evidence):
+    """Parse downloaded bytes, never filenames or executor/model identity claims."""
+    if evidence.get("bytes", 0) > 100 * 1024 * 1024:
+        return {"status": "unknown", "reason": "PDF exceeds the bounded parser size limit"}
+    try:
+        with open(path, "rb") as handle:
+            if not handle.read(8).startswith(b"%PDF-"):
+                return {"status": "failed", "reason": "downloaded bytes are not a PDF document"}
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return {"status": "unknown", "reason": "PDF verification requires the pypdf dependency"}
+        with open(path, "rb") as handle:
+            reader = PdfReader(handle, strict=True)
+            if reader.is_encrypted:
+                return {"status": "unknown", "reason": "encrypted PDF cannot be verified without access"}
+            page_count = len(reader.pages)
+            if page_count < 1:
+                return {"status": "failed", "reason": "PDF contains no pages"}
+            first_text = reader.pages[0].extract_text() or ""
+        # Parsing can take time: confirm it inspected the same stable artifact.
+        after = _read_artifact(path)
+        if (after.get("status") != "passed" or after.get("sha256") != evidence["sha256"]
+                or after.get("identity") != evidence["identity"]):
+            return {"status": "unknown", "reason": "PDF changed while being parsed"}
+        return {"status": "passed", "pages": page_count, "first_text": first_text[:50000]}
+    except Exception:
+        return {"status": "failed", "reason": "downloaded PDF is malformed or cannot be parsed"}
+
+
+def _paper_identity(check, parsed):
+    if parsed["status"] != "passed":
+        return {"status": parsed["status"], "reason": parsed["reason"]}
+    lines = [line.strip() for line in parsed["first_text"].splitlines() if line.strip()]
+    if not lines:
+        return {"status": "unknown", "reason": "PDF has no extractable first-page text for paper identity"}
+    expected = _title_key(check["title"])
+    heading = None
+    # Exact, complete heading lines near the start of the actual PDF. A title
+    # mentioned in its abstract/references, metadata, or filename is insufficient.
+    for start in range(min(8, len(lines))):
+        if any(re.match(r"^(?:abstract|摘要|references|参考文献)\b", line, re.I) for line in lines[:start + 1]):
+            break
+        joined = ""
+        for end in range(start, min(start + 6, len(lines))):
+            joined = (joined + " " + lines[end]).strip()
+            key = _title_key(joined)
+            if key == expected:
+                heading = {"title": " ".join(lines[start:end + 1]), "line": start + 1}
+                break
+            if len(key) > len(expected):
+                break
+        if heading:
+            break
+    if not heading:
+        return {"status": "unknown", "reason": "requested title is not an exact PDF first-page heading"}
+    # Optional identity qualifiers must be in the paper's first-page heading
+    # area, not in a bibliography or a discussion of somebody else's paper.
+    header = []
+    for line in lines[:20]:
+        if re.match(r"^(?:abstract|摘要|references|参考文献)\b", line, re.I):
+            break
+        header.append(line)
+    text = unicodedata.normalize("NFKC", "\n".join(header))
+    if "author" in check:
+        # Author names need word boundaries; 'Ann' must not match 'Joanne'.
+        author = r"\s+".join(re.escape(p) for p in unicodedata.normalize("NFKC", check["author"]).split())
+        if not re.search(r"(?<!\w)" + author + r"(?!\w)", text, re.I):
+            return {"status": "unknown", "reason": "requested author is not established by PDF first-page text"}
+    if "year" in check and not re.search(r"(?<!\d)" + str(check["year"]) + r"(?!\d)", text):
+        return {"status": "unknown", "reason": "requested publication year is not established by PDF text"}
+    for field in ("doi", "arxiv_id"):
+        if field not in check:
+            continue
+        identifier = check[field]
+        suffix = r"(?:v\d+)?" if field == "arxiv_id" and not re.search(r"v\d+$", identifier) else ""
+        if not re.search(r"(?<![\w./])" + re.escape(identifier) + suffix + r"(?![\w/])", text, re.I):
+            return {"status": "unknown", "reason": f"requested {field} is not established by PDF text"}
+    return {"status": "passed", "reason": "completed PDF has the requested first-page paper identity",
+            "matched_title": heading["title"], "title_line": heading["line"], "pages": parsed["pages"]}
+
+
+class CompletionVerifier:
+    """Evaluate a trusted conjunctive contract against current observations.
+
+    Page checks use browser_ax blocks. ``text_present`` matches a complete AX
+    name/text after whitespace normalization. Element role/name must identify
+    exactly one node; optional element_id disambiguates duplicate names.
+    Page milestones latch; final page checks refresh on every observe(), and
+    downloads always recheck the file even when their scope is milestone.
+    Paper downloads require a completed artifact and an exact first-page PDF
+    heading, plus any explicitly requested identity qualifiers. They never trust
+    a model's title claim, PDF metadata alone, or a filename.
     """
-    task_lower = (task or "").lower()
-    for keywords, check, name in _VERIFIERS:
-        if any(k.lower() in task_lower for k in keywords):
-            if check(info, task):
-                return name
-    return ""
+
+    def __init__(self, task, spec=None, private_spec=None):
+        if not isinstance(task, str):
+            raise ValueError("task must be a string")
+        self._public_spec = _normalize_spec(spec) if spec is not None else _infer_spec(task)
+        if any("bind_to" in c for c in self._public_spec["checks"]):
+            raise ValueError("bind_to is available only for private artifact checks")
+        self._spec = copy.deepcopy(self._public_spec)
+        self._public_ids = {c["id"] for c in self._public_spec["checks"]}
+        public_by_id = {c["id"]: c for c in self._public_spec["checks"]}
+        private = _normalize_spec(private_spec) if private_spec is not None else {"checks": []}
+        ids = set(self._public_ids)
+        for index, check in enumerate(private["checks"]):
+            if "bind_to" in check:
+                target = public_by_id.get(check["bind_to"])
+                if target is None or target["kind"] not in ("download", "paper_download"):
+                    raise ValueError("bind_to must identify an existing public artifact check")
+                expected_count = target.get("count", 1)
+                raw = private_spec["checks"][index]
+                if "count" in raw and raw["count"] != expected_count:
+                    raise ValueError("bound paper count must equal the public goal count")
+                if check["kind"] == "paper_download":
+                    check["count"] = expected_count
+            # Private IDs are internal too: even a descriptive ID may leak an answer.
+            cid = f"private_check_{index + 1}"
+            while cid in ids:
+                cid = "_" + cid
+            check["id"] = cid
+            ids.add(cid)
+            self._spec["checks"].append(check)
+        self.source = "explicit" if spec is not None or private_spec is not None else ("task" if self._spec["checks"] else "none")
+        self._pages = []
+        self._milestones = {}
+        self._artifacts = {}
+
+    @property
+    def spec(self):
+        return copy.deepcopy(self._spec)
+
+    @property
+    def public_spec(self):
+        return copy.deepcopy(self._public_spec)
+
+    def public_report(self, report=None):
+        """Expose progress without leaking private targets through failure reasons."""
+        report = self.evaluate() if report is None else report
+        checks = [copy.deepcopy(c) for c in report.get("checks", []) if c.get("id") in self._public_ids]
+        private = [c for c in report.get("checks", []) if c.get("id") not in self._public_ids]
+        if private:
+            status = ("failed" if any(c.get("status") == "failed" for c in private)
+                      else "passed" if all(c.get("status") == "passed" for c in private) else "unknown")
+            checks.append({"id": "private_validation", "kind": "private_validation", "status": status,
+                           "reason": "independent private validation passed" if status == "passed" else "independent private validation is not satisfied",
+                           "source": "private_evaluator"})
+        status = report.get("status", "unknown")
+        reason = ("all completion checks passed" if status == "passed" else
+                  "; ".join(c["reason"] for c in checks if c.get("status") != "passed")
+                  or "no deterministic completion contract for this task")
+        return {"status": status, "checks": checks, "reason": reason, "source": report.get("source", self.source)}
+
+    def observe(self, observation, execution_info=None):
+        self._pages = []
+        context = (observation.get("context", []) if isinstance(observation, dict)
+                   else getattr(observation, "context", []))
+        if isinstance(observation, dict) and observation.get("kind") == "browser_ax":
+            context = [observation]
+        if isinstance(context, (list, tuple)):
+            self._pages = copy.deepcopy([b for b in context if isinstance(b, dict) and b.get("kind") == "browser_ax"])
+        info = execution_info if isinstance(execution_info, dict) else {}
+        observed_info = (observation.get("info", {}) if isinstance(observation, dict)
+                         else getattr(observation, "info", {}))
+        observed_info = observed_info if isinstance(observed_info, dict) else {}
+        # Browser downloads often finish after click() returns. Their completion
+        # can arrive only in a later observation, including request_finish's fresh
+        # observation; always consume both channels.
+        events = []
+        for channel in (observed_info, info):
+            if isinstance(channel.get("artifacts"), list):
+                events.extend(channel["artifacts"])
+        if info.get("action") == "download" and info.get("status") in ("executed", "already_downloaded"):
+            if not any(isinstance(e, dict) and e.get("path") == info.get("path") for e in events):
+                events.append(info)
+        for event in events:
+            if (not isinstance(event, dict) or event.get("status") not in ("completed", "executed", "already_downloaded")
+                    or ("completed" in event and event["completed"] is not True)):
+                continue
+            try:
+                resources, sources = set(), set()
+                for field in ("url", "final_url", "source_url", "page_url"):
+                    try:
+                        value = _url(event.get(field))
+                    except ValueError:
+                        continue
+                    (resources if field in ("url", "final_url") else sources).add(value)
+                if not (resources or sources):
+                    continue
+                path = str(Path(_string(event.get("path"), "path")).resolve())
+                download_id = event.get("download_id") or event.get("artifact_id")
+                old = self._artifacts.get(path)
+                if old and download_id is not None and old.get("download_id") == download_id:
+                    continue  # Cumulative observations must not re-baseline changed bytes.
+                evidence = _read_artifact(path)
+                self._artifacts[path] = {"urls": resources, "source_urls": sources, "path": path,
+                                         "initial": evidence, "download_id": download_id}
+            except (ValueError, OSError):
+                pass
+        # Capture milestones now, even when evaluate() follows a later observation.
+        for check in self._spec["checks"]:
+            if check["scope"] == "milestone" and check["kind"] not in ("download", "paper_download") and check["id"] not in self._milestones:
+                result = self._page_check(check)
+                if result["status"] == "passed":
+                    self._milestones[check["id"]] = result
+
+    @staticmethod
+    def _result(check, status, reason, source, **evidence):
+        return {"id": check["id"], "kind": check["kind"], "scope": check["scope"],
+                "status": status, "reason": reason, "source": source, **evidence}
+
+    def _page_check(self, check):
+        result = lambda status, reason, **e: self._result(check, status, reason, "browser_ax", **e)
+        if len(self._pages) != 1:
+            return result("unknown", "a fresh, unambiguous browser page observation is required")
+        page = self._pages[0]
+        try:
+            actual_url = _url(page.get("url"))
+        except ValueError:
+            return result("unknown", "observed page URL is unavailable")
+        if "url" in check and actual_url != check["url"]:
+            return result("failed", "observed page URL differs from the required URL", actual_url=actual_url)
+        if check["kind"] == "url_equals":
+            return result("passed", "current page URL matches", actual_url=actual_url)
+        nodes = page.get("nodes")
+        if not isinstance(nodes, list) or any(not isinstance(n, dict) for n in nodes):
+            return result("unknown", "observed AX nodes are unavailable")
+        if any(n.get("states") is not None and not isinstance(n["states"], dict) for n in nodes):
+            return result("unknown", "observed AX states are malformed")
+        nodes = [n for n in nodes if not n.get("ignored") and not (n.get("states") or {}).get("hidden")]
+        missing = "unknown" if page.get("warnings") else "failed"
+        if check["kind"] == "text_present":
+            normalize = lambda text: " ".join(text.split()) if isinstance(text, str) else ""
+            expected = normalize(check["text"])
+            if any(expected == normalize(n.get(field)) for n in nodes for field in ("name", "text")):
+                return result("passed", "required text is present in the current AX observation")
+            return result(missing, "required text was not found in the current AX observation")
+        if page.get("warnings"):
+            return result("unknown", "incomplete AX observation cannot establish a unique element")
+        matches = [n for n in nodes if n.get("role") == check["role"] and n.get("name") == check["name"]
+                   and ("element_id" not in check or n.get("id") == check["element_id"])]
+        if not matches:
+            return result(missing, "required element was not found")
+        if len(matches) != 1:
+            return result("unknown", "role/name identifies multiple elements")
+        node = matches[0]
+        if "value" in check:
+            if "value" not in node or node["value"] == "[redacted]":
+                return result("unknown", "element value is unavailable or redacted")
+            if node["value"] != check["value"]:
+                return result("failed", "element value differs from the required value")
+        states = node.get("states") or {}
+        for key, expected in check.get("states", {}).items():
+            if key not in states:
+                return result("unknown", f"element state {key} is unavailable")
+            if states[key] != expected:
+                return result("failed", f"element state {key} differs from the required state")
+        return result("passed", "unique element has the required value/states")
+
+    def _download_checks(self, checks):
+        if not checks:
+            return {}
+        current = {path: _read_artifact(path) for path in self._artifacts}
+        parsed_pdfs, candidates, results, resources = {}, {}, {}, {}
+        paper_task = any(c["kind"] == "paper_download" for c in checks)
+        for check in checks:
+            cid = check["id"]
+            candidates[cid] = {}
+            results[cid] = self._result(check, "unknown", "no matching completed download artifact", "artifact")
+            for path, record in self._artifacts.items():
+                if "url" in check and check["url"] not in record["urls"]:
+                    continue
+                evidence, initial = current[path], record["initial"]
+                status, reason = evidence["status"], evidence["reason"]
+                extra = {}
+                if status == "passed":
+                    if initial["status"] != "passed":
+                        status, reason = "failed", "file was not verified at the successful download event"
+                    elif (evidence["identity"], evidence["sha256"]) != (initial["identity"], initial["sha256"]):
+                        status, reason = "failed", "file has changed since the successful download event"
+                    elif evidence["bytes"] < check["min_bytes"]:
+                        status, reason = "failed", "downloaded file is smaller than min_bytes"
+                    elif "filename" in check and Path(path).name != check["filename"]:
+                        status, reason = "failed", "downloaded filename does not match"
+                    elif "sha256" in check and evidence["sha256"] != check["sha256"]:
+                        status, reason = "failed", "downloaded file SHA-256 does not match"
+                    elif check["kind"] == "paper_download":
+                        if path not in parsed_pdfs:
+                            parsed_pdfs[path] = _parse_pdf(path, evidence)
+                        identity = _paper_identity(check, parsed_pdfs[path])
+                        status, reason = identity["status"], identity["reason"]
+                        extra = {k: v for k, v in identity.items() if k not in ("status", "reason")}
+                item = self._result(check, status, reason, "artifact", path=path,
+                                    urls=sorted(record["urls"]), source_urls=sorted(record["source_urls"]),
+                                    sha256=evidence.get("sha256"), **extra)
+                if status == "passed":
+                    # Copies of one paper must not count as several papers. For
+                    # plain byte downloads preserve the physical-file contract.
+                    identity = evidence["identity"]
+                    resources[identity] = ("sha256", evidence["sha256"]) if paper_task else ("inode", identity)
+                    candidates[cid][identity] = item
+                elif results[cid]["status"] != "failed":
+                    results[cid] = item
+        # A private refinement must hold for the *same physical artifact*. Two
+        # files satisfying the public title and private golden hash separately
+        # cannot be joined into a false positive. Multiple bindings are ANDed.
+        by_id = {c["id"]: c for c in checks}
+        bindings = {}
+        for check in checks:
+            if "bind_to" in check:
+                bindings.setdefault(check["bind_to"], []).append(check["id"])
+        for parent, bound_ids in bindings.items():
+            joint = set(candidates[parent])
+            for cid in bound_ids:
+                joint.intersection_update(candidates[cid])
+            if candidates[parent] and not joint:
+                results[parent] = self._result(by_id[parent], "unknown",
+                    "no artifact jointly satisfies the independent checks for this goal", "artifact")
+            candidates[parent] = {identity: item for identity, item in candidates[parent].items() if identity in joint}
+        # Expand counts into assignment slots. Bound refinements reuse all slots
+        # of their public parent; unbound checks remain distinct task objectives.
+        owners, slots = {}, {}
+        for check in checks:
+            if "bind_to" in check:
+                continue
+            for index in range(check.get("count", 1)):
+                slots[(check["id"], index)] = check["id"]
+
+        def assign(slot, visited):
+            cid = slots[slot]
+            for identity in candidates[cid]:
+                resource = resources[identity]
+                if resource in visited:
+                    continue
+                visited.add(resource)
+                if resource not in owners or assign(owners[resource][0], visited):
+                    owners[resource] = (slot, identity)
+                    return True
+            return False
+
+        for slot in slots:
+            assign(slot, set())
+        assigned = {c["id"]: [] for c in checks}
+        for slot, identity in owners.values():
+            cid = slots[slot]
+            assigned[cid].append(identity)
+        for check in checks:
+            cid, expected = check["id"], check.get("count", 1)
+            if "bind_to" in check:
+                expected = by_id[check["bind_to"]].get("count", 1)
+                assigned[cid] = assigned[check["bind_to"]]
+            matches = [candidates[cid][identity] for identity in assigned[cid]]
+            if len(matches) == expected:
+                if expected == 1:
+                    results[cid] = matches[0]
+                else:
+                    results[cid] = self._result(check, "passed", "all required distinct paper artifacts verified",
+                                                "artifact", count=len(matches), artifacts=matches)
+            elif candidates[cid]:
+                results[cid] = self._result(check, "failed", "download checks require enough distinct local artifacts",
+                                            "artifact", count=len(matches), required_count=expected)
+        return results
+
+    def evaluate(self):
+        checks = self._spec["checks"]
+        downloads = self._download_checks([c for c in checks if c["kind"] in ("download", "paper_download")])
+        results = []
+        for check in checks:
+            if check["kind"] in ("download", "paper_download"):
+                result = downloads[check["id"]]
+            elif check["id"] in self._milestones:
+                result = {**self._milestones[check["id"]], "source": "milestone"}
+            else:
+                result = self._page_check(check)
+            results.append(result)
+        status = ("unknown" if not results else "failed" if any(r["status"] == "failed" for r in results)
+                  else "unknown" if any(r["status"] == "unknown" for r in results) else "passed")
+        reason = ("no deterministic completion contract for this task" if not results
+                  else "all completion checks passed" if status == "passed"
+                  else "; ".join(f"{r['id']}: {r['reason']}" for r in results if r["status"] != "passed"))
+        return {"status": status, "checks": copy.deepcopy(results), "reason": reason, "source": self.source}
+
+
+def check_completion(task, info):
+    """Legacy helper: navigation requires info['observation']; downloads reread bytes."""
+    verifier = CompletionVerifier(task)
+    info = info if isinstance(info, dict) else {}
+    verifier.observe(info.get("observation"), info)
+    if verifier.evaluate()["status"] != "passed":
+        return ""
+    return "navigation" if verifier.spec["checks"][0]["kind"] == "url_equals" else "download"

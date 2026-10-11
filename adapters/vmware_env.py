@@ -23,8 +23,21 @@ def to_pyautogui(action: Action) -> str:
     head = "import pyautogui; import time; "
 
     # grounding 失败：拒绝执行（返回空命令 → step() 空转一步），绝不做坐标钳制。
-    if a.get("grounding_failed"):
+    if a.get("grounding_failed") or a.get("coordinate_space") == "css_viewport":
         return ""
+
+    # A failed point or half of a drag must not degrade to a keyboard action.
+    coord_names = ("x1", "y1", "x2", "y2") if name == "drag_and_drop" else ("x", "y")
+    needs_coords = name in ("click", "double_click", "right_click", "select", "drag_and_drop")
+    has_coords = any(key in a for key in coord_names)
+    if needs_coords or has_coords:
+        import math
+        try:
+            if not all(isinstance(a.get(key), (int, float)) and not isinstance(a.get(key), bool)
+                       and math.isfinite(a[key]) and a[key] >= 0 for key in coord_names):
+                return ""
+        except (ValueError, TypeError):
+            return ""
 
     if name == "click":
         x, y = a.get('x'), a.get('y')
@@ -130,6 +143,8 @@ def verify_cell_values(env, cell_values, app_name, sheet_name):
 class VMwareEnvironment(Environment):
     """包装 OSWorld DesktopEnv 的 VMware 环境。"""
 
+    evaluation_available = True
+
     def __init__(self, task_config: Dict[str, Any], vm_path: Optional[str] = None,
                  headless: bool = False, screen_width: int = 1920,
                  screen_height: int = 1080, desktop_env_path: Optional[str] = None,
@@ -209,7 +224,7 @@ class VMwareEnvironment(Environment):
         except Exception:  # noqa: BLE001
             route = None
         # 模型自己给的 target_ref 有效 → 直接用
-        if route is not None and route.get("channel") == "browser_dom":
+        if route is not None:
             return route
         # 语义回退：target_ref 缺失/无效时，用 target 描述在快照里找 ref
         target = str(action.args.get("target") or "")
@@ -233,7 +248,9 @@ class VMwareEnvironment(Environment):
         """执行已路由的 browser_dom 动作（DOM 定位 + actionability check）。"""
         session = self._get_browser_session()
         if session is None:
-            return self.step(action)
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False, "channel": "browser_dom",
+                "error": "browser session unavailable"})
         result = session.execute(action, route)
         obs = self._fresh_obs_after_action()
         info = dict(result)
@@ -242,21 +259,50 @@ class VMwareEnvironment(Environment):
     def _build_observation(self, raw_obs) -> Observation:
         """从 desktop_env 的 obs 构建 Observation：browser 快照进 context，桌面 AX fallback 进 text。"""
         screenshot = raw_obs.get("screenshot") if isinstance(raw_obs, dict) else None
-        snapshot = self._collect_browser_snapshot()
+        surface = getattr(self, "_observation_surface", "auto")
+        if surface == "browser":
+            session = self._get_browser_session()
+            if session is not None:
+                shot, snapshot, metadata = session.collect_observation()
+                if shot is not None:
+                    from ..scene import Scene
+                    metadata["scene"] = Scene(browser_use=1, structure_available=bool(snapshot),
+                        mode="browser_dom" if snapshot else "visual", reason="explicit_browser",
+                        page_id=metadata.get("page_id", ""), snapshot_id=metadata.get("snapshot_id", "")).to_dict()
+                    metadata["active_surface"] = "browser"
+                    return Observation(screenshot=shot, context=[snapshot] if snapshot else [], info=metadata)
+        snapshot = None if surface == "desktop" else self._collect_browser_snapshot()
         context = [snapshot] if snapshot else []
         text = ""
         if snapshot is None and isinstance(raw_obs, dict):
             text = self._a11y_text(raw_obs)
-        return Observation(screenshot=screenshot, text=text, context=context)
+        from ..model.grounding import screenshot_size
+        from ..scene import Scene
+        size = screenshot_size(screenshot)
+        browser_use = surface != "desktop" and (bool(snapshot) or self._focus_is_browser())
+        info = {
+            "screenshot_space": "screen_pixels",
+            "screenshot_size": list(size) if size else None,
+            "scene": Scene(browser_use=int(browser_use), structure_available=bool(snapshot),
+                           mode="browser_dom" if snapshot else "visual",
+                           reason="structured_page" if snapshot else (
+                               "no_structured_page" if browser_use else "not_browser"),
+                           url=(snapshot or {}).get("url", ""),
+                           page_id=(snapshot or {}).get("page_id", ""),
+                           snapshot_id=(snapshot or {}).get("snapshot_id", "")).to_dict(),
+        }
+        for key in ("page_id", "document_id", "snapshot_id"):
+            if snapshot and key in snapshot:
+                info[key] = snapshot[key]
+        session = getattr(self, "_browser_session", None)
+        if session is not None and hasattr(session, "event_metadata"):
+            info.update(session.event_metadata())
+        info["active_surface"] = "desktop" if surface == "desktop" else "auto"
+        return Observation(screenshot=screenshot, text=text, context=context, info=info)
 
     def _fresh_obs_after_action(self) -> Observation:
         """动作执行后重新观察：新截图 + 新 browser 快照 + 桌面 AX fallback。"""
-        raw = None
-        try:
-            raw = self._env._get_obs() if hasattr(self._env, "_get_obs") else None
-        except Exception:  # noqa: BLE001
-            raw = None
-        return self._build_observation(raw)
+        return self.observe()
 
     def _focus_is_browser(self) -> bool:
         """检测 VM 里当前焦点窗口是否是浏览器（毫秒级）。
@@ -349,6 +395,16 @@ class VMwareEnvironment(Environment):
         return s
 
     # ---- Environment 接口 ----
+    def observe(self) -> Observation:
+        """Read the current VM state without task setup or snapshot rollback."""
+        getter = getattr(self._env, "_get_obs", None)
+        if getter is not None:
+            return self._build_observation(getter())
+        getter = getattr(self.controller, "get_screenshot", None)
+        if getter is None:
+            raise NotImplementedError("VM backend does not provide an observation API")
+        return self._build_observation({"screenshot": getter()})
+
     def reset(self, task: str) -> Observation:
         obs = self._env.reset(self.task_config)
         # launch 是异步的（服务器端 subprocess.Popen 立即返回），reset 返回的截图
@@ -430,6 +486,26 @@ class VMwareEnvironment(Environment):
         return prev if prev is not None else initial
 
     def step(self, action: Action) -> StepResult:
+        name = action.action
+        if name in {"observe_desktop", "observe_browser"}:
+            self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
+            return StepResult(observation=self.observe(), info={"status": "executed", "dispatched": False, "action": name})
+        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab", "download", "goto"}:
+            session = self._get_browser_session()
+            if session is None:
+                return StepResult(observation=self.observe(), info={"status": "rejected", "dispatched": False,
+                    "error": "Browser session unavailable"})
+            args = {k: v for k, v in action.args.items() if k in {"accept", "prompt_text", "dialog_id", "tab_id", "url"}}
+            result = getattr(session, name)(**args)
+            obs = self.observe()
+            result["artifacts"] = obs.info.get("artifacts", result.get("artifacts", []))
+            return StepResult(observation=obs, info=result)
+        if action.args.get("coordinate_space") == "css_viewport":
+            session = self._get_browser_session()
+            result = session.execute_viewport_action(action, action.args.get("observation_metadata"))
+            obs = self.observe()
+            result["artifacts"] = obs.info.get("artifacts", [])
+            return StepResult(observation=obs, info=result)
         # set_cell_values / save 是 LibreOffice UNO 多行脚本（含 def/for/缩进），
         # 必须走 controller.run_python_script 保留多行结构。走 env.step 会被
         # execute_python_command 拼成 "python -c" 单行，破坏缩进结构导致静默失败
@@ -454,7 +530,9 @@ class VMwareEnvironment(Environment):
             import time as _t
             _t.sleep(1.0)
             obs = self._env._get_obs() if hasattr(self._env, "_get_obs") else {"screenshot": None}
-            return StepResult(observation=self._build_observation(obs))
+            return StepResult(observation=self._build_observation(obs), info={
+                "status": "rejected", "dispatched": False, "channel": "desktop",
+                "error": "unsupported action or invalid coordinates"})
         obs, reward, done, info = self._env.step(cmd, pause=3)
         screenshot = obs.get("screenshot") if isinstance(obs, dict) else None
         info = info or {}
@@ -544,56 +622,12 @@ class VMwareEnvironment(Environment):
                     pass
         return run_local_python(code)
 
-    def get_page_source(self) -> str:
-        """通过 Chrome DevTools Protocol 获取当前页面 URL + HTML 源码。
-
-        browser use 场景：让决策模型直接读 DOM/源码，而不是只靠截图猜坐标。
-        Chrome 在 Linux/Windows/Mac 都支持 remote debugging（9222 端口），因此跨平台。
-        连接失败 / 非浏览器任务时返回说明性文字，不抛异常。
-        """
-        env = self._env
-        if env is None:
-            return "环境未初始化，无法获取页面源码"
-        if not self._focus_is_browser():
-            return "当前焦点不在浏览器（可能正在操作其他应用），无需抓取页面源码"
-        host = getattr(env, "vm_ip", None)
-        port = getattr(env, "chromium_port", None) or 9222
-        if not host:
-            return "无法确定目标机 IP，无法连接 Chrome"
-        remote_url = f"http://{host}:{port}"
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception as exc:  # noqa: BLE001
-            return f"playwright 不可用，无法连接 Chrome CDP：{exc}"
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.connect_over_cdp(remote_url)
-                try:
-                    contexts = browser.contexts
-                    if not contexts:
-                        return "Chrome 没有打开的页面上下文"
-                    pages = contexts[0].pages
-                    if not pages:
-                        return "Chrome 没有打开的标签页"
-                    # 选「当前页面」：优先最后一个非 chrome:// 的普通网页
-                    page = None
-                    for pg in reversed(pages):
-                        u = pg.url or ""
-                        if u and not u.startswith(("chrome://", "about:", "devtools://", "edge://")):
-                            page = pg
-                            break
-                    if page is None:
-                        page = pages[-1]
-                    url = page.url
-                    html = page.content()
-                finally:
-                    try:
-                        browser.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-        except Exception as exc:  # noqa: BLE001
-            return f"获取页面源码失败（Chrome 可能未打开或未开 remote debugging）：{exc}"
-        return f"URL: {url}\n\nHTML:\n{html}"
+    def get_page_source(self, target_ref=None, max_chars=20000) -> str:
+        """Read the same task page used by observations and actions."""
+        session = self._get_browser_session()
+        if session is None:
+            return "浏览器会话不可用，请重新观察。"
+        return session.get_page_source(target_ref=target_ref, max_chars=max_chars)
 
     def browser_action(self, action_name: str, args: dict) -> str:
         """执行 browser kind 动作。当前只有 get_page_source（读精简 DOM）。
@@ -602,7 +636,7 @@ class VMwareEnvironment(Environment):
         （target_ref DOM 定位），不再走这里。
         """
         if action_name == "get_page_source":
-            return self.get_page_source()
+            return self.get_page_source(target_ref=args.get("target_ref"), max_chars=args.get("max_chars", 20000))
         return f"未知浏览器动作 {action_name}"
 
     def evaluate(self) -> float:

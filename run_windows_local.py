@@ -31,10 +31,11 @@ if _parent not in sys.path:
 from osworld_agent.config import ModelConfig          # noqa: E402
 from osworld_agent.model import ChatModel             # noqa: E402
 from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
+from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
 from osworld_agent.adapters.windows_env import WindowsEnvironment        # noqa: E402
 from osworld_agent.agent import Agent                 # noqa: E402
 from osworld_agent.viz.logging import (LoggingChatModel, LoggingGrounding,  # noqa: E402
-                                       set_results_dir, log_status, reset_collected)
+                                       set_results_dir, log_status, reset_collected, flush_logs)
 
 CHROME_DEFAULT = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 _PROFILE_PREFIX = "osworld_agent_chrome_incognito_"
@@ -150,8 +151,10 @@ def _close_owned_cdp(port: int, profile: str) -> bool:
         return False
     try:
         from playwright.sync_api import sync_playwright
+        from osworld_agent.utils import cdp_websocket_endpoint
+        endpoint = cdp_websocket_endpoint("localhost", port, timeout=4)
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(f"http://localhost:{port}", timeout=4000)
+            browser = p.chromium.connect_over_cdp(endpoint, timeout=4000)
             try:
                 # 连接期间端口可能已被重新占用；发送关闭命令前再次核对 PID 和 profile。
                 current = _owned_endpoint_pids(port, profile)
@@ -283,7 +286,15 @@ def main() -> int:
     parser.add_argument("--task", required=True, help="自由文本任务描述")
     parser.add_argument("--model", default="Qwen3.5-9B")
     parser.add_argument("--model-url", default="http://7.246.80.189:9028/v1")
+    parser.add_argument("--planner-model", help="可选独立规划模型；默认使用决策模型")
+    parser.add_argument("--planner-url", help="独立规划端点；默认沿用 --model-url")
+    parser.add_argument("--capture-rollout", action="store_true", help="请求服务端实际token与logprobs，缺元数据不允许导出RL")
+    parser.add_argument("--policy-revision", default="")
+    parser.add_argument("--tokenizer-revision", default="")
+    parser.add_argument("--processor-revision", default="")
+    parser.add_argument("--chat-template-revision", default="")
     parser.add_argument("--ground-model", default="UI-Venus-2-9B")
+    parser.add_argument("--ground-type", choices=["ui-venus2", "ui-tars"], default="ui-venus2")
     parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
@@ -292,7 +303,20 @@ def main() -> int:
     parser.add_argument("--chrome", default=CHROME_DEFAULT)
     parser.add_argument("--download-dir", default=None, help="下载目录（缺省为 osworld_agent/downloads）")
     parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省不落盘）")
+    parser.add_argument("--completion-spec", help="可信任务验收条件 JSON 文件；模型不能修改")
+    parser.add_argument("--private-completion-spec", help="私有评测条件 JSON；不会发送给模型")
+    parser.add_argument("--task-id", help="数据集任务标识；缺省按任务文本生成")
     args = parser.parse_args()
+    completion_spec = None
+    private_completion_spec = None
+    if args.completion_spec:
+        with open(args.completion_spec, encoding="utf-8") as f:
+            completion_spec = json.load(f)
+    if args.private_completion_spec:
+        with open(args.private_completion_spec, encoding="utf-8") as f:
+            private_completion_spec = json.load(f)
+    from osworld_agent.verifiers import CompletionVerifier
+    CompletionVerifier(args.task, completion_spec, private_completion_spec)
 
     # 0) 屏幕分辨率：grounding 按它换算坐标，必须和真实屏幕一致
     import pyautogui
@@ -308,8 +332,14 @@ def main() -> int:
         time.sleep(2.0)  # 等 Chrome 窗口稳定
 
         # 2) 模型（Logging 实时推送到 viz server）
-        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key="EMPTY")))
-        grounding = LoggingGrounding(UIVenus2Grounding(url=args.ground_url, api_key="EMPTY",
+        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key="EMPTY",
+            capture_rollout=args.capture_rollout, policy_revision=args.policy_revision,
+            tokenizer_revision=args.tokenizer_revision, processor_revision=args.processor_revision,
+            chat_template_revision=args.chat_template_revision)))
+        planner = (LoggingChatModel(ChatModel(ModelConfig(name=args.planner_model,
+            url=args.planner_url or args.model_url, api_key="EMPTY"))) if args.planner_model else None)
+        ground_cls = RealUItarsGrounding if args.ground_type == "ui-tars" else UIVenus2Grounding
+        grounding = LoggingGrounding(ground_cls(url=args.ground_url, api_key="EMPTY",
                                                        model=args.ground_model, width=width, height=height))
 
         # 3) 环境
@@ -319,7 +349,9 @@ def main() -> int:
         # 4) 组装 + 跑，保留 1010 的规划流水线
         agent = Agent(decision_model=model, grounding=grounding, env=env,
                       max_steps=args.max_steps, enable_reflection=False,
-                      step_callback=_live_step)
+                      step_callback=_live_step, completion_spec=completion_spec,
+                      private_completion_spec=private_completion_spec, planner_model=planner,
+                      event_path=os.path.join(args.result_dir, "events.jsonl") if args.result_dir else None)
         if args.result_dir:
             set_results_dir(args.result_dir)
         reset_collected()
@@ -389,10 +421,13 @@ def main() -> int:
         with open(os.path.join(args.result_dir, "traj_raw.jsonl"), "w", encoding="utf-8") as _f:
             _f.write("\n".join(raw_lines))
         from osworld_agent.trajectory import build_trajectory, dump_trajectory
-        traj = build_trajectory(task_id="local", domain="windows",
+        import hashlib
+        task_id = args.task_id or "local-" + hashlib.sha256(args.task.encode()).hexdigest()[:16]
+        traj = build_trajectory(task_id=task_id, domain="windows",
                                 instruction=args.task, result=result)
         dump_trajectory(os.path.join(args.result_dir, "trajectory.json"), traj)
         print(f"\n轨迹与截图已保存到: {args.result_dir}")
+    flush_logs(timeout=1.0)
     return 0
 
 

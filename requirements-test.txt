@@ -1,0 +1,9 @@
+pytest>=8,<10
+pyyaml>=6,<7
+pillow>=10
+requests>=2.31
+httpx>=0.27,<1
+openai>=1
+pypdf>=5,<7
+fastapi>=0.115,<1
+uvicorn>=0.30,<1

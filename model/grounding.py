@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
 from typing import Dict, Optional, Tuple
 
 from ..config import GroundingConfig
@@ -28,6 +29,43 @@ class Grounding(ABC):
         raise NotImplementedError
 
 
+def screenshot_size(screenshot) -> Optional[Tuple[int, int]]:
+    """Read dimensions of the actual image sent to a grounding endpoint.
+
+    Supports PIL images, paths, bytes and base64 data URLs. Unknown dimensions
+    must fail closed instead of silently using a configured desktop resolution.
+    """
+    import base64
+    import os
+    from io import BytesIO
+
+    try:
+        size = getattr(screenshot, "size", None)
+        if isinstance(size, tuple) and len(size) == 2:
+            width, height = map(int, size)
+        else:
+            from PIL import Image
+            source = screenshot
+            if isinstance(source, str) and source.startswith("data:"):
+                header, payload = source.split(",", 1)
+                if ";base64" not in header:
+                    return None
+                source = base64.b64decode(payload, validate=True)
+            if isinstance(source, (bytes, bytearray)):
+                source = BytesIO(source)
+            elif isinstance(source, os.PathLike):
+                source = os.fspath(source)
+            elif not isinstance(source, str):
+                return None
+            with Image.open(source) as img:
+                width, height = img.size
+        if width > 0 and height > 0:
+            return width, height
+    except (OSError, ValueError, TypeError, ImportError):
+        pass
+    return None
+
+
 class UItarsGrounding(Grounding):
     """UI-TARS 定位客户端。
 
@@ -45,14 +83,14 @@ class UItarsGrounding(Grounding):
         self.timeout = timeout
 
     def locate(self, screenshot, target: str) -> GroundingResult:
-        """定位目标元素。
-
-        TODO(下一步接入)：对齐服务端 49999 的 UI-TARS 具体请求协议
-        （截图编码方式、提示词格式、返回的坐标格式）。当前返回屏幕中心作为占位，
-        保证整体链路可以先跑通、再替换为真实定位。
-        """
-        # 占位实现：真实接入后替换为对 self.url 的请求。
-        return GroundingResult(x=self.width // 2, y=self.height // 2)
+        """Use the same real endpoint protocol as the specialized runners."""
+        if not hasattr(self, "_delegate"):
+            from ..adapters.uitars_grounding import RealUItarsGrounding
+            self._delegate = RealUItarsGrounding(
+                self.url, self.api_key, self.model, self.width, self.height,
+                timeout=self.timeout,
+            )
+        return self._delegate.locate(screenshot, target)
 
 
 class NullGrounding(Grounding):
@@ -63,7 +101,8 @@ class NullGrounding(Grounding):
         self.height = height
 
     def locate(self, screenshot, target: str) -> GroundingResult:
-        return GroundingResult(x=self.width // 2, y=self.height // 2)
+        width, height = screenshot_size(screenshot) or (self.width, self.height)
+        return GroundingResult(x=width // 2, y=height // 2)
 
 
 def resolve_coords(gr: GroundingResult) -> Optional[Tuple[int, int]]:
@@ -74,11 +113,14 @@ def resolve_coords(gr: GroundingResult) -> Optional[Tuple[int, int]]:
     """
     if gr is None:
         return None
-    if gr.confidence is not None and gr.confidence <= 0:
+    try:
+        if gr.confidence is not None and (not math.isfinite(gr.confidence) or gr.confidence <= 0):
+            return None
+        if not all(math.isfinite(value) and value >= 0 for value in (gr.x, gr.y)):
+            return None
+        return int(gr.x), int(gr.y)
+    except (ValueError, TypeError, OverflowError):
         return None
-    if gr.x < 0 or gr.y < 0:
-        return None
-    return int(gr.x), int(gr.y)
 
 
 def mark_coordinate(screenshot, x: int, y: int, radius: int = 14, color: str = "red"):

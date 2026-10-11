@@ -10,20 +10,16 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
-
-from ..model.grounding import Grounding, GroundingResult
+from ..model.grounding import Grounding, GroundingResult, screenshot_size
 
 
 # UI-Venus-2 grounding prompt。
-# 注意：官方 prompt 带 "if infeasible output [-1,-1]" 会因决策模型生成的 target 描述
-# 与实际屏幕有细微偏差而大量拒答。这里去掉拒答引导、改为强制给坐标，
-# 让模型在描述不完全匹配时也给出"尽力估计"的坐标（对 OSWorld 任务更有利）。
+# 明确允许拒答：不能把不可定位目标变成任意的点击。
 _DEFAULT_USER_PROMPT = (
     "Output the center point of the position corresponding to the following instruction: \n"
     "{instruction}. \n\n"
     "The output should just be the coordinates of a point, in the format [x,y]. "
-    "Always output your best estimate of the coordinates."
+    "If infeasible, output [-1,-1]."
 )
 
 
@@ -33,19 +29,18 @@ def _extract_coords(text: str):
     支持 [x,y]、[x1,y1,x2,y2]（取中心）、[-1,-1]（拒答）。
     """
     text = (text or "").strip()
-    # [-1,-1] 拒答
-    if re.search(r"\[\s*-1\s*,\s*-1\s*\]", text):
-        return None
     # [x1,y1,x2,y2] 四数取中心
-    m = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", text)
+    m = re.fullmatch(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", text)
     if m:
         x1, y1, x2, y2 = map(int, m.groups())
+        if not (0 <= x1 <= x2 <= 1000 and 0 <= y1 <= y2 <= 1000):
+            return None
         return (x1 + x2) / 2, (y1 + y2) / 2
     # [x, y] 两数
-    m = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", text)
+    m = re.fullmatch(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", text)
     if m:
         x, y = map(int, m.groups())
-        if x < 0 or y < 0:
+        if not (0 <= x <= 1000 and 0 <= y <= 1000):
             return None
         return float(x), float(y)
     return None
@@ -78,9 +73,14 @@ class UIVenus2Grounding(Grounding):
 
     def locate(self, screenshot, target: str):
         from ..model.decision_model import encode_image
+        import os
+        if isinstance(screenshot, os.PathLike):
+            screenshot = os.fspath(screenshot)
+        size = screenshot_size(screenshot)
         url = encode_image(screenshot)
-        if not url:
+        if not url or size is None:
             return GroundingResult(x=-1, y=-1, confidence=0.0)
+        width, height = size
 
         text = _DEFAULT_USER_PROMPT.replace("{instruction}", target.rstrip("."))
         messages = [{"role": "user", "content": [
@@ -99,8 +99,9 @@ class UIVenus2Grounding(Grounding):
                 out = (resp.choices[0].message.content or "").strip()
                 coords = _extract_coords(out)
                 if coords is not None:
-                    x = round(coords[0] / 1000.0 * self.width)
-                    y = round(coords[1] / 1000.0 * self.height)
+                    # Normalized 1000 denotes the image edge, i.e. last pixel.
+                    x = min(width - 1, round(coords[0] / 1000.0 * width))
+                    y = min(height - 1, round(coords[1] / 1000.0 * height))
                     return GroundingResult(x=x, y=y, confidence=1.0)
                 last_err = f"响应无坐标/拒答: {out[:100]}"
             except Exception as exc:  # noqa: BLE001

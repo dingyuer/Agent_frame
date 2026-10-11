@@ -29,6 +29,12 @@ def main() -> None:
         max_retries=cfg.agent.max_retries,
         enable_reflection=cfg.agent.enable_reflection,
         early_stop_repeat=cfg.agent.early_stop_repeat,
+        max_replans=cfg.agent.max_replans,
+        completion_spec=cfg.completion,
+        context_config=cfg.context,
+        private_completion_spec=cfg.private_completion,
+        planner_model=build_decision_model(cfg.planner_model) if cfg.planner_model else None,
+        event_path=cfg.event_path,
     )
     task = args.task_instruction or args.task_id
     try:

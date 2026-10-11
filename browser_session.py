@@ -1,8 +1,7 @@
-"""Chromium AX/DOM 观察 + 快照范围内的确定性动作（借鉴 osworld_agent_v2）。
+"""Chromium AX/DOM 观察、任务会话、浏览器事件和确定性动作。
 
-与 v2 的差异（重要）：**每次 collect/execute 都用 with sync_playwright() 临时连接、
-用完即关**，不长期持有 playwright 连接——否则会和 OSWorld 的 setup/evaluator
-（同样用 playwright sync API）在同一个进程里产生 asyncio loop 冲突。
+持久 Playwright async 连接由独立线程拥有，事件在浏览器调用期间派发；下载作为
+同一事件循环的限时后台任务运行，不阻塞下一次观察或主线程评测器。
 
 策略输出语义目标 target_ref（快照节点引用），执行器按 backend_id 精确定位。
 DOM 坐标是 CSS viewport 坐标，不是桌面截图像素。
@@ -13,13 +12,116 @@ import os
 import re
 import time
 import uuid
+import math
+import copy
+import hashlib
+import json
+import threading
+import asyncio
+import inspect
+import queue
+from concurrent.futures import Future
+from functools import wraps
 from dataclasses import dataclass
 
 
 class BrowserActionError(RuntimeError):
-    def __init__(self, message, dispatched=False):
+    def __init__(self, message, dispatched=False, code="blocked"):
         super().__init__(message)
         self.dispatched = dispatched
+        self.code = code
+
+
+class _BrowserWorker:
+    """Serialize operations while also pumping browser events between model calls."""
+    def __init__(self, owner):
+        self.owner = owner
+        self.queue = queue.Queue()
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, name="browser-session", daemon=True)
+        self.thread.start()
+
+    def submit(self, fn):
+        if self.closed:
+            raise RuntimeError("Browser worker is closed")
+        future = Future()
+        self.queue.put((fn, future))
+        return future
+
+    def _run(self):
+        while True:
+            try:
+                work = self.queue.get(timeout=0.025)
+            except queue.Empty:
+                loop = self.owner._loop
+                if loop is not None and not loop.is_closed():
+                    try:
+                        loop.run_until_complete(asyncio.sleep(0))
+                    except Exception:
+                        pass  # The next explicit browser operation reports transport errors.
+                continue
+            if work is None:
+                return
+            fn, future = work
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(fn())
+                except BaseException as exc:
+                    future.set_exception(exc)
+
+    def shutdown(self, wait=True):
+        self.closed = True
+        self.queue.put(None)
+        if wait and threading.get_ident() != self.thread.ident:
+            self.thread.join()
+
+
+def browser_thread(method):
+    """Keep Playwright's sync event loop on one owner thread, away from evaluators."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if self._worker_thread == threading.get_ident():
+            return method(self, *args, **kwargs)
+        if self._worker is None:
+            self._worker = _BrowserWorker(self)
+        def invoke():
+            self._worker_thread = threading.get_ident()
+            return method(self, *args, **kwargs)
+        return self._worker.submit(invoke).result()
+    return wrapped
+
+
+class _AsyncBrowserObject:
+    """Small public-API adapter; every await stays on the session owner thread."""
+    def __init__(self, owner, raw):
+        self.owner, self.raw = owner, raw
+
+    def __getattr__(self, name):
+        value = getattr(self.raw, name)
+        if not callable(value):
+            return self.owner._wrap_async(value)
+        def call(*args, **kwargs):
+            if name in {"on", "once"} and len(args) == 2:
+                event, callback = args
+                args = (event, lambda *items: callback(*(self.owner._wrap_async(x) for x in items)))
+            args = tuple(self.owner._unwrap_async(x) for x in args)
+            kwargs = {k: self.owner._unwrap_async(v) for k, v in kwargs.items()}
+            # Even synchronous public methods such as on() schedule protocol
+            # subscriptions and therefore require a running asyncio loop.
+            if self.owner._loop is not None and self.owner._loop.is_running():
+                result = value(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise RuntimeError("Async browser operation cannot be awaited from a synchronous event callback")
+            else:
+                async def invoke():
+                    result = value(*args, **kwargs)
+                    return await result if inspect.isawaitable(result) else result
+                timeout_ms = kwargs.get("timeout") or self.owner.options.timeout_ms
+                result = self.owner._await(invoke(), max(float(timeout_ms) / 1000, 1) + 1)
+            return self.owner._wrap_async(result)
+        return call
 
 
 INTERACTIVE = {"button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox",
@@ -35,10 +137,11 @@ class BrowserOptions:
     max_nodes: int = 4000
     max_snapshot_age: float = 180.0
     require_focus: bool = True   # True=要求浏览器前台聚焦；Windows 本地模式设 False（虚拟鼠标，用户可同时用电脑）
+    download_timeout_s: float = 90.0
 
 
 class BrowserSession:
-    """每次操作临时连接 CDP，用完即关（避免 playwright asyncio loop 跨调用冲突）。"""
+    """Task-owned CDP session with a dedicated async Playwright owner thread."""
 
     def __init__(self, options=None, foreground_check=None, downloads_dir=None):
         self.options = options or BrowserOptions()
@@ -48,17 +151,369 @@ class BrowserSession:
         self.snapshot = None
         self.nodes = {}
         self._downloaded = {}  # url -> path，本次会话已下载的文件（幂等去重）
+        self._downloaded_sizes = {}
+        self._task_page_id = None
+        self._known_page_ids = set()
+        self._observation_metadata = {}
+        self.last_resolution_error = None
+        self._worker = None
+        self._worker_thread = None
+        self._playwright = None
+        self._browser = None
+        self._owned_context = None
+        self._watched_pages = set()
+        self._watched_contexts = set()
+        self._dialogs = {}
+        self._pending_downloads = []
+        self._artifacts = []
+        self._download_events = []
+        self._parents = {}
+        self._base_downloads_dir = self.downloads_dir
+        self.initial_state = {}
+        self._last_screenshot = None
+        self._last_screenshot_metadata = {}
+        self._temporary_cdp = []
+        self._loop = None
+        self._async_objects = {}
+        self._background_downloads = set()
+        self._active_downloads = {}
 
     # ---- 临时连接的 attach 帮助 ----
+    def _resolve_cdp_endpoint(self):
+        """Resolve local/LAN CDP directly; process proxy settings belong to webpage traffic."""
+        from urllib.parse import urlsplit, urlunsplit
+        endpoint = self.options.endpoint.strip()
+        parsed = urlsplit(endpoint)
+        if parsed.scheme in {"ws", "wss"}:
+            return endpoint
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("CDP endpoint must be an HTTP(S) or WS(S) URL")
+        import httpx
+        discovery = urlunsplit((parsed.scheme, parsed.netloc,
+            parsed.path.rstrip("/") + "/json/version/", parsed.query, ""))
+        with httpx.Client(trust_env=False, timeout=max(0.1, self.options.timeout_ms / 1000)) as client:
+            response = client.get(discovery)
+            response.raise_for_status()
+            websocket = response.json().get("webSocketDebuggerUrl", "")
+        if not isinstance(websocket, str) or urlsplit(websocket).scheme not in {"ws", "wss"}:
+            raise ValueError("CDP discovery did not provide a WebSocket debugger URL")
+        return websocket
+
     def _connect(self):
-        from playwright.sync_api import sync_playwright
-        p = sync_playwright().start()
+        if self._browser is not None:
+            return self._playwright, self._browser
+        endpoint = self._resolve_cdp_endpoint()
+        from playwright.async_api import async_playwright
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+        p = self._wrap_async(self._await(async_playwright().start()))
+        browser = None
         try:
-            browser = p.chromium.connect_over_cdp(self.options.endpoint, timeout=self.options.timeout_ms)
+            browser = p.chromium.connect_over_cdp(endpoint, timeout=self.options.timeout_ms)
+            self._watch_contexts(browser)
         except Exception:
-            p.stop()
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            try:
+                p.stop()
+            except Exception:
+                pass
+            self._async_objects.clear()
             raise
+        self._playwright, self._browser = p, browser
         return p, browser
+
+    def _await(self, coroutine, timeout=None):
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+        if self._loop.is_running():
+            raise RuntimeError("Awaiting browser operations inside synchronous event callbacks is unsupported")
+        return self._loop.run_until_complete(asyncio.wait_for(
+            coroutine, timeout if timeout is not None else max(1, self.options.timeout_ms / 1000) + 1))
+
+    def _wrap_async(self, value):
+        if isinstance(value, list):
+            return [self._wrap_async(x) for x in value]
+        if isinstance(value, tuple):
+            return tuple(self._wrap_async(x) for x in value)
+        if type(value).__module__.startswith("playwright.async_api"):
+            if id(value) not in self._async_objects:
+                self._async_objects[id(value)] = _AsyncBrowserObject(self, value)
+            return self._async_objects[id(value)]
+        return value
+
+    def _unwrap_async(self, value):
+        if isinstance(value, _AsyncBrowserObject):
+            return value.raw
+        if isinstance(value, (list, tuple)):
+            return [self._unwrap_async(x) for x in value]
+        if isinstance(value, dict):
+            return {k: self._unwrap_async(v) for k, v in value.items()}
+        return value
+
+    def _contexts(self, browser):
+        return [self._owned_context] if self._owned_context is not None else browser.contexts
+
+    def _cdp(self, page):
+        session = page.context.new_cdp_session(page)
+        self._temporary_cdp.append(session)
+        return session
+
+    def _watch_contexts(self, browser):
+        for context in self._contexts(browser):
+            if id(context) not in self._watched_contexts and hasattr(context, "on"):
+                context.on("page", self._watch_page)
+                context.on("dialog", lambda dialog: self._record_dialog(dialog.page, dialog)
+                           if getattr(dialog, "page", None) is not None else None)
+                self._watched_contexts.add(id(context))
+            for page in context.pages:
+                self._watch_page(page)
+
+    def _watch_page(self, page):
+        if id(page) in self._watched_pages or not hasattr(page, "on"):
+            return
+        self._watched_pages.add(id(page))
+        page.on("dialog", lambda dialog: self._record_dialog(page, dialog))
+        page.on("download", lambda download: self._queue_download(page, download))
+
+    def _record_dialog(self, page, dialog):
+        if self._owned_context is not None and page.context is not self._owned_context:
+            return
+        if any(item["object"] is dialog for item in self._dialogs.values()):
+            return
+        dialog_id = uuid.uuid4().hex
+        self._dialogs[dialog_id] = {"object": dialog, "page": page,
+            "id": dialog_id, "type": dialog.type, "message": dialog.message,
+            "default_value": dialog.default_value}
+
+    def _queue_download(self, page, download):
+        if self._owned_context is not None and page.context is not self._owned_context:
+            return
+        download_id = uuid.uuid4().hex
+        source_page_url = page.url
+        if self._loop is None:  # Deterministic in-memory transports used by offline tests.
+            self._pending_downloads.append((page, download, download_id, source_page_url))
+            return
+        path = self._artifact_path(download.suggested_filename, download_id)
+        raw = self._unwrap_async(download)
+        deadline = time.monotonic() + self.options.download_timeout_s
+        self._active_downloads[download_id] = {"download_id": download_id, "url": download.url,
+            "status": "in_progress", "completed": False, "started_at": time.time()}
+        async def save():
+            try:
+                await asyncio.wait_for(raw.save_as(path), max(0, deadline - time.monotonic()))
+                self._record_artifact(path=path, url=download.url, final_url=download.url,
+                                      download_id=download_id, page_url=source_page_url)
+            except BaseException as exc:
+                try:
+                    await asyncio.wait_for(raw.cancel(), 5)
+                except BaseException:
+                    pass
+                self._download_events.append({"download_id": download_id, "status": "failed",
+                    "completed": False, "url": download.url,
+                    "error": "download deadline exceeded" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__})
+            finally:
+                self._active_downloads.pop(download_id, None)
+        task = self._loop.create_task(save())
+        self._background_downloads.add(task)
+        task.add_done_callback(self._background_downloads.discard)
+
+    @staticmethod
+    def _filename(value):
+        from urllib.parse import unquote
+        value = unquote(value or "download").replace("\\", "/").rsplit("/", 1)[-1]
+        value = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", value).strip(" .")[:180] or "download"
+        return "_" + value if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", value, re.I) else value
+
+    def _artifact_path(self, filename, download_id):
+        os.makedirs(self.downloads_dir, exist_ok=True)
+        name = self._filename(filename)
+        path = os.path.join(os.path.abspath(self.downloads_dir), name)
+        if os.path.lexists(path):
+            stem, ext = os.path.splitext(name)
+            path = os.path.join(os.path.abspath(self.downloads_dir), f"{stem}_{download_id[:12]}{ext}")
+        return path
+
+    @staticmethod
+    def _file_hash(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _record_artifact(self, *, path, url, final_url, download_id, page_url="", content_type="", transport="browser"):
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise ValueError("download did not produce a nonempty regular file")
+        artifact = {"source_url": url, "url": url, "final_url": final_url,
+            "path": os.path.abspath(path), "status": "completed", "completed": True,
+            "download_id": download_id, "page_url": page_url, "content_type": content_type,
+            "bytes": os.path.getsize(path), "transport": transport, "completed_at": time.time()}
+        artifact["sha256"] = self._file_hash(path)
+        self._artifacts.append(artifact)
+        return copy.deepcopy(artifact)
+
+    def _drain_downloads(self):
+        if self._loop is not None:
+            self._await(asyncio.sleep(0))
+            return
+        pending, self._pending_downloads = self._pending_downloads, []
+        for page, download, download_id, source_page_url in pending:
+            path = None
+            try:
+                path = self._artifact_path(download.suggested_filename, download_id)
+                download.save_as(path)
+                self._record_artifact(path=path, url=download.url, final_url=download.url,
+                                      download_id=download_id, page_url=source_page_url)
+            except Exception as exc:
+                self._download_events.append({"download_id": download_id, "status": "failed",
+                    "completed": False, "url": download.url, "error": str(exc)[:300]})
+
+    @browser_thread
+    def event_metadata(self):
+        return {"artifacts": copy.deepcopy(self._artifacts),
+            "download_events": copy.deepcopy(self._download_events + list(self._active_downloads.values())),
+            "dialogs": [{k: v for k, v in d.items() if k not in {"object", "page"}}
+                        for d in self._dialogs.values()], "initial_state": copy.deepcopy(self.initial_state)}
+
+    def _cancel_background_downloads(self):
+        if self._loop is None or not self._background_downloads:
+            return
+        tasks = list(self._background_downloads)
+        async def cancel_all():
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            self._await(cancel_all(), 6)
+        finally:
+            self._background_downloads.clear()
+            self._active_downloads.clear()
+
+    @browser_thread
+    def begin_episode(self, task_id=None, isolated=True, viewport=None):
+        """Create a fresh context and output directory; never silently reuse on failure."""
+        if not isolated:
+            raise ValueError("begin_episode requires isolated=True")
+        self.initial_state = {}
+        _, browser = self._connect()
+        self._cancel_background_downloads()
+        if self._owned_context is not None:
+            self._owned_context.close()
+            self._owned_context = None
+        self._async_objects = {id(item.raw): item for item in (self._browser, self._playwright)
+                               if isinstance(item, _AsyncBrowserObject)}
+        self.invalidate()
+        self._task_page_id = None
+        self._known_page_ids.clear()
+        self._watched_pages.clear()
+        self._watched_contexts.clear()
+        self._parents.clear()
+        self._dialogs.clear()
+        self._pending_downloads.clear()
+        self._artifacts.clear()
+        self._download_events.clear()
+        self._downloaded.clear()
+        self._downloaded_sizes.clear()
+        self._last_screenshot = None
+        self._last_screenshot_metadata = {}
+        size = viewport or {"width": 1280, "height": 720}
+        episode_id = str(task_id or uuid.uuid4().hex)
+        # Random suffix prevents retries/repeated user IDs from sharing files.
+        directory_id = self._filename(episode_id) + "_" + uuid.uuid4().hex[:12]
+        context = browser.new_context(accept_downloads=True, viewport=size, locale="en-US",
+            timezone_id="UTC", color_scheme="light", reduced_motion="reduce", service_workers="block")
+        self._owned_context = context
+        self.downloads_dir = os.path.join(self._base_downloads_dir, directory_id)
+        os.makedirs(self.downloads_dir, exist_ok=False)
+        self._watch_contexts(browser)
+        page = context.new_page()
+        self._watch_page(page)
+        self._task_page_id = self._target_info(page)["targetId"]
+        profile = {"version": "blank-browser-v1", "viewport": size,
+                   "browser_version": str(getattr(browser, "version", "unknown")),
+                   "locale": "en-US", "timezone": "UTC", "color_scheme": "light",
+                   "reduced_motion": "reduce", "service_workers": "block", "storage": "empty"}
+        fingerprint = hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()[:20]
+        self.initial_state = {"isolated": True, "isolation_scope": "browser_context",
+            "initial_state_id": "blank-browser-v1:" + fingerprint,
+            "episode_id": episode_id, "context_id": uuid.uuid4().hex,
+            "downloads_dir": os.path.abspath(self.downloads_dir), "profile": profile}
+        return copy.deepcopy(self.initial_state)
+
+    def _tab_records(self, browser):
+        records = []
+        for context in self._contexts(browser):
+            for page in context.pages:
+                try:
+                    item = self._target_info(page)
+                    self._parents[item["targetId"]] = item.get("openerId")
+                    records.append({"tab_id": item["targetId"], "url": page.url,
+                        "title": item.get("title", ""),
+                        "opener_id": item.get("openerId"), "active": item["targetId"] == self._task_page_id})
+                except Exception:
+                    continue
+        return records
+
+    @browser_thread
+    def list_tabs(self):
+        _, browser = self._connect()
+        self._pick_page(browser)
+        return {"status": "executed", "dispatched": False, "action": "list_tabs", "tabs": self._tab_records(browser)}
+
+    @browser_thread
+    def switch_tab(self, tab_id):
+        _, browser = self._connect()
+        if tab_id not in {r["tab_id"] for r in self._tab_records(browser)}:
+            return self._failure("Unknown task tab", "not_found")
+        self._task_page_id = tab_id
+        if self.options.require_focus:
+            for context in self._contexts(browser):
+                for page in context.pages:
+                    if self._target_info(page)["targetId"] == tab_id:
+                        page.bring_to_front()
+        self.invalidate()
+        return {"status": "executed", "dispatched": False, "action": "switch_tab", "tab_id": tab_id}
+
+    @browser_thread
+    def close_tab(self, tab_id=None):
+        _, browser = self._connect()
+        tab_id = tab_id or self._task_page_id
+        for context in self._contexts(browser):
+            for page in list(context.pages):
+                if self._target_info(page)["targetId"] == tab_id:
+                    parent = self._parents.get(tab_id)
+                    page.close()
+                    if self._task_page_id == tab_id:
+                        self._task_page_id = parent
+                    self.invalidate()
+                    return {"status": "executed", "dispatched": True, "action": "close_tab", "tab_id": tab_id}
+        return self._failure("Unknown task tab", "not_found")
+
+    @browser_thread
+    def handle_dialog(self, accept, prompt_text=None, dialog_id=None):
+        if type(accept) is not bool:
+            return self._failure("accept must be boolean", "unsupported")
+        if dialog_id is None:
+            if len(self._dialogs) != 1:
+                return self._failure("Provide dialog_id when dialog is absent or ambiguous", "ambiguous")
+            dialog_id = next(iter(self._dialogs))
+        item = self._dialogs.get(dialog_id)
+        if item is None:
+            return self._failure("Unknown dialog", "not_found")
+        try:
+            if accept:
+                item["object"].accept(prompt_text=prompt_text) if prompt_text is not None else item["object"].accept()
+            else:
+                item["object"].dismiss()
+            del self._dialogs[dialog_id]
+            self.invalidate()
+            return {"status": "executed", "dispatched": True, "action": "handle_dialog", "dialog_id": dialog_id}
+        except Exception as exc:
+            return self._failure(exc, dispatched=True)
 
     @staticmethod
     def _focused_page(browser):
@@ -87,105 +542,240 @@ class BrowserSession:
         return None
 
     def _pick_page(self, browser):
-        """按 require_focus 选页面：聚焦模式用 _focused_page，否则 _any_page。"""
-        if self.options.require_focus:
-            return self._focused_page(browser)
-        return self._any_page(browser)
+        """Keep the selected task page; new popups require an explicit tab switch."""
+        pages = []
+        self._watch_contexts(browser)
+        for context in self._contexts(browser):
+            for page in context.pages:
+                try:
+                    info = self._target_info(page)
+                    pages.append((page, info))
+                    self._parents[info["targetId"]] = info.get("openerId")
+                except Exception:
+                    continue
+        if self._task_page_id is None:
+            chosen = (pages[0][0] if self._owned_context is not None and pages else
+                      self._focused_page(browser) if self.options.require_focus else self._any_page(browser))
+            match = next(((p, i) for p, i in pages if p is chosen), None)
+            if match is None:
+                return None
+            self._task_page_id = match[1]["targetId"]
+        self._known_page_ids.update(i["targetId"] for _, i in pages)
+        page = next((p for p, i in pages if i["targetId"] == self._task_page_id), None)
+        if page is None and self._task_page_id:
+            parent = self._parents.get(self._task_page_id)
+            page = next((p for p, i in pages if i["targetId"] == parent), None)
+            if page is not None:
+                self._task_page_id = parent
+        if page is not None and self.options.require_focus and not any(d["page"] is page for d in self._dialogs.values()):
+            try:
+                if not page.evaluate("document.hasFocus() && document.visibilityState === 'visible'"):
+                    return None
+            except Exception:
+                return None
+        return page
+
+    @staticmethod
+    def _target_info(page, cdp=None):
+        own = cdp is None
+        cdp = cdp or page.context.new_cdp_session(page)
+        try:
+            return cdp.send("Target.getTargetInfo")["targetInfo"]
+        finally:
+            if own:
+                try:
+                    cdp.detach()
+                except Exception:
+                    pass
+
+    def _identity(self, page, cdp):
+        return {"page_id": self._target_info(page, cdp)["targetId"],
+                "document_id": cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]}
+
+    @staticmethod
+    def _failure(message, code="blocked", dispatched=False, started=None, **extra):
+        result = {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
+                  "channel": "browser_dom", "error": str(message)[:500],
+                  "error_code": "uncertain" if dispatched else code, **extra}
+        if started is not None:
+            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        return result
+
+    def _disconnect(self, p, browser):
+        sessions, self._temporary_cdp = self._temporary_cdp, []
+        for session in sessions:
+            try:
+                session.detach()
+            except Exception:
+                pass
+        if browser is self._browser:
+            return
+        for owner, method in ((browser, "close"), (p, "stop")):
+            try:
+                getattr(owner, method)()
+            except Exception:
+                pass
 
     # ---- collect ----
     def collect(self):
+        return self._collect(False)[1]
+
+    def collect_observation(self):
+        """同一连接、页面和文档的 (CSS 截图, AX 快照, 观察元数据)。"""
+        return self._collect(True)
+
+    @browser_thread
+    def _collect(self, with_screenshot):
         start = time.perf_counter()
+        self.invalidate()
         if self.foreground_check and not self.foreground_check():
-            self.snapshot = None
-            self.nodes = {}
-            return None
+            return None, None, {"error_code": "blocked", "error": "Browser lost focus"}
         try:
             p, browser = self._connect()
-        except Exception:
-            return None
+        except Exception as exc:
+            return None, None, {"error_code": "not_found", "error": str(exc)[:200]}
         try:
             page = self._pick_page(browser)
             if page is None:
-                return None
-            cdp = page.context.new_cdp_session(page)
-            cdp.send("Accessibility.enable")
-            doc_before = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
+                return None, None, {"error_code": "not_found", "error": "No task page"}
+            page.wait_for_timeout(1)  # dispatch pending browser events before observing
+            dialogs = [d for d in self._dialogs.values() if d["page"] is page]
+            if dialogs:
+                metadata = {**self._last_screenshot_metadata, **self.event_metadata(),
+                            "dialog": {k: v for k, v in dialogs[-1].items() if k not in {"object", "page"}},
+                            "screenshot_stale": True, "observation_errors": ["JavaScript dialog blocks page observation"]}
+                return self._last_screenshot, None, metadata
+            self._drain_downloads()
+            cdp = self._cdp(page)
+            identity = self._identity(page, cdp)
             url = page.url
-            viewport = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
-            dom = cdp.send("DOMSnapshot.captureSnapshot", {"computedStyles": []})
-            strings, layout = dom["strings"], {}
-            for doc in dom["documents"]:
-                dn = doc["nodes"]
-                li = doc.get("layout", {})
-                bounds = dict(zip(li.get("nodeIndex", []), li.get("bounds", [])))
-                for i, backend in enumerate(dn.get("backendNodeId", [])):
-                    attrs = dn.get("attributes", [])[i]
-                    at = {strings[attrs[k]]: strings[attrs[k + 1]] for k in range(0, len(attrs), 2)}
-                    layout[backend] = {"bounds": bounds.get(i), "tag": strings[dn["nodeName"][i]].lower(),
-                                       "attrs": at, "frame_id": strings[doc["frameId"]]}
-            main_frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
-            raw = cdp.send("Accessibility.getFullAXTree")["nodes"]
-            snapshot_id = uuid.uuid4().hex[:12]
-            retained = [n for n in raw if not n.get("ignored") and n.get("role", {}).get("value") not in SKIP]
-            raw_map = {n["nodeId"]: n for n in raw}
-            refs = {n["nodeId"]: str(i) for i, n in enumerate(retained)}  # 短数字 ref（ComponentBench 风格，模型易抄）
-            nodes = []
-            for n in retained[:self.options.max_nodes]:
-                backend = n.get("backendDOMNodeId")
-                detail = layout.get(backend, {})
-                attrs = detail.get("attrs", {})
-                role = n.get("role", {}).get("value", "")
-                states = {p["name"]: p.get("value", {}).get("value") for p in n.get("properties", [])
-                          if p["name"] in {"checked", "selected", "expanded", "disabled", "focused", "required", "readonly", "level"}}
-                parent = n.get("parentId")
-                seen = set()
-                while parent and parent not in refs and parent not in seen:
-                    seen.add(parent)
-                    parent = raw_map.get(parent, {}).get("parentId")
-                bounds = detail.get("bounds")
-                visible = bool(bounds and bounds[2] > 0 and bounds[3] > 0 and
-                    bounds[0] < viewport["x"] + viewport["width"] and bounds[0] + bounds[2] > viewport["x"] and
-                    bounds[1] < viewport["y"] + viewport["height"] and bounds[1] + bounds[3] > viewport["y"])
-                node = {"ref": refs[n["nodeId"]], "parent": refs.get(parent), "role": role,
-                        "name": str(n.get("name", {}).get("value", ""))[:400], "states": states,
-                        "backend_id": backend, "frame_id": detail.get("frame_id"),
-                        "tag": detail.get("tag", ""), "bounds": bounds, "in_viewport": visible,
-                        "direct": bool(backend and role in INTERACTIVE and detail.get("frame_id") == main_frame)}
-                if "value" in n:
-                    node["value"] = "[redacted]" if attrs.get("type") == "password" else str(n["value"].get("value", ""))[:400]
-                if attrs.get("href"):
-                    node["href"] = attrs["href"][:500]
-                if attrs.get("id"):
-                    node["id"] = attrs["id"][:200]
-                nodes.append(node)
-            warnings = []
-            if len(retained) > self.options.max_nodes:
-                warnings.append("node_limit: additional nodes omitted")
-            if len(page.frames) > 1:
-                warnings.append("iframe content may be incomplete; iframe actions use visual fallback")
-            self.snapshot = {"kind": "browser_ax", "snapshot_id": snapshot_id, "url": url,
-                "title": page.title(), "viewport": viewport, "nodes": nodes, "warnings": warnings,
-                "captured_at": time.time(), "capture_ms": round((time.perf_counter() - start) * 1000, 2)}
-            self.nodes = {n["ref"]: n for n in nodes}
-            return self.snapshot
-        except Exception:
-            self.snapshot = None
-            self.nodes = {}
-            return None
+            snapshot, shot, errors = None, None, []
+            try:
+                snapshot = self._collect_page(page, cdp, identity, start)
+            except Exception as exc:
+                errors.append(str(exc)[:200])
+            viewport_script = "({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})"
+            capture_viewport = page.evaluate(viewport_script)
+            if with_screenshot:
+                try:
+                    import io
+                    from PIL import Image
+                    shot = Image.open(io.BytesIO(page.screenshot(full_page=False, scale="css")))
+                    shot.load()
+                except Exception as exc:
+                    errors.append(str(exc)[:200])
+            if identity != self._identity(page, cdp) or page.url != url:
+                raise BrowserActionError("Page changed during observation", code="stale")
+            final_viewport = page.evaluate(viewport_script)
+            if any(capture_viewport[k] != final_viewport[k] for k in ("width", "height", "x", "y")):
+                raise BrowserActionError("Viewport changed during observation", code="stale")
+            metadata = {**identity, "snapshot_id": snapshot["snapshot_id"] if snapshot else uuid.uuid4().hex[:12],
+                        "captured_at": time.time(), "url": page.url,
+                        "scroll_offset": [final_viewport["x"], final_viewport["y"]],
+                        **self.event_metadata(), "tabs": self._tab_records(browser)}
+            if shot is not None:
+                metadata.update(screenshot_space="css_viewport", screenshot_size=list(shot.size))
+            if errors:
+                metadata["observation_errors"] = errors
+            if snapshot is not None:
+                self.snapshot = snapshot
+                self.nodes = {n["ref"]: n for n in snapshot["nodes"]}
+            self._observation_metadata = metadata
+            if shot is not None:
+                self._last_screenshot = shot
+                self._last_screenshot_metadata = copy.deepcopy(metadata)
+            return shot, snapshot, metadata
+        except Exception as exc:
+            self.invalidate()
+            return None, None, {"error_code": getattr(exc, "code", "stale"), "error": str(exc)[:200], **self.event_metadata()}
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
+
+    def _collect_page(self, page, cdp, identity, start):
+        cdp.send("Accessibility.enable")
+        url = page.url
+        viewport = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
+        dom = cdp.send("DOMSnapshot.captureSnapshot", {"computedStyles": []})
+        strings, layout = dom["strings"], {}
+        for doc in dom["documents"]:
+            dn = doc["nodes"]
+            li = doc.get("layout", {})
+            bounds = dict(zip(li.get("nodeIndex", []), li.get("bounds", [])))
+            for i, backend in enumerate(dn.get("backendNodeId", [])):
+                attrs = dn.get("attributes", [])[i]
+                at = {strings[attrs[k]]: strings[attrs[k + 1]] for k in range(0, len(attrs), 2)}
+                layout[backend] = {"bounds": bounds.get(i), "tag": strings[dn["nodeName"][i]].lower(),
+                                   "attrs": at, "frame_id": strings[doc["frameId"]]}
+        main_frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+        raw = cdp.send("Accessibility.getFullAXTree")["nodes"]
+        snapshot_id = uuid.uuid4().hex[:12]
+        retained = [n for n in raw if not n.get("ignored") and n.get("role", {}).get("value") not in SKIP]
+        raw_map = {n["nodeId"]: n for n in raw}
+        modal_ids = {n["nodeId"] for n in retained if n.get("role", {}).get("value") in {"dialog", "alertdialog"}}
+        modal_tree = set(modal_ids)
+        changed = True
+        while changed:
+            previous = len(modal_tree)
+            modal_tree.update(n["nodeId"] for n in raw if n.get("parentId") in modal_tree)
+            changed = previous != len(modal_tree)
+        for nid in list(modal_tree):
+            parent = raw_map.get(nid, {}).get("parentId")
+            seen = set()
+            while parent and parent not in seen:
+                seen.add(parent)
+                modal_tree.add(parent)
+                parent = raw_map.get(parent, {}).get("parentId")
+        selected_ids = {n["nodeId"] for n in retained[:self.options.max_nodes]} | modal_tree
+        refs = {n["nodeId"]: str(i) for i, n in enumerate(retained)}  # 短数字 ref（ComponentBench 风格，模型易抄）
+        nodes = []
+        for n in retained:
+            if n["nodeId"] not in selected_ids:
+                continue
+            backend = n.get("backendDOMNodeId")
+            detail = layout.get(backend, {})
+            attrs = detail.get("attrs", {})
+            role = n.get("role", {}).get("value", "")
+            states = {p["name"]: p.get("value", {}).get("value") for p in n.get("properties", [])
+                      if p["name"] in {"checked", "selected", "expanded", "disabled", "focused", "required", "readonly", "level"}}
+            parent = n.get("parentId")
+            seen = set()
+            while parent and parent not in refs and parent not in seen:
+                seen.add(parent)
+                parent = raw_map.get(parent, {}).get("parentId")
+            bounds = detail.get("bounds")
+            visible = bool(bounds and bounds[2] > 0 and bounds[3] > 0 and
+                bounds[0] < viewport["x"] + viewport["width"] and bounds[0] + bounds[2] > viewport["x"] and
+                bounds[1] < viewport["y"] + viewport["height"] and bounds[1] + bounds[3] > viewport["y"])
+            node = {"ref": refs[n["nodeId"]], "parent": refs.get(parent), "role": role,
+                    "name": str(n.get("name", {}).get("value", ""))[:400], "states": states,
+                    "backend_id": backend, "frame_id": detail.get("frame_id"),
+                    "tag": detail.get("tag", ""), "bounds": bounds, "in_viewport": visible,
+                    "direct": bool(backend and role in INTERACTIVE and detail.get("frame_id") == main_frame)}
+            if n["nodeId"] in modal_tree:
+                node["modal_context"] = True
+            if "value" in n:
+                node["value"] = "[redacted]" if attrs.get("type") == "password" else str(n["value"].get("value", ""))[:400]
+            if attrs.get("href"):
+                node["href"] = attrs["href"][:500]
+            if attrs.get("id"):
+                node["id"] = attrs["id"][:200]
+            nodes.append(node)
+        warnings = []
+        if len(retained) > self.options.max_nodes:
+            warnings.append("node_limit: additional nodes omitted")
+        if len(page.frames) > 1:
+            warnings.append("iframe content may be incomplete; iframe actions use visual fallback")
+        return {"kind": "browser_ax", "snapshot_id": snapshot_id, "url": url, "frame_id": main_frame, **identity,
+            "title": page.title(), "viewport": viewport, "nodes": nodes, "warnings": warnings,
+            "active_modals": [refs[n] for n in modal_ids if n in refs],
+            "captured_at": time.time(), "capture_ms": round((time.perf_counter() - start) * 1000, 2)}
 
     # ---- route ----
     def _ref_hint(self, observation, limit=20):
         """生成"当前可用元素编号"提示，帮模型从编造/过期的 ref 里纠正过来。"""
-        refs = observation.info.get("exposed_refs") or list(self.nodes.keys())
+        refs = observation.info.get("exposed_refs")
+        if refs is None:
+            refs = list(self.nodes.keys())
         parts = []
         for ref in refs:
             n = self.nodes.get(ref)
@@ -201,37 +791,47 @@ class BrowserSession:
 
     def route(self, action, observation):
         ref = action.args.get("target_ref")
-        if not ref:
+        if ref is not None:
+            ref = str(ref)
+        if ref is None:
             # 模型输出 HTML id → 解析成 ref（比 12 位 hex ref 更短、更易抄）
             eid = action.args.get("element_id")
             if eid:
                 ref = self.resolve_id(str(eid))
-        if not ref:
+        if ref is None:
             return None
+        info = observation.info or {}
+        observation_id = info.get("snapshot_id") or info.get("scene", {}).get("snapshot_id")
+        if observation_id and (not self.snapshot or observation_id != self.snapshot.get("snapshot_id")):
+            return {"channel": "reobserve", "reason": "Observation snapshot changed", "error_code": "stale"}
         if ref not in observation.info.get("exposed_refs", self.nodes):
             hint = self._ref_hint(observation)
-            return {"channel": "reobserve",
+            return {"channel": "reobserve", "error_code": "stale",
                     "reason": f"target_ref '{ref}' 不在当前页面里，可能是编造或过期的编号。"
                               f"当前页面可用的元素编号（部分）：{hint}。"
                               f"请从中选一个正确的 ref，或改用 element_id / 英文 target。"}
         if not self.snapshot or ref not in self.nodes:
-            return {"channel": "reobserve", "reason": "Unknown or stale target_ref"}
+            return {"channel": "reobserve", "reason": "Unknown or stale target_ref", "error_code": "stale"}
         if action.action not in {"click", "double_click", "right_click", "type", "select", "scroll"}:
             return None
         node = self.nodes[ref]
+        if action.action == "scroll" and node.get("frame_id") != self.snapshot.get("frame_id"):
+            return {"channel": "reobserve", "reason": "Cross-frame container scrolling is unsupported",
+                    "error_code": "unsupported"}
         if not node["direct"] and action.action != "scroll":
             return None
         return {"channel": "browser_dom", "snapshot_id": self.snapshot["snapshot_id"],
+                "page_id": self.snapshot.get("page_id"), "document_id": self.snapshot.get("document_id"),
                 "target_ref": ref, "coordinate_space": "css_viewport"}
 
     def resolve_id(self, element_id):
         """按 HTML id 属性找节点，返回 ref 或 None。"""
+        self.last_resolution_error = None
         if not self.nodes or not element_id:
             return None
-        for ref, n in self.nodes.items():
-            if n.get("id") == element_id:
-                return ref
-        return None
+        matches = [ref for ref, n in self.nodes.items() if n.get("id") == element_id]
+        self.last_resolution_error = "ambiguous" if len(matches) > 1 else None
+        return matches[0] if len(matches) == 1 else None
 
     # ---- 语义回退：target 描述 → 节点 ref ----
     _STOPWORDS = {
@@ -249,6 +849,7 @@ class BrowserSession:
         命中即走 DOM 定位（跳过视觉定位）；匹配不置信返回 None → 交给视觉定位。
         allowed：可选 set，只在这些 ref（= 已暴露给模型的节点）里匹配。
         """
+        self.last_resolution_error = None
         if not self.snapshot or not self.nodes:
             return None
         t = (target or "").lower()
@@ -256,7 +857,7 @@ class BrowserSession:
             return None
         # 模型有时把 ref 直接写进 target 描述里（如 "[87]"）→ 直接提取用
         m = re.search(r"\[(\d+)\]", t)
-        if m and m.group(1) in self.nodes:
+        if m and m.group(1) in self.nodes and self.nodes[m.group(1)].get("direct"):
             if allowed is None or m.group(1) in allowed:
                 return m.group(1)
         # 引号里的精确短语（模型通常写成 "The 'X' option in ..."）
@@ -266,8 +867,8 @@ class BrowserSession:
         # 方括号里的短语（模型写成 "The [PDF] xxx link" 这种）也当精确短语提取
         quoted += re.findall(r"\[([^\[\]]{2,80})\]", t)
         tokens = set(re.findall(r"[a-z0-9]+", t)) - self._STOPWORDS
-        allowed_set = set(allowed) if allowed else None
-        best_ref, best_score = None, 0
+        allowed_set = set(allowed) if allowed is not None else None
+        candidates = []
         for ref, n in self.nodes.items():
             if allowed_set is not None and ref not in allowed_set:
                 continue
@@ -290,38 +891,376 @@ class BrowserSession:
                 score += 6 * sum(1 for tk in tokens if tk and (tk in name or tk in value))
             if role and role in t:
                 score += 4
-            if score > best_score:
-                best_score, best_ref = score, ref
+            if score >= 24:
+                candidates.append((score, ref))
         # 只信「引号精确命中」这一档（≥24）或足够强的 token 命中；宁可不匹配走视觉定位，
         # 也不要在 DOM 里点错节点。
-        if best_ref and best_score >= 24:
-            return best_ref
+        candidates.sort(reverse=True)
+        if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 12:
+            self.last_resolution_error = "ambiguous"
+            return None
+        if candidates:
+            return candidates[0][1]
+        self.last_resolution_error = "not_found"
         return None
 
+    def _validate_binding(self, binding, page=None, cdp=None):
+        if not binding or not all(binding.get(k) is not None for k in ("page_id", "document_id", "snapshot_id", "captured_at")):
+            raise BrowserActionError("Observation has no page/document binding", code="stale")
+        age = time.time() - binding["captured_at"]
+        if age < 0 or age > self.options.max_snapshot_age:
+            raise BrowserActionError("Observation expired", code="stale")
+        if page is not None:
+            actual = self._identity(page, cdp)
+            if any(actual[k] != binding[k] for k in ("page_id", "document_id")):
+                raise BrowserActionError("Page or document changed", code="stale")
+            if binding.get("url") and page.url != binding["url"]:
+                raise BrowserActionError("Page navigated", code="stale")
+
+    _INSPECT_PROPERTIES = r"""function() {
+      const e = this.nodeType === 1 ? this : this.parentElement;
+      if (!e || !e.isConnected) return {detached:true};
+      const tag = e.tagName.toLowerCase(), type = (e.getAttribute('type') || '').toLowerCase();
+      const autocomplete = (e.getAttribute('autocomplete') || '').toLowerCase();
+      const labels = Array.from(e.labels || []).map(label => label.textContent || '').join(' ');
+      const semantic = [e.getAttribute('name'), e.id, e.getAttribute('aria-label'),
+                        e.getAttribute('placeholder'), labels].filter(Boolean).join(' ');
+      const reasons = [];
+      if (type === 'password') reasons.push('password');
+      if (/(^|\s)(current-password|new-password|one-time-code|cc-[^\s]+)(\s|$)/.test(autocomplete))
+        reasons.push('sensitive_autocomplete');
+      const control = tag === 'input' || tag === 'textarea' || e.isContentEditable;
+      if (control && /password|passcode|one.?time|(?:^|[\W_])otp(?:[\W_]|$)|otp(?:code|input|digit|field)|(?:verification|authentication|security).?(?:code|pin)|(?:credit|debit|card).?(?:number|security|verification|expiry|expiration)|\bcc[-_ ]?(?:number|num|exp|csc|cvv|cvc)\b|\b(?:cvv|cvc|ccnum)\b|密码|验证码|信用卡|银行卡|卡号/i.test(semantic))
+        reasons.push('sensitive_label');
+      const disabled = !!e.disabled || e.getAttribute('aria-disabled') === 'true' || !!e.closest('[inert]');
+      const editable = !disabled && !e.readOnly && (e.isContentEditable || tag === 'textarea' ||
+        (tag === 'input' && !['button','submit','reset','checkbox','radio','file','hidden','image','range','color'].includes(type)));
+      let editable_has_text = null;
+      if (editable) {
+        const content = e.isContentEditable ? e.textContent : e.value;
+        editable_has_text = typeof content === 'string' ? content.length > 0 : null;
+      }
+      const rect = e.getBoundingClientRect();
+      return {tag, input_type:type, editable:!!editable, editable_has_text, sensitive:reasons.length > 0, sensitive_reasons:reasons,
+              disabled, bounds:[rect.x,rect.y,rect.width,rect.height]};
+    }"""
+
+    _INSPECT_ANCESTOR = r"""function(skipSelf) {
+      const parent = e => e.assignedSlot || e.parentElement || (e.getRootNode && e.getRootNode().host);
+      let e = this.nodeType === 1 ? this : this.parentElement;
+      if (skipSelf && e) e = parent(e);
+      const roles = new Set(['button','link','textbox','searchbox','checkbox','radio','combobox',
+        'menuitem','menuitemcheckbox','menuitemradio','tab','switch','slider','spinbutton',
+        'listbox','option','treeitem']);
+      for (let depth=0; e && depth<64; depth++, e=parent(e)) {
+        if (e.matches('button,a[href],input,textarea,select,option,summary,[contenteditable]:not([contenteditable="false"])') ||
+            roles.has(e.getAttribute('role'))) return e;
+      }
+      return null;
+    }"""
+
+    _INSPECT_SCROLL_ANCESTOR = r"""function() {
+      const parent = e => e.assignedSlot || e.parentElement || (e.getRootNode && e.getRootNode().host);
+      let e = this.nodeType === 1 ? this : this.parentElement;
+      for (let depth=0; e && depth<64; depth++, e=parent(e)) {
+        if (e === document.scrollingElement) return e;
+        const overflow = getComputedStyle(e).overflowY;
+        if (['auto','scroll','overlay'].includes(overflow) && e.scrollHeight > e.clientHeight) return e;
+      }
+      return document.scrollingElement;
+    }"""
+
+    @browser_thread
+    def inspect_point(self, x, y, metadata):
+        """Inspect a frozen CSS screenshot point without input or a new snapshot.
+
+        A target_ref is returned only after a live backend-node match. Bounding
+        boxes are diagnostics, never evidence for choosing a semantic target.
+        """
+        return self._inspect_target(metadata, point=(x, y))
+
+    @browser_thread
+    def inspect_focused(self, metadata):
+        """Inspect focus, including open shadow roots; return only text presence, never content."""
+        return self._inspect_target(metadata)
+
+    @browser_thread
+    def inspect_scroll_target(self, x, y, metadata):
+        """Resolve the actual scroll container without dispatch or new AX refs."""
+        return self._inspect_target(metadata, point=(x, y), scroll=True)
+
+    @browser_thread
+    def insert_focused_text(self, text, metadata, overwrite=False, expected_backend_id=None):
+        """Insert human text at the existing caret, without a second click.
+
+        Focus and sensitive-field checks happen before any keyboard dispatch.
+        Once dispatch starts, an exception is uncertain and must not be retried.
+        """
+        started, dispatched = time.perf_counter(), False
+        if not isinstance(text, str) or not isinstance(overwrite, bool):
+            return self._failure("Text must be a string and overwrite a boolean", "unsupported")
+        inspected = self.inspect_focused(metadata)
+        if inspected.get("status") != "inspected":
+            return inspected
+        if inspected.get("sensitive") or inspected.get("sensitive_unknown"):
+            return self._failure("Sensitive fields cannot be recorded as ordinary text input", "blocked")
+        if not inspected.get("editable"):
+            return self._failure("Focused element is not editable", "blocked")
+        backend_id = inspected.get("focused_backend_id")
+        if backend_id is None or (expected_backend_id is not None and expected_backend_id != backend_id):
+            return self._failure("Focused element changed", "stale")
+        p = browser = cdp = None
+        group = "human-insert-" + uuid.uuid4().hex
+        try:
+            p, browser = self._connect()
+            page = self._pick_page(browser)
+            if page is None:
+                raise BrowserActionError("Task page unavailable", code="stale")
+            cdp = self._cdp(page)
+            self._validate_binding(metadata, page, cdp)
+            obj = cdp.send("DOM.resolveNode", {"backendNodeId": backend_id,
+                                               "objectGroup": group})["object"].get("objectId")
+            if not obj:
+                raise BrowserActionError("Focused element detached", code="stale")
+            inspection = cdp.send("Runtime.callFunctionOn", {"objectId": obj,
+                "functionDeclaration": """function() {
+                  let active=document.activeElement;
+                  while(active && active.shadowRoot && active.shadowRoot.activeElement)
+                    active=active.shadowRoot.activeElement;
+                  return {same_focus:active === this, fields:(""" + self._INSPECT_PROPERTIES + """).call(this)};
+                }""", "returnByValue": True, "objectGroup": group})
+            focus = inspection.get("result", {}).get("value") or {}
+            if inspection.get("exceptionDetails") or not focus.get("same_focus"):
+                raise BrowserActionError("Focus changed before text input", code="stale")
+            fields = focus.get("fields") or {}
+            if fields.get("detached"):
+                raise BrowserActionError("Focused element detached", code="stale")
+            if fields.get("sensitive") or not fields.get("editable"):
+                raise BrowserActionError("Focused element is sensitive or not editable", code="blocked")
+            dispatched = True
+            if overwrite:
+                page.keyboard.press("ControlOrMeta+A")
+                page.keyboard.press("Backspace")
+            page.keyboard.insert_text(text)
+            return {"status": "executed", "dispatched": True, "channel": "browser_dom",
+                    "action": "type", "resolved": "focused_input", "backend_id": backend_id,
+                    "page_id": metadata["page_id"], "document_id": metadata["document_id"],
+                    "snapshot_id": metadata["snapshot_id"],
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except Exception as exc:
+            return self._failure(exc, getattr(exc, "code", "blocked"), dispatched, started,
+                                 action="type", resolved="focused_input")
+        finally:
+            if cdp is not None:
+                try:
+                    cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:
+                    pass
+            if browser is not None:
+                self._disconnect(p, browser)
+
+    def _inspect_target(self, metadata, point=None, scroll=False):
+        started = time.perf_counter()
+        p = browser = cdp = None
+        group = "human-inspect-" + uuid.uuid4().hex
+        try:
+            self._validate_binding(metadata)
+            if metadata.get("snapshot_id") != self._observation_metadata.get("snapshot_id"):
+                raise BrowserActionError("Observation superseded", code="stale")
+            if metadata.get("screenshot_stale"):
+                raise BrowserActionError("Screenshot is stale", code="stale")
+            if point is not None and metadata.get("screenshot_space") != "css_viewport":
+                raise BrowserActionError("Expected CSS viewport coordinates", code="unsupported")
+            p, browser = self._connect()
+            page = self._pick_page(browser)
+            if page is None:
+                raise BrowserActionError("Task page unavailable", code="stale")
+            if any(d["page"] is page for d in self._dialogs.values()):
+                raise BrowserActionError("JavaScript dialog blocks inspection", code="blocked")
+            cdp = self._cdp(page)
+            self._validate_binding(metadata, page, cdp)
+            viewport_script = "({w: innerWidth, h: innerHeight, x: scrollX, y: scrollY})"
+            viewport = page.evaluate(viewport_script)
+            if metadata.get("screenshot_size") and metadata["screenshot_size"] != [viewport["w"], viewport["h"]]:
+                raise BrowserActionError("Viewport resized", code="stale")
+            if metadata.get("scroll_offset") != [viewport["x"], viewport["y"]]:
+                raise BrowserActionError("Viewport scrolled", code="stale")
+            identity = {key: metadata[key] for key in ("page_id", "document_id", "snapshot_id")}
+            result = {"status": "inspected", "dispatched": False, "matched": False,
+                      "target_label": "", "editable": False, "sensitive": False,
+                      "sensitive_reasons": [], "coordinate_space": "css_viewport", **identity}
+            main_frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+            if point is not None:
+                x, y = point
+                if not (isinstance(x, (int, float)) and not isinstance(x, bool)
+                        and isinstance(y, (int, float)) and not isinstance(y, bool)
+                        and math.isfinite(x) and math.isfinite(y)
+                        and 0 <= x < viewport["w"] and 0 <= y < viewport["h"]):
+                    raise BrowserActionError("Point is outside the screenshot", code="not_found")
+                result["point"] = [x, y]
+                hit = cdp.send("DOM.getNodeForLocation", {"x": int(x), "y": int(y),
+                    "includeUserAgentShadowDOM": True, "ignorePointerEventsNone": False})
+                result["hit_backend_id"] = hit.get("backendNodeId")
+                if hit.get("frameId") != main_frame:
+                    result.update(reason="iframe_target", sensitive=True, sensitive_unknown=True,
+                                  sensitive_reasons=["uninspectable_frame"])
+                    obj = None
+                else:
+                    obj = cdp.send("DOM.resolveNode", {"backendNodeId": hit["backendNodeId"],
+                                                       "objectGroup": group})["object"].get("objectId")
+            else:
+                focused = cdp.send("Runtime.evaluate", {"expression": """(() => {
+                  let e=document.activeElement;
+                  while(e && e.shadowRoot && e.shadowRoot.activeElement) e=e.shadowRoot.activeElement;
+                  return e;
+                })()""", "objectGroup": group, "returnByValue": False})
+                if focused.get("exceptionDetails"):
+                    raise BrowserActionError("Focus inspection failed", code="blocked")
+                obj = focused.get("result", {}).get("objectId")
+
+            def call(object_id, function, *, by_value=True, arguments=None):
+                response = cdp.send("Runtime.callFunctionOn", {"objectId": object_id,
+                    "functionDeclaration": function, "returnByValue": by_value,
+                    "objectGroup": group, "arguments": [{"value": arg} for arg in (arguments or [])]})
+                if response.get("exceptionDetails"):
+                    raise BrowserActionError("Element inspection failed", code="stale")
+                return response.get("result", {}).get("value" if by_value else "objectId")
+
+            if scroll:
+                result.update(root_scroll=False, semantic_unavailable=True)
+                if obj:
+                    container = call(obj, self._INSPECT_SCROLL_ANCESTOR, by_value=False)
+                    if container:
+                        properties = call(container, self._INSPECT_PROPERTIES)
+                        if not properties or properties.get("detached"):
+                            raise BrowserActionError("Scroll container detached", code="stale")
+                        result.update(properties)
+                        result["root_scroll"] = bool(call(container, "function(){return this === document.scrollingElement;}"))
+                        result["reason"] = "root_scroll" if result["root_scroll"] else "nested_scroll"
+                        if result["root_scroll"]:
+                            result["semantic_unavailable"] = False
+                        else:
+                            backend = cdp.send("DOM.describeNode", {"objectId": container, "depth": 0})["node"]["backendNodeId"]
+                            matches = [(ref, node) for ref, node in self.nodes.items()
+                                       if node.get("backend_id") == backend and node.get("frame_id") == main_frame]
+                            if len(matches) == 1 and self.snapshot and self.snapshot.get("snapshot_id") == metadata["snapshot_id"]:
+                                ref, node = matches[0]
+                                result.update(matched=True, backend_id=backend, role=node.get("role", ""),
+                                              target_label=" ".join(filter(None, (node.get("role", ""), node.get("name", "")))))
+                                if ref in (metadata.get("exposed_refs") or []):
+                                    result.update(target_ref=ref, semantic_unavailable=False)
+                                    if node.get("id"):
+                                        result["element_id"] = node["id"]
+                                else:
+                                    result["unexposed"] = True
+                    else:
+                        result["reason"] = "no_scroll_target"
+                obj = None
+
+            if obj:
+                if point is None:
+                    result["focused_backend_id"] = cdp.send("DOM.describeNode", {"objectId": obj, "depth": 0})["node"]["backendNodeId"]
+                properties = call(obj, self._INSPECT_PROPERTIES)
+                if not properties or properties.get("detached"):
+                    raise BrowserActionError("Element detached", code="stale")
+                result.update(properties)
+                if properties.get("tag") in {"iframe", "frame"}:
+                    result.update(reason="iframe_target", sensitive=True, sensitive_unknown=True,
+                                  sensitive_reasons=["uninspectable_frame"])
+                elif properties.get("tag") == "canvas":
+                    result["reason"] = "canvas_target"
+                else:
+                    candidate = call(obj, self._INSPECT_ANCESTOR, by_value=False, arguments=[False])
+                    # Walk interactive ancestors, including shadow hosts. The
+                    # first exact AX backend match is the most specific target.
+                    for _ in range(16):
+                        if not candidate:
+                            break
+                        backend = cdp.send("DOM.describeNode", {"objectId": candidate, "depth": 0})["node"]["backendNodeId"]
+                        matches = [(ref, node) for ref, node in self.nodes.items()
+                                   if node.get("backend_id") == backend and node.get("direct")
+                                   and node.get("frame_id") == main_frame]
+                        if len(matches) == 1 and self.snapshot and self.snapshot.get("snapshot_id") == metadata["snapshot_id"]:
+                            ref, node = matches[0]
+                            properties = call(candidate, self._INSPECT_PROPERTIES)
+                            if not properties or properties.get("detached"):
+                                raise BrowserActionError("Target detached", code="stale")
+                            result.update(properties)
+                            result.update(matched=True, backend_id=backend, role=node.get("role", ""),
+                                          target_label=" ".join(filter(None, (node.get("role", ""), node.get("name", "")))))
+                            exposed = metadata.get("exposed_refs")
+                            if exposed is None or ref in exposed:
+                                result["target_ref"] = ref
+                                if node.get("id"):
+                                    result["element_id"] = node["id"]
+                            else:
+                                result["unexposed"] = True
+                            break
+                        candidate = call(candidate, self._INSPECT_ANCESTOR, by_value=False, arguments=[True])
+                    if not result["matched"]:
+                        result["reason"] = "no_matching_ax_node"
+            elif "reason" not in result:
+                result["reason"] = "no_focused_element" if point is None else "no_dom_element"
+            self._validate_binding(metadata, page, cdp)
+            if page.evaluate(viewport_script) != viewport:
+                raise BrowserActionError("Viewport changed during inspection", code="stale")
+            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            return result
+        except Exception as exc:
+            return self._failure(exc, getattr(exc, "code", "blocked"), started=started)
+        finally:
+            if cdp is not None:
+                try:
+                    cdp.send("Runtime.releaseObjectGroup", {"objectGroup": group})
+                except Exception:
+                    pass
+            if browser is not None:
+                self._disconnect(p, browser)
+
     # ---- execute ----
+    @browser_thread
     def execute(self, action, route):
-        ref = route.get("target_ref")
+        if action.action == "download":
+            return self.download(str(action.args.get("url") or ""))
+        if action.action not in {"click", "double_click", "right_click", "type", "select", "scroll"}:
+            return self._failure(f"Unsupported DOM action: {action.action}", "unsupported")
+        try:
+            self._validate_binding(self.snapshot)
+            if route.get("snapshot_id") != self.snapshot["snapshot_id"]:
+                raise BrowserActionError("Route snapshot changed", code="stale")
+            for key in ("page_id", "document_id"):
+                if route.get(key) is not None and route[key] != self.snapshot[key]:
+                    raise BrowserActionError("Route page/document changed", code="stale")
+        except BrowserActionError as exc:
+            return self._failure(exc, exc.code)
+        ref = str(route.get("target_ref"))
         node = self.nodes.get(ref)
         if node is None:
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Unknown target_ref"}
+            return self._failure("Unknown target_ref", "stale")
+        if node.get("frame_id") != self.snapshot.get("frame_id"):
+            return self._failure("Cross-frame DOM coordinates are unsupported", "unsupported")
         if (self.foreground_check and not self.foreground_check()):
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Browser lost focus"}
+            return self._failure("Browser lost focus", "blocked")
         started, dispatched = time.perf_counter(), False
         try:
             p, browser = self._connect()
         except Exception as exc:
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": str(exc)[:200]}
+            return self._failure(exc, "not_found")
         try:
             page = self._pick_page(browser)
             if page is None:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "No focused page"}
-            if page.url != self.snapshot.get("url"):
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Page navigated"}
-            cdp = page.context.new_cdp_session(page)
+                return self._failure("Task page unavailable", "stale")
+            if any(d["page"] is page for d in self._dialogs.values()):
+                return self._failure("JavaScript dialog must be handled first", "blocked", **self.event_metadata())
+            cdp = self._cdp(page)
+            self._validate_binding(self.snapshot, page, cdp)
             backend_id = node["backend_id"]
-            obj = cdp.send("DOM.resolveNode", {"backendNodeId": backend_id})["object"].get("objectId")
+            try:
+                obj = cdp.send("DOM.resolveNode", {"backendNodeId": backend_id})["object"].get("objectId")
+            except Exception as exc:
+                raise BrowserActionError("Target detached", code="stale") from exc
             if not obj:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Target detached"}
+                return self._failure("Target detached", "stale")
             cdp.send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
             inspect = """function() {
               if (!this.isConnected || !(this instanceof Element)) return {error:'detached'};
@@ -334,7 +1273,9 @@ class BrowserSession:
               while(hit && hit.shadowRoot && hit.shadowRoot.elementFromPoint) {
                 const next=hit.shadowRoot.elementFromPoint(x,y); if (!next || next===hit) break; hit=next;
               }
-              if (!hit || !(this===hit || this.contains(hit))) return {error:'occluded'};
+              if (!hit || !(this===hit || this.contains(hit))) return {error:'occluded',point:{x,y},
+                blocker:hit ? {id:hit.id,tag:hit.tagName.toLowerCase(),role:hit.getAttribute('role'),
+                  name:(hit.getAttribute('aria-label') || hit.innerText || '').slice(0,300)} : null};
               return {x,y,w:r.width,h:r.height,tag:this.tagName.toLowerCase(),readOnly:!!this.readOnly,
                       editable:this.isContentEditable || this.tagName==='TEXTAREA' || (this.tagName==='INPUT' && !['button','submit','checkbox','radio','file'].includes(this.type))};
             }"""
@@ -348,30 +1289,33 @@ class BrowserSession:
             page.wait_for_timeout(35)
             point = call(obj, inspect)
             if not point or point.get("error"):
-                raise BrowserActionError((point or {}).get("error", "Target not actionable"))
+                reason = (point or {}).get("error", "Target not actionable")
+                if reason == "occluded":
+                    blocker = point.get("blocker") or {}
+                    blocker_ref = self.resolve_id(blocker.get("id")) if blocker.get("id") else None
+                    if blocker_ref is None and point.get("point"):
+                        try:
+                            at = point["point"]
+                            backend = cdp.send("DOM.getNodeForLocation", {"x": int(at["x"]),
+                                "y": int(at["y"]), "includeUserAgentShadowDOM": True}).get("backendNodeId")
+                            blocker_ref = next((ref for ref, n in self.nodes.items() if n.get("backend_id") == backend), None)
+                        except Exception:
+                            pass
+                    return self._failure(reason, "blocked", started=started, blocker=blocker,
+                        blocker_ref=blocker_ref,
+                        active_modals=copy.deepcopy(self.snapshot.get("active_modals", [])))
+                raise BrowserActionError(reason, code="stale" if reason == "detached" else "blocked")
             if first != point:
                 raise BrowserActionError("Target moved during actionability check")
             name, args = action.action, action.args
-            # 点击的是 PDF 链接 → 直接 HTTP 下载保存（而非浏览器打开 PDF 查看器）
-            if name in ("click", "right_click", "double_click") and node.get("href"):
-                try:
-                    from urllib.parse import urljoin
-                    full = urljoin(self.snapshot.get("url", ""), node["href"])
-                except Exception:  # noqa: BLE001
-                    full = node["href"]
-                _u = full.lower()
-                # PDF 链接判定：.pdf 后缀 / 查询/锚点参数 / 路径含 /pdf/（arXiv 的 /pdf/1706.03762 这类）
-                if (_u.endswith(".pdf") or ".pdf?" in _u or ".pdf#" in _u
-                        or "/pdf/" in _u or _u.endswith("/pdf")):
-                    return self.download(full)
             if name == "type" and (not point["editable"] or point["readOnly"]):
                 raise BrowserActionError("Target is not editable")
             if name == "select" and point["tag"] != "select":
-                raise BrowserActionError("Custom dropdown: use click and then click its option")
+                raise BrowserActionError("Custom dropdown: use click and then click its option", code="unsupported")
             if name == "select":
                 matches = call(obj, "function(label){return Array.from(this.options).filter(o=>o.label===label && !o.disabled).map(o=>o.index)}", [str(args["option"])])
                 if len(matches) != 1:
-                    raise BrowserActionError("Select option is absent or ambiguous")
+                    raise BrowserActionError("Select option is absent or ambiguous", code="ambiguous" if matches else "not_found")
                 dispatched = True
                 call(obj, """function(i){ this.selectedIndex=i; this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); }""", [matches[0]])
             elif name == "scroll":
@@ -393,18 +1337,10 @@ class BrowserSession:
                     "target_ref": ref, "coord": [point["x"], point["y"]],
                     "coordinate_space": "css_viewport", "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except Exception as exc:
-            return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
-                    "channel": "browser_dom", "error": str(exc)[:500],
-                    "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+            return self._failure(exc, getattr(exc, "code", "blocked"),
+                                 dispatched or getattr(exc, "dispatched", False), started)
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
     # ---- 纯 CDP 浏览器动作（不动真实鼠标键盘）----
     _KEY_MAP = {
@@ -421,6 +1357,7 @@ class BrowserSession:
         k = (key or "").strip().lower()
         return cls._KEY_MAP.get(k, key)
 
+    @browser_thread
     def goto(self, url):
         """CDP 导航（虚拟，不动真实鼠标键盘）。"""
         url = (url or "").strip()
@@ -429,7 +1366,7 @@ class BrowserSession:
                     "error": "empty url"}
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        started = time.perf_counter()
+        started, dispatched = time.perf_counter(), False
         try:
             p, browser = self._connect()
         except Exception as exc:
@@ -438,51 +1375,66 @@ class BrowserSession:
         try:
             page = self._pick_page(browser)
             if page is None:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "error": "No page"}
+                return self._failure("Task page unavailable", "stale")
+            dispatched = True
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "action": "goto", "url": page.url[:300],
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except Exception as exc:
-            return {"status": "uncertain", "dispatched": False, "channel": "browser_dom",
-                    "error": str(exc)[:300]}
+            return self._failure(exc, "blocked", dispatched, started)
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
     def screenshot(self):
-        """截当前页面 viewport（返回 PIL Image），不受其他窗口遮挡。"""
+        """CSS 像素 viewport 截图，同时建立其页面/文档绑定。"""
+        return self.collect_observation()[0]
+
+    @browser_thread
+    def get_page_source(self, target_ref=None, max_chars=20000):
+        """Read a sanitized bounded DOM subtree from the bound task document."""
         try:
             p, browser = self._connect()
-        except Exception:
-            return None
+        except Exception as exc:
+            return f"页面源码不可用：{str(exc)[:200]}"
         try:
             page = self._pick_page(browser)
             if page is None:
-                return None
-            data = page.screenshot(full_page=False)
-            import io
-            from PIL import Image
-            return Image.open(io.BytesIO(data))
-        except Exception:
-            return None
+                return "任务页面不可用，请重新观察"
+            cdp = self._cdp(page)
+            before = self._identity(page, cdp)
+            url = page.url
+            clean = """function(){const root=this.cloneNode(true);
+              root.querySelectorAll('script,style,noscript,template,input[type=hidden]').forEach(n=>n.remove());
+              [root,...root.querySelectorAll('*')].forEach(n=>{
+                for(const a of [...n.attributes || []]) if(a.name.startsWith('on') ||
+                  ['style','nonce','integrity','srcdoc'].includes(a.name)) n.removeAttribute(a.name);
+                if(n.matches && n.matches('input[type=password]')) n.removeAttribute('value');
+              }); return root.outerHTML;}"""
+            if target_ref is not None:
+                self._validate_binding(self.snapshot, page, cdp)
+                node = self.nodes.get(str(target_ref))
+                if node is None or not node.get("backend_id"):
+                    return "Unknown or stale target_ref; reobserve first"
+                obj = cdp.send("DOM.resolveNode", {"backendNodeId": node["backend_id"]})["object"].get("objectId")
+                result = cdp.send("Runtime.callFunctionOn", {"objectId": obj,
+                    "functionDeclaration": clean, "returnByValue": True})
+                html = result.get("result", {}).get("value", "")
+            else:
+                html = page.evaluate("() => (" + clean + ").call(document.documentElement)")
+            if not isinstance(html, str):
+                raise ValueError("DOM source unavailable")
+            if before != self._identity(page, cdp) or page.url != url:
+                self.invalidate()
+                return "读取源码期间页面发生导航，请重新观察"
+            limit = min(50000, max(100, int(max_chars)))
+            return f"URL: {url}\n{html[:limit]}" + ("\n[truncated]" if len(html) > limit else "")
+        except Exception as exc:
+            return f"页面源码不可用：{str(exc)[:200]}"
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
+    @browser_thread
     def viewport_size(self):
         """返回当前页面 viewport 尺寸 (width, height)。"""
         try:
@@ -498,149 +1450,194 @@ class BrowserSession:
         except Exception:
             return None
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
     def click_at_viewport(self, action, vx, vy):
-        """视觉定位回退（浏览器 viewport 截图坐标系）：直接在 viewport 坐标处 CDP 虚拟点击/输入。
+        """兼容旧调用；新环境用 execute_viewport_action 传入对应观察的 metadata。"""
+        from copy import copy
+        action = copy(action)
+        action.args = {**action.args, "x": vx, "y": vy}
+        return self.execute_viewport_action(action)
 
-        与 click_at_screen 的区别：坐标已经是 viewport 坐标（因为截图就是 viewport），
-        不再做屏幕→viewport 换算。
-        """
+    @browser_thread
+    def execute_viewport_action(self, action, metadata=None):
+        """仅在截图绑定仍有效时执行 CSS viewport 输入。"""
         started, dispatched = time.perf_counter(), False
+        name, args = action.action, action.args
+        point_scroll = name == "scroll" and ("x" in args or "y" in args)
+        without_coordinates = name in {"press", "hotkey"} or (name == "scroll" and not point_scroll)
+        if name not in {"click", "double_click", "right_click", "type", "drag_and_drop", "scroll", "press", "hotkey"}:
+            return self._failure(f"Unsupported visual action: {name}", "unsupported", resolved="visual")
+        binding = metadata if metadata is not None else self._observation_metadata
+        try:
+            self._validate_binding(binding)
+            if binding.get("snapshot_id") != self._observation_metadata.get("snapshot_id"):
+                raise BrowserActionError("Visual observation superseded", code="stale")
+            if not without_coordinates and binding.get("screenshot_space") != "css_viewport":
+                raise BrowserActionError("Expected a CSS viewport screenshot", code="unsupported")
+            width, height = binding.get("screenshot_size", (0, 0))
+            if without_coordinates:
+                points = []
+            elif name == "drag_and_drop":
+                points = [(args.get("x1"), args.get("y1")), (args.get("x2"), args.get("y2"))]
+            else:
+                points = [(args.get("x"), args.get("y"))]
+            if not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                       and isinstance(y, (int, float)) and not isinstance(y, bool)
+                       and math.isfinite(x) and math.isfinite(y) and 0 <= x < width and 0 <= y < height
+                       for x, y in points):
+                raise BrowserActionError("Visual coordinates outside screenshot", code="not_found")
+        except (BrowserActionError, KeyError, TypeError, ValueError) as exc:
+            return self._failure(exc, getattr(exc, "code", "stale"), resolved="visual")
         try:
             p, browser = self._connect()
         except Exception as exc:
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                    "resolved": "visual", "error": str(exc)[:200]}
+            return self._failure(exc, "not_found", resolved="visual")
         try:
             page = self._pick_page(browser)
             if page is None:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "resolved": "visual", "error": "No page"}
-            name = action.action
+                return self._failure("Task page unavailable", "stale", resolved="visual")
+            if any(d["page"] is page for d in self._dialogs.values()):
+                return self._failure("JavaScript dialog must be handled first", "blocked", **self.event_metadata())
+            cdp = self._cdp(page)
+            self._validate_binding(binding, page, cdp)
+            viewport = page.evaluate("({w: innerWidth, h: innerHeight, x: scrollX, y: scrollY})")
+            if not without_coordinates and [viewport["w"], viewport["h"]] != [width, height]:
+                raise BrowserActionError("Viewport resized after observation", code="stale")
+            if not without_coordinates and binding.get("scroll_offset") != [viewport.get("x", 0), viewport.get("y", 0)]:
+                raise BrowserActionError("Viewport scrolled after observation", code="stale")
+            vx, vy = points[0] if points else (None, None)
             if name in ("click", "double_click", "right_click"):
+                dispatched = True
                 page.mouse.click(vx, vy, button="right" if name == "right_click" else "left",
                                  click_count=2 if name == "double_click" else 1)
-                dispatched = True
             elif name == "type":
+                dispatched = True
                 page.mouse.click(vx, vy)
                 if action.args.get("overwrite"):
                     page.keyboard.press("ControlOrMeta+A")
                     page.keyboard.press("Backspace")
                 page.keyboard.insert_text(str(action.args.get("text", "")))
+            elif name == "drag_and_drop":
+                page.mouse.move(vx, vy)
                 dispatched = True
-            else:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "resolved": "visual", "error": f"不支持的视觉动作 {name}"}
+                try:
+                    page.mouse.down()
+                    page.mouse.move(*points[1], steps=12)
+                finally:
+                    page.mouse.up()
+            elif name == "scroll":
+                delta = int(args.get("amount", 1)) * 300 * (-1 if args.get("direction", "down") == "up" else 1)
+                dispatched = True
+                if point_scroll:
+                    page.mouse.move(vx, vy)
+                    page.mouse.wheel(0, delta)
+                else:
+                    page.evaluate("delta => window.scrollBy(0, delta)", delta)
+            elif name in {"press", "hotkey"}:
+                key = (self._norm_key(str(args.get("key", ""))) if name == "press" else
+                       "+".join(self._norm_key(k) for k in args.get("keys", [])))
+                if not key:
+                    raise BrowserActionError("Missing key", code="unsupported")
+                dispatched = True
+                page.keyboard.press(key)
             return {"status": "executed" if dispatched else "rejected", "dispatched": dispatched,
-                    "channel": "browser_dom", "resolved": "visual",
+                    "channel": "browser_dom", "resolved": "visual", "action": name,
                     "coord": [vx, vy], "coordinate_space": "css_viewport",
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except Exception as exc:
+            return self._failure(exc, getattr(exc, "code", "blocked"), dispatched, started, resolved="visual")
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
+    @browser_thread
     def download(self, url):
-        """用 HTTP 下载文件（论文 PDF 等）到 downloads 目录，返回结果 dict。
-
-        带浏览器 User-Agent、跟随重定向；从 Content-Disposition 或 URL 提取文件名。
-        """
-        import requests
-        import urllib3
-        from urllib.parse import urlparse, unquote
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        """Download with the task BrowserContext's cookies, recording transport evidence."""
+        from urllib.parse import urlparse
         url = (url or "").strip()
         if not url.startswith(("http://", "https://")):
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                    "action": "download", "error": f"无效下载地址: {url[:120]}"}
-        # 幂等：本次会话已下载过这个 URL → 直接返回，不重复下载（防模型重复点击同一链接）
-        if url in self._downloaded:
-            path = self._downloaded[url]
-            return {"status": "already_downloaded", "dispatched": False, "channel": "browser_dom",
-                    "action": "download", "path": path,
-                    "message": f"该文件已下载过：{path}，无需重复下载"}
-        headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")}
+            return self._failure("Invalid download URL", "unsupported", action="download", url=url)
+        cached = next((a for a in reversed(self._artifacts) if a["url"] == url), None)
+        if cached:
+            try:
+                digest = self._file_hash(cached["path"])
+                if digest == cached.get("sha256"):
+                    return {"status": "already_downloaded", "dispatched": False,
+                        "action": "download", "url": url, "path": cached["path"],
+                        "bytes": cached["bytes"], "verified": True, "semantic_verified": False,
+                        "artifacts": [copy.deepcopy(cached)]}
+            except OSError:
+                pass
+        response, path, created = None, None, False
         started = time.perf_counter()
         try:
-            # verify=False：公司网络走 MITM 代理，Python CA 库缺公司根证书（仅影响下载，模型走 HTTP 内网）
-            r = requests.get(url, headers=headers, timeout=90, stream=True,
-                             allow_redirects=True, verify=False)
-            if r.status_code != 200:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "action": "download", "error": f"HTTP {r.status_code}"}
-            # 文件名：优先 Content-Disposition，其次 URL 路径
-            filename = None
-            cd = r.headers.get("Content-Disposition", "")
-            m = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", cd, re.IGNORECASE)
-            if m:
-                filename = unquote(m.group(1).strip())
-            if not filename:
-                filename = unquote(os.path.basename(urlparse(url).path)) or "download"
-            # 无扩展名时按 content-type 补
+            _, browser = self._connect()
+            page = self._pick_page(browser)
+            if page is None:
+                return self._failure("Task page unavailable", "not_found", action="download", url=url)
+            response = page.context.request.get(url, timeout=90000,
+                headers={"Referer": page.url} if page.url.startswith(("http://", "https://")) else {})
+            if response.status != 200:
+                return self._failure(f"HTTP {response.status}", "blocked", action="download", url=url)
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            declared = headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > 128 * 1024 * 1024:
+                return self._failure("HTTP download exceeds 128 MiB; use browser download", "unsupported", action="download", url=url)
+            cd = headers.get("content-disposition", "")
+            match = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", cd, re.IGNORECASE)
+            filename = match.group(1).strip() if match else os.path.basename(urlparse(response.url).path)
+            content_type = headers.get("content-type", "")
             if "." not in filename:
-                ct = r.headers.get("Content-Type", "")
-                if "pdf" in ct:
-                    filename += ".pdf"
-                elif "html" in ct:
-                    filename += ".html"
-            os.makedirs(self.downloads_dir, exist_ok=True)
-            path = os.path.join(self.downloads_dir, filename)
-            # 文件已存在 → 加后缀改名（xxx_1.pdf、xxx_2.pdf…），不覆盖旧下载
-            if os.path.exists(path):
-                base, ext = os.path.splitext(filename)
-                i = 1
-                while os.path.exists(os.path.join(self.downloads_dir, f"{base}_{i}{ext}")):
-                    i += 1
-                filename = f"{base}_{i}{ext}"
-                path = os.path.join(self.downloads_dir, filename)
-            size = 0
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    f.write(chunk)
-                    size += len(chunk)
-            self._downloaded[url] = path
-            # 落盘校验：写完后读回，确认真实存在 + 大小匹配（不靠模型自评）
-            verified = False
-            try:
-                verified = os.path.exists(path) and os.path.getsize(path) == size and size > 0
-            except Exception:  # noqa: BLE001
-                verified = False
+                filename += ".pdf" if "pdf" in content_type else ".html" if "html" in content_type else ""
+            download_id = uuid.uuid4().hex
+            path = self._artifact_path(filename, download_id)
+            body = response.body()
+            if len(body) > 128 * 1024 * 1024:
+                raise ValueError("HTTP download exceeds 128 MiB")
+            with open(path, "xb") as stream:
+                created = True
+                stream.write(body)
+            artifact = self._record_artifact(path=path, url=url, final_url=response.url,
+                download_id=download_id, page_url=page.url, content_type=content_type, transport="http_context")
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
-                    "action": "download", "path": path, "bytes": size,
-                    "verified": verified, "url": url[:200],
-                    "message": (f"✅ 已成功下载到 {path}（{size} 字节），已核实落盘，任务完成" if verified
-                                else f"⚠️ 下载写入异常：{path} 落盘校验失败"),
-                    "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                    "action": "download", "error": str(exc)[:300]}
+                "action": "download", "path": path, "bytes": artifact["bytes"], "verified": True,
+                "semantic_verified": False, "url": url, "final_url": response.url,
+                "artifacts": [artifact], "message": "Transfer completed; document identity still requires framework verification.",
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except Exception as exc:
+            if created and path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return self._failure(exc, "blocked", action="download", url=url, verified=False)
+        finally:
+            if response is not None:
+                try:
+                    response.dispose()
+                except Exception:
+                    pass
 
+    @browser_thread
     def execute_target(self, action, target, allowed=None):
         """纯 target 描述执行：先 resolve ref → DOM 点击；否则 Playwright locator 匹配。
 
         全程 CDP，不动真实鼠标。allowed = 已暴露给模型的 ref 集合。
         """
-        if action.action == "scroll":
-            return self._scroll(action)
+        if action.action == "download":
+            return self.download(str(action.args.get("url") or ""))
+        if action.action in {"scroll", "press", "hotkey"}:
+            return self.execute_viewport_action(action)
         ref = self.resolve_target(target, allowed=allowed)
         if ref:
             action.args["target_ref"] = ref
-            route = {"channel": "browser_dom", "target_ref": ref, "coordinate_space": "css_viewport"}
+            route = {"channel": "browser_dom", "snapshot_id": self.snapshot["snapshot_id"],
+                     "target_ref": ref, "coordinate_space": "css_viewport"}
             return self.execute(action, route)
+        if self.last_resolution_error == "ambiguous":
+            return self._failure("Target matches multiple nodes", "ambiguous")
+        if allowed is not None:
+            return self._failure("Target not found in exposed nodes", "not_found")
         return self._execute_locator(action, target)
 
     def _locator_for(self, page, target):
@@ -664,7 +1661,7 @@ class BrowserSession:
                 pass
             for role in roles:
                 try:
-                    r = page.get_by_role(role, name=q)
+                    r = page.get_by_role(role, name=q, exact=True)
                     if r.count() > 0:
                         return r
                 except Exception:
@@ -677,22 +1674,27 @@ class BrowserSession:
                 pass
         return None
 
+    @browser_thread
     def _execute_locator(self, action, target):
         """CDP locator 执行浏览器动作（虚拟输入）。"""
         started, dispatched = time.perf_counter(), False
         try:
+            self._validate_binding(self._observation_metadata)
+        except BrowserActionError as exc:
+            return self._failure(exc, exc.code, resolved="locator")
+        try:
             p, browser = self._connect()
         except Exception as exc:
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                    "resolved": "locator", "error": str(exc)[:200]}
+            return self._failure(exc, "not_found", resolved="locator")
         try:
             page = self._pick_page(browser)
             if page is None:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "resolved": "locator", "error": "No page"}
+                return self._failure("Task page unavailable", "stale", resolved="locator")
+            self._validate_binding(self._observation_metadata, page, self._cdp(page))
             name = action.action
             if name in ("press", "hotkey"):
                 # 键盘动作不需要 locator
+                dispatched = True
                 if name == "press":
                     page.keyboard.press(self._norm_key(str(action.args.get("key", ""))))
                 else:
@@ -705,15 +1707,16 @@ class BrowserSession:
                         "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
             loc = self._locator_for(page, target)
             if loc is None:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "resolved": "locator",
-                        "error": "Target not found in DOM（换一种 target 描述，或该目标在 canvas/iframe）"}
+                return self._failure("Target not found in DOM", "not_found", resolved="locator")
+            if loc.count() != 1:
+                return self._failure("Target matches multiple elements", "ambiguous", resolved="locator")
             if name in ("click", "double_click", "right_click"):
                 dispatched = True
                 loc.first.click(button="right" if name == "right_click" else "left",
                                 click_count=2 if name == "double_click" else 1, timeout=5000)
             elif name == "type":
                 l = loc.first
+                dispatched = True
                 l.click(timeout=5000)
                 if action.args.get("overwrite"):
                     page.keyboard.press("ControlOrMeta+A")
@@ -721,27 +1724,20 @@ class BrowserSession:
                 page.keyboard.insert_text(str(action.args.get("text", "")))
                 dispatched = True
             elif name == "select":
+                dispatched = True
                 loc.first.select_option(str(action.args.get("option", "")), timeout=5000)
                 dispatched = True
             else:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "resolved": "locator", "error": f"unsupported action {name}"}
+                return self._failure(f"Unsupported action {name}", "unsupported", resolved="locator")
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "resolved": "locator", "action": name,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except Exception as exc:
-            return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
-                    "channel": "browser_dom", "resolved": "locator", "error": str(exc)[:300]}
+            return self._failure(exc, getattr(exc, "code", "blocked"), dispatched, started, resolved="locator")
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
+    @browser_thread
     def _scroll(self, action):
         """页面级滚动（window.scrollBy），无需 target。"""
         amount = int(action.args.get("amount", 1))
@@ -765,14 +1761,7 @@ class BrowserSession:
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "error": str(exc)[:200]}
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
     # ---- 视觉回退：grounding 屏幕坐标 → CDP 虚拟坐标点击（不动真实鼠标）----
     @staticmethod
@@ -790,6 +1779,7 @@ class BrowserSession:
         vy = sy / dpr - (geo.get("sy", 0) or 0) - max(0, chrome_css)
         return int(round(vx)), int(round(vy))
 
+    @browser_thread
     def click_at_screen(self, action, sx, sy):
         """视觉定位回退：在屏幕坐标 (sx, sy) 处用 CDP 虚拟点击/输入，不动真实鼠标。"""
         started, dispatched = time.perf_counter(), False
@@ -831,18 +1821,42 @@ class BrowserSession:
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "resolved": "visual", "error": str(exc)[:300]}
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
     def invalidate(self):
         self.snapshot = None
         self.nodes = {}
+        self._observation_metadata = {}
+
+    @browser_thread
+    def _close_connection(self):
+        self._cancel_background_downloads()
+        if self._owned_context is not None:
+            try:
+                self._owned_context.close()
+            except Exception:
+                pass
+            self._owned_context = None
+        browser, playwright = self._browser, self._playwright
+        self._browser = self._playwright = None
+        if browser is not None:
+            self._disconnect(playwright, browser)
+        self.invalidate()
+        self._task_page_id = None
+        self._known_page_ids.clear()
+        self._async_objects.clear()
+        if self._loop is not None:
+            self._loop.close()
+            self._loop = None
 
     def close(self):
-        self.invalidate()
+        if self._worker is None and self._browser is None:
+            self.invalidate()
+            return
+        try:
+            self._close_connection()
+        finally:
+            worker, self._worker = self._worker, None
+            self._worker_thread = None
+            if worker is not None:
+                worker.shutdown(wait=True)

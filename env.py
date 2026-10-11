@@ -34,10 +34,20 @@ class StepResult:
 class Environment(ABC):
     """环境统一接口。"""
 
+    # Whether evaluate() is an independent task evaluator, rather than a stub.
+    evaluation_available = False
+
     @abstractmethod
     def reset(self, task: str) -> Observation:
         """启动任务环境，返回初始观察。"""
         raise NotImplementedError
+
+    def observe(self) -> Observation:
+        """刷新当前状态，不执行动作，也不重置任务或虚拟机快照。
+
+        后端必须显式实现；不能通过 reset() 模拟观察。
+        """
+        raise NotImplementedError("This environment does not implement observe()")
 
     @abstractmethod
     def step(self, action: Action) -> StepResult:

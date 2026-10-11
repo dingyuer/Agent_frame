@@ -19,6 +19,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 app = FastAPI(title="osworld_agent Viz")
@@ -91,6 +92,16 @@ _agent_state = {
     "status": "idle", "proc": None, "task_name": None, "config": None,
     "start_time": None, "output": [], "current_step": 0, "max_steps": 0, "task_total": 0,
 }
+
+# Human demonstrations use their own browser context and never invoke a model.
+from .collection import CollectionController, collection_router
+import atexit
+
+collection = CollectionController(os.getenv("OSWORLD_SFT_DIR", str(_PKG / "human_runs")),
+                                 agent_busy=lambda: _agent_state["status"] == "running")
+app.include_router(collection_router(collection))
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+atexit.register(collection.close)
 
 
 def _reader_thread(proc):
@@ -469,10 +480,22 @@ def _start_local(cfg: dict):
         "--model", model,
         "--model-url", model_url,
         "--ground-model", ground_model,
+        "--ground-type", str(cfg.get("ground_type", "ui-venus2")),
         "--ground-url", ground_url,
         "--max-steps", str(max_steps),
         "--result-dir", result_dir,
     ]
+    if cfg.get("completion_spec") is not None:
+        from osworld_agent.verifiers import CompletionVerifier
+        try:
+            contract = CompletionVerifier(task, cfg["completion_spec"]).spec
+        except ValueError as exc:
+            return {"ok": False, "error": f"验收条件无效：{exc}"}
+        os.makedirs(result_dir, exist_ok=True)
+        contract_path = os.path.abspath(os.path.join(result_dir, "completion_spec.json"))
+        with open(contract_path, "w", encoding="utf-8") as f:
+            json.dump(contract, f, ensure_ascii=False, indent=2)
+        cmd += ["--completion-spec", contract_path]
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
@@ -505,6 +528,8 @@ def _start_local(cfg: dict):
 
 @app.post("/run/start")
 async def start_run(request: Request):
+    if collection.active:
+        return {"ok": False, "error": "人工采集进行中，请先结束采集。"}
     if _agent_state["status"] == "running":
         return {"ok": False, "error": "已有任务在运行中，请先停止"}
     try:
@@ -906,5 +931,6 @@ def _keep_model_warm():
 
 if __name__ == "__main__":
     port = int(os.getenv("AGENTS_VIZ_PORT", "8088"))
-    threading.Thread(target=_keep_model_warm, daemon=True).start()
+    if os.getenv("OSWORLD_KEEP_MODEL_WARM") == "1":
+        threading.Thread(target=_keep_model_warm, daemon=True).start()
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

@@ -24,6 +24,8 @@ from .vmware_env import to_pyautogui
 class WindowsEnvironment(Environment):
     """Windows 本机环境（GUI + browser use）。"""
 
+    evaluation_available = False
+
     def __init__(self, browser_port: int = 9222, width: int = 1920, height: int = 1080,
                  downloads_dir: Optional[str] = None):
         self.browser_port = browser_port
@@ -33,16 +35,25 @@ class WindowsEnvironment(Environment):
         self.browser_only = True  # 浏览器专用：用精简 system prompt + 强化 DOM 定位
         self.downloads_dir = downloads_dir
         self._browser_session = None
+        self._last_observation_info = {}
+        self._observation_surface = "browser"
+        self._episode_prepared = False
+        self.initial_state = {}
+
+    def begin_episode(self, task_id=None, isolated=True):
+        session = self._get_browser_session()
+        self.initial_state = session.begin_episode(task_id=task_id, isolated=isolated,
+            viewport={"width": self.width, "height": self.height})
+        if not self.initial_state.get("isolated"):
+            raise RuntimeError("Browser episode isolation was not established")
+        self._episode_prepared = True
+        self._observation_surface = "browser"
+        self._last_observation_info = {}
+        return dict(self.initial_state)
 
     # ---- 观察 ----
     def _take_screenshot(self):
-        """浏览器场景用 CDP 截 viewport（不受其他窗口遮挡），桌面场景用 pyautogui 全屏。"""
-        if self._focus_is_browser():
-            session = self._get_browser_session()
-            if session is not None:
-                shot = session.screenshot()
-                if shot is not None:
-                    return shot
+        """Desktop fallback; browser screenshots are collected atomically with AX."""
         import pyautogui
         return pyautogui.screenshot()
 
@@ -88,11 +99,51 @@ class WindowsEnvironment(Environment):
             return None
 
     def _build_observation(self) -> Observation:
-        """截图 + browser_ax 快照进 context；显式标注场景（browser_use / structure_available）。"""
-        screenshot = self._take_screenshot()
-        snapshot = self._collect_browser_snapshot()
-        context = [snapshot] if snapshot else []
-        info = {"scene": self._derive_scene(snapshot)}
+        """Collect screenshot and AX on one page, with an explicit coordinate space."""
+        from ..model.grounding import screenshot_size
+        from ..scene import Scene
+
+        screenshot, snapshot, metadata = None, None, {}
+        error = ""
+        try:
+            session = self._get_browser_session()
+            if session is not None and self._observation_surface == "browser":
+                screenshot, snapshot, metadata = session.collect_observation()
+                metadata = dict(metadata or {})
+            elif session is not None and hasattr(session, "event_metadata"):
+                metadata = session.event_metadata()
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+
+        if screenshot is not None and metadata.get("screenshot_space") == "css_viewport":
+            info = metadata
+            info["scene"] = Scene(
+                browser_use=1, structure_available=bool(snapshot),
+                mode="browser_dom" if snapshot else "visual",
+                reason="structured_page" if snapshot else "no_structured_page",
+                url=(snapshot or {}).get("url", metadata.get("url", "")),
+                page_id=metadata.get("page_id", ""),
+                snapshot_id=metadata.get("snapshot_id", ""),
+            ).to_dict()
+            context = [snapshot] if snapshot else []
+        else:
+            # Never attach viewport AX to a desktop screenshot from a different
+            # surface: both the scene and execution space must describe the image.
+            screenshot = self._take_screenshot()
+            size = screenshot_size(screenshot)
+            info = {"screenshot_space": "screen_pixels",
+                    "screenshot_size": list(size) if size else None,
+                    "scene": Scene(browser_use=0, structure_available=False,
+                                   mode="visual", reason="desktop_fallback").to_dict()}
+            for key in ("artifacts", "download_events", "dialogs", "dialog", "initial_state", "tabs"):
+                if key in metadata:
+                    info[key] = metadata[key]
+            if error or metadata.get("error") or metadata.get("observation_errors"):
+                info["observation_error"] = error or metadata.get("error") or "; ".join(metadata["observation_errors"])
+            context = []
+        self._last_observation_info = dict(info)
+        info["active_surface"] = "browser" if info.get("screenshot_space") == "css_viewport" else "desktop"
+        info["requested_surface"] = self._observation_surface
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
     def _derive_scene(self, snapshot):
@@ -110,11 +161,11 @@ class WindowsEnvironment(Environment):
 
     def _fresh_obs_after_action(self) -> Observation:
         """动作执行后重新观察：新截图 + 新 browser 快照。"""
-        return self._build_observation()
+        return self.observe()
 
     # ---- 路由 + 执行（browser_dom）----
     # 浏览器场景里全部走 CDP 的动作（虚拟鼠标键盘，不碰真实外设）
-    _BROWSER_CDP_ACTIONS = ("goto", "click", "double_click", "right_click",
+    _BROWSER_CDP_ACTIONS = ("goto", "download", "click", "double_click", "right_click",
                             "type", "select", "scroll", "press", "hotkey")
 
     def route_action(self, action, obs):
@@ -125,8 +176,9 @@ class WindowsEnvironment(Environment):
         """
         if obs is None or action.action not in self._BROWSER_CDP_ACTIONS:
             return None
-        # 只有「浏览器可用」才走 CDP；否则回 GUI（桌面应用场景）
-        if not self._focus_is_browser():
+        # Route against the actual observation, not a fresh CDP page guess.
+        from ..scene import observation_scene
+        if not observation_scene(obs).get("browser_use"):
             return None
         session = self._get_browser_session()
         if session is None:
@@ -135,10 +187,13 @@ class WindowsEnvironment(Environment):
         url = self._address_bar_url(action)
         if url:
             return {"channel": "browser_dom", "goto_url": url, "coordinate_space": "css_viewport"}
+        # A scroll with an explicit node refers to that container, not the page.
+        if action.action == "scroll" and (action.args.get("target_ref") or action.args.get("element_id")):
+            return session.route(action, obs)
         # goto / scroll / press / hotkey：无 target，直接 browser_dom
-        if action.action in ("goto", "scroll", "press", "hotkey"):
+        if action.action in ("goto", "download", "scroll", "press", "hotkey"):
             return {"channel": "browser_dom", "target": action.args.get("target"),
-                    "coordinate_space": "css_viewport"}
+                    "coordinate_space": "css_viewport", **self._route_identity(obs)}
         # click / type / select / double / right：优先 DOM 定位
         try:
             route = session.route(action, obs)  # 处理 target_ref / element_id
@@ -150,6 +205,8 @@ class WindowsEnvironment(Environment):
         target = str(action.args.get("target") or "")
         if target:
             exposed = obs.info.get("exposed_refs") if isinstance(obs.info, dict) else None
+            if exposed is not None and not exposed:
+                return None
             allowed = set(exposed) if exposed else None
             try:
                 ref = session.resolve_target(target, allowed=allowed)
@@ -157,10 +214,14 @@ class WindowsEnvironment(Environment):
                 ref = None
             if ref:
                 action.args["target_ref"] = ref
-                return {"channel": "browser_dom", "snapshot_id": session.snapshot["snapshot_id"],
-                        "target_ref": ref, "coordinate_space": "css_viewport"}
+                return session.route(action, obs)
         # 结构解析失败：返回 None → 视觉定位（grounding 定坐标 → CDP 虚拟点击）
         return None
+
+    @staticmethod
+    def _route_identity(obs):
+        return {key: obs.info[key] for key in ("page_id", "document_id", "snapshot_id")
+                if key in obs.info}
 
     @staticmethod
     def _address_bar_url(action):
@@ -182,40 +243,77 @@ class WindowsEnvironment(Environment):
         """执行已路由的 browser_dom 动作：goto / DOM(ref) / scroll/press/hotkey 全部走 CDP。"""
         session = self._get_browser_session()
         if session is None:
-            return self.step(action)
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False, "channel": "browser_dom",
+                "error": "browser session unavailable"})
         if action.action == "goto" or route.get("goto_url"):
             result = session.goto(str(action.args.get("url") or route.get("goto_url")))
-        elif action.action in ("scroll", "press", "hotkey"):
-            result = session.execute_target(action, None)
+        elif action.action == "download":
+            result = session.download(str(action.args.get("url") or ""))
         elif route.get("target_ref"):
             result = session.execute(action, route)
+        elif action.action in ("scroll", "press", "hotkey"):
+            result = session.execute_viewport_action(
+                action, metadata=action.args.get("observation_metadata") or self._last_observation_info)
         else:
             result = {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                       "error": "no routable target"}
         obs = self._fresh_obs_after_action()
         info = dict(result)
+        info["artifacts"] = obs.info.get("artifacts", info.get("artifacts", []))
         return StepResult(observation=obs, info=info)
 
     # ---- Environment 接口 ----
     def reset(self, task: str) -> Observation:
+        if not self._episode_prepared:
+            self.begin_episode()
+        self._episode_prepared = False
+        return self.observe()
+
+    def observe(self) -> Observation:
         return self._build_observation()
 
     def step(self, action: Action) -> StepResult:
         name = action.action
         spec = get_action_spec(name)
         kind = spec.kind if spec else "env"
-
-        # 浏览器场景 + 视觉定位坐标 → CDP 虚拟点击（不动真实鼠标）
-        if (kind in ("env", "uno")
-                and name in ("click", "double_click", "right_click", "type")
-                and action.args.get("x") is not None and action.args.get("y") is not None
-                and not action.args.get("grounding_failed")
-                and self._focus_is_browser()):
+        if name in {"observe_desktop", "observe_browser"}:
+            self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
+            obs = self.observe()
+            return StepResult(observation=obs, info={"status": "executed", "dispatched": False,
+                "action": name, "artifacts": obs.info.get("artifacts", [])})
+        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab"}:
             session = self._get_browser_session()
-            if session is not None:
-                # 截图是 viewport（CDP 截的），grounding 坐标即 viewport 坐标，直接点，不再屏幕→viewport 换算
-                result = session.click_at_viewport(action, int(action.args["x"]), int(action.args["y"]))
-                return StepResult(observation=self._build_observation(), info=dict(result))
+            kwargs = {k: v for k, v in action.args.items() if k in {
+                "accept", "prompt_text", "dialog_id", "tab_id"}}
+            result = getattr(session, name)(**kwargs)
+            obs = self.observe()
+            result["artifacts"] = obs.info.get("artifacts", [])
+            return StepResult(observation=obs, info=result)
+
+        coordinate_space = action.args.get("coordinate_space")
+        coordinate_actions = ("click", "double_click", "right_click", "type", "select", "drag_and_drop")
+        if action.args.get("grounding_failed"):
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False, "error": "grounding failed"})
+
+        if coordinate_space == "css_viewport" and kind == "env" and name != "wait":
+            session = self._get_browser_session()
+            if session is None:
+                result = {"status": "rejected", "dispatched": False,
+                          "channel": "browser_cdp", "error": "browser session unavailable"}
+            else:
+                result = session.execute_viewport_action(
+                    action, metadata=action.args.get("observation_metadata") or self._last_observation_info)
+            obs = self.observe()
+            result = dict(result)
+            result["artifacts"] = obs.info.get("artifacts", [])
+            return StepResult(observation=obs, info=result)
+
+        if name in coordinate_actions and coordinate_space != "screen_pixels":
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False,
+                "error": "coordinate action requires css_viewport or screen_pixels"})
 
         if kind == "browser":
             result = self.browser_action(name, action.args)
@@ -232,24 +330,28 @@ class WindowsEnvironment(Environment):
                 exec(cmd, {"__name__": "__main__"})  # noqa: S102  执行 pyautogui 命令字符串
             except Exception as exc:  # noqa: BLE001
                 return StepResult(observation=self._build_observation(),
-                                  info={"error": f"执行异常: {exc}"})
-        return StepResult(observation=self._build_observation())
+                                  info={"status": "failed", "dispatched": True,
+                                        "channel": "desktop", "error": f"执行异常: {exc}"})
+            return StepResult(observation=self.observe(), info={
+                "status": "executed", "dispatched": True, "channel": "desktop"})
+        return StepResult(observation=self.observe(), info={
+            "status": "rejected", "dispatched": False, "channel": "desktop",
+            "error": "unsupported action or invalid coordinates"})
 
     # ---- 浏览器操作 ----
     def browser_action(self, action_name: str, args: Dict[str, Any]) -> str:
         """执行 browser kind 动作（当前只有 get_page_source）。"""
         if action_name == "get_page_source":
-            return self.get_page_source()
+            return self.get_page_source(target_ref=args.get("target_ref"), max_chars=args.get("max_chars", 20000))
         return f"未知浏览器动作 {action_name}"
 
-    def get_page_source(self) -> str:
-        if not self._focus_is_browser():
-            return "当前焦点不在浏览器（可能正在操作其他应用），无需抓取页面源码"
-        from .. import utils
-        html = utils.fetch_page_source("localhost", self.browser_port)
-        return html or "获取页面源码失败（Chrome 可能未开 remote debugging）"
+    def get_page_source(self, target_ref=None, max_chars=20000) -> str:
+        """Read the same task page used by observations and actions."""
+        session = self._get_browser_session()
+        if session is None:
+            return "浏览器会话不可用，请重新观察。"
+        return session.get_page_source(target_ref=target_ref, max_chars=max_chars)
 
-    # ---- 终端 / Python ----
     def run_command(self, command: str) -> str:
         try:
             r = subprocess.run(["cmd", "/c", command], capture_output=True, text=True,
@@ -267,7 +369,7 @@ class WindowsEnvironment(Environment):
         return (r.stdout or "").strip() or (r.stderr or "").strip() or "(无输出)"
 
     def evaluate(self) -> float:
-        # 本地手动任务没有独立评测器：返回 0，由人工/模型 verify 判断是否完成
+        # 本地手动任务没有独立评测器；框架通过任务契约和执行证据验证。
         return 0.0
 
     def close(self) -> None:

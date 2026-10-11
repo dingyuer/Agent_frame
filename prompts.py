@@ -29,9 +29,10 @@ def _render_items(items) -> str:
 
 # 浏览器场景的动作白名单：只保留浏览器 + 通用动作，过滤表格/UNO/子Agent/桌面切换
 _BROWSER_ONLY_ACTIONS = {
-    "goto", "click", "double_click", "right_click", "type", "scroll",
+    "goto", "download", "click", "double_click", "right_click", "type", "scroll",
     "press", "hotkey", "select", "drag_and_drop", "wait",
     "run_in_terminal", "get_page_source", "request_finish", "fail",
+    "handle_dialog", "list_tabs", "switch_tab", "close_tab", "observe_desktop", "observe_browser",
 }
 
 
@@ -109,7 +110,7 @@ def build_system_prompt(
 4. 给 grounding 的 target 必须是【英文完整句子】，包含：① 在哪个应用里；② 在屏幕哪个方位；③ 相邻的可见文字（英文原文）；④ 外观（button / icon / tab / menu item）。
 5. 如果上一步没生效（failure/uncertain），换一种方式重试，不要原样重复无效动作。
 6. 重要中间结果放进 state_update.known_fact_add，之后需要时再取用。
-7. 任务完成时 next_action 用 {{"type": "request_finish", "answer": "最终答案"}}（程序会验证是否真完成，未完成会被拒绝）；确认无法完成用 {{"type": "fail"}}。
+7. 对照任务计划和系统验收条件逐项执行。不得把动作执行成功当成整个任务完成。你报告完成时 next_action 用 {{"type": "request_finish", "answer": "最终答案"}}（程序会验证是否真完成；验收条件尚未满足意味着仍有待办，应继续操作，不能据此直接 fail）；确认无法完成用 {{"type": "fail"}}。
 8. 看到记忆里 control_state = STALL 或 forbidden_repeats 非空，说明当前策略已失败：必须换一种完全不同的策略，禁止原样重复 forbidden_repeats 里的动作。
 9. 从【已经打开】的应用/页面继续做，就在那里完成任务，不要另开别的应用。
 10. 修改已有输入框里的值，用 type 的 overwrite: true 覆盖（先清空再输入），不要直接追加。"""
@@ -120,18 +121,20 @@ def build_system_prompt(
    - 元素带 id → 加 element_id（直接复制该 HTML id，如 "download-btn"）；
    - 元素没 id 但有 ref → 加 target_ref（复制那个纯数字编号，如 "65"）；
    - 一定【不要】编造 id 或 ref：从当前观察的 browser_ax 里原样复制，抄错就定位不到。
-   只有目标【确实不在页面 DOM 里】时（canvas 画布、原生弹窗、浏览器地址栏/工具栏、桌面窗口），才只用英文 target 交给视觉定位。不要输出 CSS/XPath、不要猜坐标。
+   结构定位不可用时可以用英文 target 交给视觉定位。页面截图只包含网页；操作浏览器工具栏、权限气泡或系统窗口前，先 observe_desktop 获取桌面图，完成后 observe_browser 回到网页。不要输出 CSS/XPath、不要猜坐标。
 12. 打开网址/访问网站：必须用 goto 动作（url 填完整网址，如 scholar.google.com），【绝对不要】点击地址栏、也不要往地址栏 type 网址——地址栏是浏览器 chrome UI，不在页面 DOM。要搜索内容：先用 goto 打开搜索引擎首页，再在页面里的搜索框用 type 输入关键词。
-13. 下载文件（如论文 PDF）：就是「点击页面里那个下载/PDF 链接或按钮」——按第 11 条给它加 element_id 或 target_ref 直接点。不要新增动作、不要输出下载 URL。
+13. 下载文件：从真实页面取得完整下载 URL 后用 download；也可以点击真实下载按钮，由浏览器事件记录实际下载。只有系统产物验收通过才算完成；不得编造 URL，PDF文件名也不是论文身份依据。
 14. 找不到目标元素时的排查（重要）：当你要操作的元素在 AX 树里找不到、或截图里看不到时，【不要】反复点同一个地方，按顺序排查：
    - 是否被【弹窗/对话框/提示条】遮挡了 → 先关掉它（点它的关闭按钮，或按 Esc）；
    - 是否页面需要【滚动】才能看到目标 → 用 scroll 上下滚一滚再看；
    - 是否需要先【点击某处展开】（展开菜单、切换 tab、聚焦输入框）目标才会出现 → 先点一下。
-   先排查「被挡住 / 没滚到 / 没展开」，比反复点一个看不到的目标更有效。"""
+   先排查「被挡住 / 没滚到 / 没展开」，再重新定位。
+15. 当前观察含 dialog 时，只能先用 handle_dialog 明确 accept:true/false（输入框可带 prompt_text）。不要猜按钮坐标或盲按 Esc。新标签页先 list_tabs，依据标题/URL选择 switch_tab；广告页面不能自动当任务页面。
+16. recovery 标记 resolve_obstruction 时，结合当前图、blocker_ref、active_modals 处理障碍；恢复后按新观察重新取得原目标引用。旧截图标 screenshot_stale 时仅供背景参考。"""
     else:
         browser_rule = """11. 浏览器规则：当你要操作的目标【是浏览器页面里的元素】时，优先加 element_id（HTML id）或 target_ref（ref 编号）直接走 DOM 定位；都拿不准才只用英文 target（程序会先结构匹配，匹配不到再视觉定位）。目标不在页面 DOM 里时（canvas、原生弹窗、地址栏、桌面窗口）才用英文 target 交给视觉定位。不要编造 id/ref。
 12. 打开网址/访问网站：必须用 goto 动作，不要点地址栏、不要往地址栏 type 网址。
-13. 下载文件（如论文 PDF）：点击页面里那个下载/PDF 链接或按钮即可，加 element_id 或 target_ref 直接点。
+13. 下载文件：从页面取得完整 URL，使用 download 动作；不得编造 URL，点击链接不等于完成下载。
 14. 找不到目标元素时的排查（重要）：当要操作的元素在 AX 树里找不到、或截图里看不到时，不要反复点同一个地方，按顺序排查：① 是否被弹窗/对话框遮挡 → 先关掉它；② 是否页面需要滚动才能看到 → 用 scroll；③ 是否需要先点击展开（菜单/tab/输入框）目标才会出现。"""
 
     # 桌面专用规则（表格/技能，browser_only 不渲染，经验见 docs/legacy_prompt.md）
@@ -149,7 +152,7 @@ def build_system_prompt(
 {table_rule}
 {code_agent_rule}
 ## 你的输入（每次都会给你）
-1. 三张截图（按顺序）：
+1. 按需提供最多三张截图（有 AX 结构时默认只提供当前图，以实际附图为准）：
    - 【上上步截图 S(t-2)】原图；
    - 【上一步截图 S(t-1)】如果上一步用了鼠标定位，图上会有一个红圈标出实际点击位置；否则是原图；
    - 【当前截图 S(t)】原图，未画任何标记。
@@ -244,18 +247,28 @@ def build_format_feedback(error: str) -> str:
 # --------------------------------------------------------------------------- #
 # 任务规划（planner）：把模糊任务拆成结构化 plan
 # --------------------------------------------------------------------------- #
-def build_planner_prompt(task: str) -> str:
+def build_planner_prompt(task: str, completion_spec=None, profile=None) -> str:
     """任务规划 prompt：把用户模糊任务拆解成 3~8 个可独立执行、按顺序完成的子步骤。"""
-    return f"""你是任务规划器。把用户模糊的任务拆解成 3~8 个可独立执行、按顺序完成的子步骤。
+    import json
+    contract = json.dumps(completion_spec or {"checks": []}, ensure_ascii=False)
+    workflow = json.dumps(profile or {}, ensure_ascii=False)
+    return f"""你是任务规划器。把任务拆解成 1~12 个具体、按顺序执行的子步骤。简单任务无需凑步骤，复杂任务必须覆盖全部要求。
 
 拆解规则：
 1. 第一步通常是「打开某个网站/应用」。搜索类任务要明确打开哪个搜索引擎（谷歌学术 scholar.google.com / 谷歌 / arXiv / Bing 等），不要只写"打开浏览器"；
 2. 搜索类任务：必须自己提炼搜索关键词（论文名、主题词、作者等），写进 keywords 数组；
 3. 每个子步骤要具体、可操作（含明确的操作对象和预期结果），不要写"完成任务"这种空话；
 4. 最后给出「完成判据」final_check：一个可以客观核对的完成标志（如"downloads 目录下存在该论文的 PDF 文件"）。
+5. 补全操作前提与基本步骤：先到正确网站，找到目标，再操作，最后核对结果。不能用模糊的“找到并完成”代替操作步骤。
+6. 每步写 expected_evidence，说明执行后应观察到的具体变化。多对象任务逐个列出，不漏数量、筛选条件和保存要求。
+7. 系统验收条件由调用方提供或由严格任务规则提取，你不能修改、删除或自行增加可信验收条件。check_ids 只引用下面已有 id；没有对应条件就填 []。
+8. final_check 只是你的建议，不会作为任务完成的证据。任务结束由框架逐项核实。
+9. 若给出类型化任务流程，steps 必须覆盖 workflow 中每个 phase（用相同英文值），每步 expected_evidence 不能为空。论文搜索先核对身份，再下载；不要提前编造下载URL。
+
+系统验收条件：{contract}
+任务流程模板：{workflow}
 
 任务：{task}
 
 只输出一个 JSON 对象，不要多余文字：
-{{"steps": [{{"idx": 1, "goal": "..."}}, {{"idx": 2, "goal": "..."}}], "keywords": ["..."], "final_check": "..."}}"""
-
+{{"steps": [{{"idx": 1, "phase": "search", "goal": "...", "expected_evidence": "...", "check_ids": []}}], "keywords": ["..."], "final_check": "..."}}"""

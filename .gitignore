@@ -20,6 +20,7 @@ venv/
 logs/
 runs/
 outputs/
+human_runs/
 
 # Editor and operating system files
 .idea/

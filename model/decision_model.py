@@ -10,6 +10,7 @@ vision 开启时（默认），每步把当前截图以 OpenAI vision 格式（i
 from __future__ import annotations
 
 import copy
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -23,6 +24,14 @@ class ChatMessage:
     content: str
 
 
+class ImageEncodingError(ValueError):
+    """A required image must not silently become a text-only model request."""
+
+
+def _field(obj, key, default=None):
+    return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+
+
 def _guess_mime(path: str) -> str:
     import mimetypes
     return mimetypes.guess_type(path)[0] or "image/png"
@@ -32,7 +41,7 @@ def encode_image(screenshot) -> str:
     """把截图转成 base64 data URL（OpenAI vision 的 image_url 用）。
 
     支持 PIL.Image / 文件路径 / bytes / 已是 data-url 的字符串。
-    无法识别时返回空字符串，调用方会回退到纯文本。
+    无法识别时返回空字符串，调用方必须拒绝缺失的当前截图。
     """
     import base64
     from io import BytesIO
@@ -68,6 +77,21 @@ class ChatModel:
         self.vision = bool(getattr(cfg, "vision", True))
         self.disable_thinking = bool(getattr(cfg, "disable_thinking", True))
         self.last_call: Dict[str, Any] = {}   # 最近一次调用的完整元数据（供轨迹记录 decision_calls）
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from openai import OpenAI
+            import httpx
+            self._client = OpenAI(
+                base_url=self.cfg.url, api_key=self.cfg.api_key, max_retries=0,
+                http_client=httpx.Client(trust_env=False, timeout=self.cfg.timeout))
+        return self._client
+
+    def close(self):
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     def chat(self, messages, retries: int = 2, json_mode: bool = False) -> str:
         """发送一轮对话，返回模型文本；失败自动重试。
@@ -78,17 +102,13 @@ class ChatModel:
         json_mode=True 时加 response_format=json_object，用 vLLM 约束解码强制输出合法
         JSON 对象（减少非 JSON、格式漂移）；这是「约束前移」，仍保留调用方的执行前校验。
         """
-        from openai import OpenAI  # 延迟导入，避免非模型场景也依赖 openai
-        import httpx
-
-        # trust_env=False：直连内网 endpoint，不走系统代理（同 grounding，避免 HIS 代理拦掉 7.x）
-        client = OpenAI(
-            base_url=self.cfg.url, api_key=self.cfg.api_key,
-            http_client=httpx.Client(trust_env=False, timeout=self.cfg.timeout),
-        )
+        client = self._get_client()
         normalized = [self._to_message_dict(m) for m in messages]
         self.last_call = {"messages": copy.deepcopy(normalized),
-                          "model": resolve_model_name(self.cfg.name), "attempts": []}
+                          "model": resolve_model_name(self.cfg.name), "attempts": [],
+                          "tokenizer_revision": self.cfg.tokenizer_revision,
+                          "processor_revision": self.cfg.processor_revision,
+                          "chat_template_revision": self.cfg.chat_template_revision}
         last_err: Optional[Exception] = None
         for attempt in range(retries + 1):
             started = time.perf_counter()
@@ -102,6 +122,10 @@ class ChatModel:
                 # 关闭 Qwen 思考模式：避免模型生成大段 chain-of-thought 陷入循环、不收敛到答案
                 if self.disable_thinking:
                     create_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+                if self.cfg.capture_rollout:
+                    create_kwargs["logprobs"] = True
+                    create_kwargs.setdefault("extra_body", {}).update(
+                        return_token_ids=True, return_tokens_as_token_ids=True)
                 if json_mode:
                     create_kwargs["response_format"] = {"type": "json_object"}
                 generation = {k: v for k, v in create_kwargs.items() if k not in ("model", "messages")}
@@ -122,7 +146,10 @@ class ChatModel:
                 self.last_call["attempts"].append({"status": "ok", "latency_ms": latency_ms,
                                                    "generation": copy.deepcopy(generation),
                                                    "response": content})
-                return content.strip()
+                if self.cfg.capture_rollout:
+                    self.last_call.update(self._capture_rollout(resp))
+                # Keep sampled text exact; parsing belongs to the action layer.
+                return content
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 self.last_call["attempts"].append({
@@ -139,6 +166,57 @@ class ChatModel:
                     time.sleep(1.5 * (attempt + 1))
         raise RuntimeError(f"模型调用失败({self.cfg.name}): {last_err}")
 
+    def _capture_rollout(self, response):
+        """Accept actual server tokens, with explicit revision attestation.
+
+        Supports vLLM return_token_ids/logprobs and a training gateway's
+        rollout_metadata. A configured revision alone is not server evidence.
+        Missing metadata makes the call unusable for on-policy export, while
+        preserving it for diagnosis and SFT. Never tokenize returned text here.
+        """
+        choice = response.choices[0]
+        extra = _field(response, "rollout_metadata", {}) or {}
+        if not isinstance(extra, dict):
+            extra = {}
+        ids = extra.get("token_ids", _field(choice, "token_ids"))
+        prompt_ids = extra.get("prompt_token_ids", _field(response, "prompt_token_ids"))
+        entries = _field(_field(choice, "logprobs"), "content", []) or []
+        lp = extra.get("token_logprobs")
+        if lp is None and entries:
+            lp = [_field(item, "logprob") for item in entries]
+        revision = extra.get("policy_revision", _field(response, "policy_revision"))
+        captured = {"prompt_token_ids": copy.deepcopy(prompt_ids), "token_ids": copy.deepcopy(ids),
+                    "token_logprobs": copy.deepcopy(lp), "policy_revision": revision,
+                    "policy_revision_source": "server" if revision else "unavailable",
+                    "expected_policy_revision": self.cfg.policy_revision,
+                    "loss_mask": [1] * len(ids) if isinstance(ids, list) else None}
+        for key in ("tokenizer_revision", "processor_revision", "chat_template_revision"):
+            captured[key] = extra.get(key) or getattr(self.cfg, key)
+        valid_ids = lambda x: isinstance(x, list) and bool(x) and all(type(t) is int and t >= 0 for t in x)
+        problems = []
+        if not valid_ids(prompt_ids) or not valid_ids(ids):
+            problems.append("missing or invalid server token IDs")
+        if (not isinstance(lp, list) or not isinstance(ids, list) or len(lp) != len(ids)
+                or any(type(p) not in (float, int) or not math.isfinite(p) or p > 0 for p in lp)):
+            problems.append("missing or invalid token logprobs")
+        if not isinstance(revision, str) or not revision:
+            problems.append("server did not attest policy_revision")
+        elif self.cfg.policy_revision and revision != self.cfg.policy_revision:
+            problems.append("policy_revision mismatch")
+        if any(not captured[k] for k in ("tokenizer_revision", "processor_revision", "chat_template_revision")):
+            problems.append("missing tokenizer/processor/chat-template revision")
+        for key in ("tokenizer_revision", "processor_revision", "chat_template_revision"):
+            expected = getattr(self.cfg, key)
+            if expected and extra.get(key) and extra[key] != expected:
+                problems.append(f"{key} mismatch")
+        # Invalid server floats must remain diagnosable in strict JSON logs.
+        # None is explicitly invalid for training; it must never become zero.
+        if isinstance(lp, list):
+            captured["token_logprobs"] = [
+                p if type(p) in (float, int) and math.isfinite(p) else None for p in lp]
+        captured.update(rl_ready=not problems, rollout_validation_errors=problems)
+        return captured
+
     def build_vision_message(self, text: str, images=None) -> Dict[str, Any]:
         """构造一条用户消息；vision 开启时按顺序附上多张图（OpenAI vision 格式）。
 
@@ -146,9 +224,11 @@ class ChatModel:
         """
         if self.vision and images:
             content: Any = [{"type": "text", "text": text}]
-            for label, shot in images:
+            for index, (label, shot) in enumerate(images):
                 url = encode_image(shot)
                 if not url:
+                    if index == len(images) - 1:
+                        raise ImageEncodingError("当前截图编码失败，未发送纯文本替代请求")
                     continue
                 if label:
                     content.append({"type": "text", "text": label})

@@ -137,7 +137,7 @@ def validate_action(act: Action) -> Optional[str]:
     if spec is None:
         return f"未知动作类型「{act.action}」。可选动作：{', '.join(ACTION_REGISTRY)}"
     # 策略只能输出语义目标，不能提供执行器内部坐标 / 状态字段
-    if any(k in act.args for k in ("x", "y", "x1", "y1", "x2", "y2", "grounding_failed")):
+    if any(k in act.args for k in ("x", "y", "x1", "y1", "x2", "y2", "grounding_failed", "coordinate_space", "observation_metadata")):
         return "策略只能输出语义目标，不能提供执行器内部坐标或状态字段"
     # target_ref：DOM 节点引用（可选，但有就必须是非空字符串）
     if "target_ref" in act.args and (not isinstance(act.args["target_ref"], str) or not act.args["target_ref"]):
@@ -171,6 +171,14 @@ def validate_action(act: Action) -> Optional[str]:
         keys = act.args.get("keys")
         if not isinstance(keys, list) or not keys:
             return "hotkey 的 keys 必须是非空列表"
+    if act.action == "handle_dialog":
+        if type(act.args.get("accept")) is not bool:
+            return "handle_dialog 的 accept 必须为 true 或 false"
+        if "prompt_text" in act.args and not isinstance(act.args["prompt_text"], str):
+            return "prompt_text 必须是字符串"
+    if act.action in ("switch_tab", "close_tab") and "tab_id" in act.args:
+        if not isinstance(act.args["tab_id"], str) or not act.args["tab_id"].strip():
+            return "tab_id 必须来自当前标签页列表"
     return None
 
 

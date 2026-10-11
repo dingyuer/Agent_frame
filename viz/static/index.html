@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agent S3 实时可视化</title>
+<title>Agent Frame Studio</title>
 <style>
   :root {
     --bg: #f4f6f9;
@@ -285,20 +285,36 @@
   .json-bool { color: #569cd6; }
   .json-null { color: #808080; font-style: italic; }
 </style>
+<link rel="stylesheet" href="/static/studio.css">
 </head>
 <body>
-  <!-- 顶部导航栏 -->
-  <div id="topnav">
-    <div class="brand"><span class="dot"></span>Agent S3 可视化</div>
-    <button class="navbtn active" id="nav-run">⚡ 运行配置</button>
-    <button class="navbtn" id="nav-live">▶ 实时监控</button>
-    <button class="navbtn" id="nav-history">📁 虚拟轨迹</button>
-    <button class="navbtn" id="nav-local">🖥 本机轨迹</button>
-    <button class="navbtn" id="nav-debug">🧪 模型调试</button>
-    <button class="navbtn" id="nav-chat">💬 会话调试</button>
-    <span class="conn off" id="conn"><span class="led"></span><span id="conn-text">连接中…</span></span>
-  </div>
-
+  <svg class="icon-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m9 5 11 7-11 7V5Z"/><path d="M4 5v14"/></symbol>
+    <symbol id="i-capture" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m13-5h3a2 2 0 0 1 2 2v3M3 16v3a2 2 0 0 0 2 2h3m13-5v3a2 2 0 0 1-2 2h-3"/><circle cx="12" cy="12" r="4"/></symbol>
+    <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M2 12h5l3-8 4 16 3-8h5"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 8V5a2 2 0 0 1 2-2h5l3 4h6a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8Z"/></symbol>
+    <symbol id="i-screen" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 3v7m0 4v7M12 3v12m0 4v2M20 3v2m0 4v12M1 10h6m2 5h6m2-10h6"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11a9 9 0 0 1-9 9H3l1-5a9 9 0 1 1 17-4Z"/><path d="M8 9h8m-8 4h5"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+  </defs></svg>
+  <aside id="topnav" aria-label="主导航">
+    <a class="brand" href="#run" aria-label="Agent Frame 工作台"><span class="brand-mark"><svg><use href="#i-grid"/></svg></span><span>Agent Frame<small>STUDIO</small></span></a>
+    <div class="nav-section-label">工作空间</div>
+    <button class="navbtn active" id="nav-run" title="运行任务"><svg><use href="#i-play"/></svg><span>运行任务</span></button>
+    <button class="navbtn" id="nav-live" title="实时监控"><svg><use href="#i-pulse"/></svg><span>实时监控</span></button>
+    <button class="navbtn" id="nav-collect" title="SFT 采集"><svg><use href="#i-capture"/></svg><span>SFT 采集</span><span class="nav-chip">NEW</span></button>
+    <div class="nav-section-label">轨迹与调试</div>
+    <button class="navbtn" id="nav-local" title="本机轨迹"><svg><use href="#i-screen"/></svg><span>本机轨迹</span></button>
+    <button class="navbtn" id="nav-history" title="虚拟机轨迹"><svg><use href="#i-folder"/></svg><span>虚拟机轨迹</span></button>
+    <button class="navbtn" id="nav-debug" title="模型调试"><svg><use href="#i-sliders"/></svg><span>模型调试</span></button>
+    <button class="navbtn" id="nav-chat" title="会话调试"><svg><use href="#i-chat"/></svg><span>会话调试</span></button>
+    <div class="sidebar-foot"><span class="sidebar-status-dot"></span><span>Observe. Act. Improve.<small>浏览器与 GUI Agent 工作空间</small></span></div>
+  </aside>
+  <header id="studio-header"><div class="breadcrumb">工作空间<span>/</span><strong id="studio-page-title">运行任务</strong></div><div class="header-right"><span class="header-label">Agent Frame Studio</span><span class="conn off" id="conn"><span class="led"></span><span id="conn-text">连接中…</span></span></div></header>
   <!-- 状态栏（实时视图专用） -->
   <div id="statusbar">
     <div class="item"><span class="label">任务编号</span><span class="value" id="st-taskno" style="display:flex;align-items:center;gap:8px">
@@ -315,6 +331,36 @@
     <div class="item" style="margin-left: auto;"><button id="btn-interrupt" class="run-btn stop" style="margin-top:0;padding:6px 14px;font-size:12px;width:auto;display:none">⏹ 中断运行</button></div>
   </div>
 
+  <section id="view-collect" aria-label="SFT 人工示范采集">
+    <div class="scroll capture-scroll">
+      <div class="page-intro"><div><div class="eyebrow">HUMAN DEMONSTRATIONS</div><h1>把操作，变成训练数据。</h1><p>直接操作浏览器镜像，记录每一步，再审阅为可用的 SFT 样本。</p></div><span class="no-model-pill"><span></span>无需连接模型</span></div>
+      <div id="capture-error" class="capture-error" role="alert" hidden></div>
+      <section id="capture-setup" class="studio-card">
+        <div class="section-heading"><span class="section-index">01</span><div><h2>准备一次示范</h2><p>任务描述会作为整段轨迹的指令</p></div></div>
+        <div class="capture-setup-grid"><div><label class="field-label" for="capture-task">任务描述 <span class="required">*</span></label><textarea id="capture-task" rows="3" placeholder="例如：在 arXiv 搜索 Attention Is All You Need，并下载论文 PDF。"></textarea></div><div><label class="field-label" for="capture-start-url">起始网址</label><input id="capture-start-url" type="url" value="https://arxiv.org" placeholder="https://example.com"><div class="capture-start-row"><button id="capture-start" class="studio-btn primary"><svg><use href="#i-capture"/></svg>开始采集</button><span class="field-tip">一项操作，一个步骤</span></div></div></div>
+        <details class="capture-connection inline-details"><summary>浏览器连接选项</summary><div class="capture-connection-grid"><fieldset class="radio-options"><legend>浏览器来源</legend><label><input type="radio" name="capture-browser-mode" value="launch" checked>启动独立 Chromium</label><label><input type="radio" name="capture-browser-mode" value="connect">连接已打开的浏览器</label><label><input type="checkbox" id="capture-show-window">同时显示独立浏览器窗口</label></fieldset><div id="capture-endpoint-field"><label class="field-label" for="capture-endpoint">CDP 地址</label><input id="capture-endpoint" value="http://127.0.0.1:9222"><p class="field-tip">连接运行服务所在机器上的浏览器。已开浏览器需启用远程调试。</p></div></div><details class="inline-details"><summary>可选：系统验收条件</summary><textarea id="capture-completion" rows="3" spellcheck="false" placeholder='{"checks": []}'></textarea><p class="field-tip">没有系统验收时，样本仍可人工审阅；不会自动标记为任务成功。</p></details></details>
+      </section>
+      <section id="capture-session-bar" class="studio-card capture-session-bar" hidden><div><span id="capture-state" class="capture-state">未开始</span><strong id="capture-session-task"></strong><span id="capture-session-id" class="mono-label"></span></div><div class="capture-session-actions"><button id="capture-new" class="studio-btn secondary" hidden>新建示范</button><button id="capture-pause" class="studio-btn secondary">暂停</button><button id="capture-stop" class="studio-btn danger-outline">结束采集</button></div></section>
+      <div class="capture-workspace">
+        <section class="studio-card browser-card">
+          <div class="browser-card-head"><div class="browser-dots"><i></i><i></i><i></i></div><strong>浏览器镜像</strong><span id="capture-browser-status">等待开始</span><button id="capture-refresh" class="icon-button" title="刷新当前观察，不记录操作步骤" aria-label="刷新当前观察" disabled>↻</button></div>
+          <div id="capture-tabbar" class="capture-tabbar" hidden></div>
+          <form id="capture-navigation" class="capture-navigation"><span class="url-symbol">↗</span><input id="capture-url" aria-label="浏览器网址" placeholder="开始采集后，在这里导航" disabled><button id="capture-go" type="submit" class="studio-btn secondary" disabled>前往</button></form>
+          <div id="capture-dialog" class="capture-dialog" hidden><div><strong>页面对话框</strong><p id="capture-dialog-text"></p><input id="capture-dialog-input" placeholder="对话框输入内容" hidden></div><button id="capture-dialog-cancel" class="studio-btn secondary">取消</button><button id="capture-dialog-accept" class="studio-btn primary">确定</button></div>
+          <div id="capture-stage" class="capture-stage" tabindex="0" aria-label="可交互浏览器镜像，点击元素后使用下方输入框输入文字">
+            <div id="capture-placeholder" class="capture-placeholder"><div class="browser-illustration"><span></span><div class="illustration-lines"><i></i><i></i><i></i></div><svg><use href="#i-capture"/></svg></div><h3>你的下一段示范，从这里开始</h3><p>填写任务后开始采集。<br>点击、输入、滚动和拖拽，会自动整理为操作步骤。</p><div class="placeholder-tags"><span>截图</span><span>AX Tree</span><span>语义动作</span></div></div>
+            <img id="capture-frame" alt="采集浏览器的当前画面" draggable="false" hidden>
+            <div id="capture-busy" class="capture-busy" hidden><span class="spinner"></span><span>正在执行并保存观察…</span></div>
+            <div id="capture-paused-overlay" class="capture-paused-overlay" hidden><span>采集已暂停</span><small>继续后会获取新的页面观察</small></div>
+          </div>
+          <div class="mirror-caption"><span id="capture-dimensions">页面截图与 AX Tree 同步记录</span><span>单击 · 双击 · 右击 · 拖拽 · 滚轮</span></div>
+          <div class="capture-input-tools"><div class="capture-keyboard"><span>浏览器按键</span><button type="button" data-capture-key="Enter" disabled>Enter ↵</button><button type="button" data-capture-key="Tab" disabled>Tab ⇥</button><button type="button" data-capture-key="Escape" disabled>Esc</button><button type="button" data-capture-key="Backspace" disabled>⌫</button><button type="button" data-capture-hotkey="Control+A" disabled>Ctrl + A</button><button type="button" data-capture-hotkey="Control+Z" disabled>Ctrl + Z</button></div><label class="field-label" for="capture-text">文字输入</label><div class="capture-composer"><textarea id="capture-text" rows="2" placeholder="先在镜像中点击输入框，再在此输入中文或粘贴文本。" disabled></textarea><button id="capture-send-text" class="studio-btn primary" disabled>提交文字<small>Ctrl + Enter</small></button></div><div class="composer-foot"><label class="checkbox-row"><input id="capture-overwrite" type="checkbox">替换原有文字</label><span>整段提交为一个 type 步骤；Enter 在这里换行。</span></div></div>
+        </section>
+        <aside class="studio-card capture-timeline-panel"><div class="timeline-heading"><div><h2>操作时间线 <span id="capture-step-count">0</span></h2><p>审阅操作，补充语义</p></div><span id="capture-reviewed-count" class="subtle-pill">已审阅 0</span></div><div class="review-guidance">每步可保留或丢弃。补充目标与意图，让示范更适合训练。</div><div id="capture-steps" class="capture-steps"><div class="timeline-empty"><span class="timeline-empty-line"></span><strong>还没有操作步骤</strong><p>开始后，你的操作会出现在这里。<br>鼠标移动不会单独记录。</p></div></div><div id="capture-verification" class="capture-verification">系统验收：尚未执行</div><div class="capture-export"><div class="export-heading"><strong>导出训练数据</strong><span>人工示范 · SFT</span></div><label class="checkbox-row"><input id="capture-reviewed-only" type="checkbox" checked disabled>仅导出已审阅且保留的步骤</label><div class="export-buttons"><button id="capture-export-jsonl" class="studio-btn secondary" disabled><svg><use href="#i-download"/></svg>JSONL</button><button id="capture-export-zip" class="studio-btn primary" disabled><svg><use href="#i-download"/></svg>图片 + ZIP</button></div><p>结束采集后可导出。验收状态会随数据保留。</p></div></aside>
+      </div>
+    </div>
+  </section>
+
   <!-- 实时视图 -->
   <div id="view-live">
     <div id="timeline" class="scroll"><div class="empty">等待 agent 启动…</div></div>
@@ -323,104 +369,38 @@
   <!-- 运行视图 -->
   <div id="view-run" class="active">
     <div id="run-body" class="scroll">
+      <div class="page-intro"><div><div class="eyebrow">YOUR AGENT WORKSPACE</div><h1>让任务，从这里开始。</h1><p>配置模型，运行任务，追踪每一次观察与行动。</p></div><button class="studio-btn secondary" onclick="switchView('collect')"><svg><use href="#i-capture"/></svg>采集一段人工示范</button></div>
       <div id="run-form">
-        <div class="run-panel">
-        <div class="run-sec-title">启动任务</div>
-        <div style="display:flex;gap:8px;margin:0 0 14px">
-          <button class="tab-btn active" id="tab-local">🖥 本机 Windows</button>
-          <button class="tab-btn" id="tab-vm">🖥 虚拟机 OSWorld</button>
-        </div>
-
-        <div id="panel-local">
-          <div class="run-row">
-            <label>任务描述</label>
-            <textarea id="local-task" rows="4" style="width:100%;font-family:var(--mono);font-size:13px;padding:10px;border:1px solid var(--border);border-radius:8px;resize:vertical;line-height:1.5" placeholder="例如：用浏览器打开谷歌学术 scholar.google.com，搜索论文 'Attention Is All You Need'，然后点击第一个搜索结果的 PDF 链接下载它"></textarea>
+        <section class="run-panel task-panel">
+          <div class="section-heading"><span class="section-index">01</span><div><h2>定义任务</h2><p>告诉 Agent 你想完成什么</p></div></div>
+          <div class="segmented"><button class="tab-btn active" id="tab-local">本机浏览器</button><button class="tab-btn" id="tab-vm">OSWorld 虚拟机</button></div>
+          <div id="panel-local">
+            <label class="field-label" for="local-task">任务描述</label>
+            <textarea id="local-task" rows="6" placeholder="例如：搜索论文 Attention Is All You Need，找到原文并下载 PDF。"></textarea>
+            <div class="field-tip">描述明确的目标、限制和期望结果。</div>
+            <div class="run-row compact"><label for="local-maxsteps">最大执行步数</label><input id="local-maxsteps" type="number" value="15" min="1" max="200"></div>
+            <button id="btn-local-start" class="run-btn primary-launch">启动任务<svg><use href="#i-arrow"/></svg></button>
+            <p class="form-footnote">本机任务使用 Windows 浏览器环境。启动后可在实时监控中查看进度。</p>
           </div>
-          <div class="run-row">
-            <label>最大步数</label>
-            <input id="local-maxsteps" type="number" value="15" min="1" max="50">
+          <div id="panel-vm" style="display:none">
+            <div class="run-row"><label>测试集</label><select id="run-testset"><option value="evaluation_examples/test_small.json" selected>test_small · 39 个任务</option><option value="evaluation_examples/test_one.json">test_one · 3 个任务</option><option value="evaluation_examples/test_all.json">test_all · 369 个任务</option></select></div>
+            <div class="run-row"><label>任务领域</label><select id="run-domain"></select></div>
+            <div class="run-row"><label>任务</label><select id="run-task"></select></div>
+            <div class="form-two"><div class="run-row"><label>最大步数</label><input id="run-maxsteps" type="number" value="20" min="1" max="200"></div><div class="run-row"><label>历史步数</label><input id="run-maxtraj" type="number" value="3" min="1" max="16"></div></div>
+            <label class="checkbox-row"><input id="run-manual" type="checkbox">人工操作虚拟机，结束后运行评测</label>
+            <button id="btn-start" class="run-btn primary-launch">启动任务<svg><use href="#i-arrow"/></svg></button>
           </div>
-          <div class="run-row">
-            <button id="btn-local-start" class="run-btn">▶ 本机启动</button>
-          </div>
-          <div class="run-note">在本机 Windows 上运行（浏览器操作走 CDP 虚拟输入不动真实鼠标；桌面应用会真控鼠标）。模型默认用 189 的决策(9028) + grounding(8001)。启动后自动切到「实时监控」边跑边看。</div>
-        </div>
-
-        <div id="panel-vm" style="display:none">
-        <div class="run-sec-title">任务</div>
-        <div class="run-row">
-          <label>测试集</label>
-          <select id="run-testset">
-            <option value="evaluation_examples/test_small.json" selected>test_small（39 任务）</option>
-            <option value="evaluation_examples/test_one.json">test_one（3 任务）</option>
-            <option value="evaluation_examples/test_all.json">test_all（369 任务）</option>
-          </select>
-        </div>
-        <div class="run-row">
-          <label>域名</label>
-          <select id="run-domain"></select>
-        </div>
-        <div class="run-row">
-          <label>任务</label>
-          <select id="run-task"></select>
-        </div>
-        <div class="run-sec-title">配置</div>
-        <div class="run-row" style="display:none">
-          <label>决策模型 provider</label>
-          <select id="run-model-provider">
-            <option value="openai">openai（API 兼容）</option>
-            <option value="anthropic">anthropic</option>
-            <option value="vllm" selected>vllm（本地部署）</option>
-            <option value="gemini">gemini</option>
-            <option value="open_router">open_router</option>
-          </select>
-        </div>
-        <div class="run-row">
-          <label>决策模型</label>
-          <select id="run-model"></select>
-        </div>
-        <div class="run-row" style="display:none">
-          <label>决策模型 URL</label>
-          <input id="run-model-url" value="http://7.246.80.237:9028/v1">
-        </div>
-        <div class="run-row" style="display:none">
-          <label>决策模型 API Key</label>
-          <input id="run-model-apikey" type="password" value="EMPTY" placeholder="留空则用 OPENAI_API_KEY 环境变量">
-        </div>
-        <div class="run-row">
-          <label>grounding 模型</label>
-          <select id="run-ground"></select>
-        </div>
-        <div class="run-row" style="display:none">
-          <label>grounding URL</label>
-          <input id="run-ground-url" value="http://7.246.80.237:49999/v1">
-        </div>
-        <div class="run-row" style="display:none">
-          <label>grounding API Key</label>
-          <input id="run-ground-apikey" type="password" value="EMPTY">
-        </div>
-        <div class="run-row">
-          <label>最大步数</label>
-          <input id="run-maxsteps" type="number" value="20" min="1" max="50">
-        </div>
-        <div class="run-row">
-          <label>轨迹长度（max_trajectory_length）</label>
-          <input id="run-maxtraj" type="number" value="3" min="1" max="16">
-        </div>
-        <div class="run-row" style="flex-direction:row;align-items:center;gap:10px">
-          <input id="run-manual" type="checkbox" style="width:auto;flex:0 0 auto">
-          <label for="run-manual" style="margin:0;cursor:pointer">🧑 手动模式：人工操作 VM，完成后点「评估结果」</label>
-        </div>
-        <div class="run-row" style="gap:10px">
-          <button id="btn-test" class="run-btn" style="background:var(--panel2);color:var(--text);border:1px solid var(--border);flex:1">🔌 测试连接</button>
-          <button id="btn-start" class="run-btn" style="flex:2">启动</button>
-        </div>
-        <div id="test-result" class="run-note" style="display:none"></div>
-        <div class="run-note">启动后自动切到「实时监控」查看模型调用与耗时</div>
-        </div>
-        </div>
-
-        <div class="run-panel">
+        </section>
+        <section class="run-panel model-panel">
+          <div class="section-heading"><span class="section-index">02</span><div><h2>连接模型</h2><p>决策与视觉定位，各司其职</p></div><span class="subtle-pill">REMOTE</span></div>
+          <div class="model-section"><div class="model-label"><span class="model-dot"></span>决策模型<span>理解页面 · 规划行动</span></div>
+          <div class="run-row"><label for="run-model">模型</label><select id="run-model"></select></div><div class="run-row"><label for="run-model-url">服务地址</label><input id="run-model-url" value="http://127.0.0.1:9028/v1" placeholder="http://模型主机:端口/v1"></div>
+          <details class="inline-details"><summary>认证与 Provider</summary><div class="run-row"><label>Provider</label><select id="run-model-provider"><option value="openai">OpenAI compatible</option><option value="anthropic">Anthropic</option><option value="vllm" selected>vLLM</option><option value="gemini">Gemini</option><option value="open_router">OpenRouter</option></select></div><div class="run-row"><label>API Key</label><input id="run-model-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
+          <div class="model-section"><div class="model-label"><span class="model-dot muted"></span>定位模型<span>视觉回退 · 元素定位</span></div>
+          <div class="run-row"><label for="run-ground">模型</label><select id="run-ground"></select></div><div class="run-row"><label for="run-ground-url">服务地址</label><input id="run-ground-url" value="http://127.0.0.1:8001/v1" placeholder="http://模型主机:端口/v1"></div><details class="inline-details"><summary>认证</summary><div class="run-row"><label>API Key</label><input id="run-ground-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
+          <button id="btn-test" class="studio-btn secondary full-width">测试决策模型连接</button><div id="test-result" class="run-note" style="display:none"></div>
+        </section>
+        <details class="advanced-settings"><summary><svg><use href="#i-sliders"/></svg><div>高级实验设置<small>记忆、视觉策略与提示词预设</small></div><span class="subtle-pill">预览 · 尚未接入</span></summary><div class="advanced-notice">这些实验控件为配置预览；当前运行后端尚未完整接入，修改不保证影响任务执行。</div><div class="advanced-grid">        <div class="run-panel">
           <div class="run-sec-title">Memory（实验变量）</div>
           <div class="run-row"><label>记忆策略</label><select id="run-memory"></select></div>
           <div id="run-memory-desc" class="experiment-note"></div>
@@ -447,6 +427,7 @@
           <div class="run-row"><label>保存名</label><input id="run-prompt-name" placeholder="prompt-v1-short"></div>
           <div class="run-row"><label>说明</label><input id="run-prompt-description" placeholder="本次修改目的"></div>
         </div>
+</div></details>
       </div>
 
       <div id="run-running" style="display:none">
@@ -597,6 +578,12 @@ const navChat = document.getElementById('nav-chat');
 const navLocal = document.getElementById('nav-local');
 function switchView(view) {
   const isLive = view === 'live';
+  document.getElementById('view-collect').classList.toggle('active', view === 'collect');
+  document.getElementById('nav-collect').classList.toggle('active', view === 'collect');
+  const titles = {run:'运行任务', live:'实时监控', collect:'SFT 采集', history:'虚拟机轨迹', local:'本机轨迹', debug:'模型调试', chat:'会话调试'};
+  document.getElementById('studio-page-title').textContent = titles[view] || '工作空间';
+  document.body.dataset.view = view;
+  if (view === 'collect' && window.CaptureStudio) window.CaptureStudio.open();
   const isRun = view === 'run';
   document.getElementById('view-live').classList.toggle('active', isLive);
   document.getElementById('view-history').classList.toggle('active', view === 'history');
@@ -617,6 +604,7 @@ function switchView(view) {
   if (view === 'chat') initChatView();
   if (isRun) initRunView();
 }
+document.getElementById('nav-collect').addEventListener('click', () => switchView('collect'));
 navLive.addEventListener('click', () => switchView('live'));
 navHistory.addEventListener('click', () => switchView('history'));
 navDebug.addEventListener('click', () => switchView('debug'));
@@ -952,7 +940,7 @@ function fillPendingCard(card, payload) {
       }
     }
     let i = 0;
-    const step = 3;  // 每次填充 3 字
+    const step = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? Math.max(1, text.length) : 3;
     const timer = setInterval(() => {
       i += step;
       responseEl.textContent = text.slice(0, i);
@@ -1230,6 +1218,12 @@ document.getElementById('btn-local-start').addEventListener('click', () => {
     mode: 'local',
     task: task,
     max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
+    model: document.getElementById('run-model').value,
+    model_url: document.getElementById('run-model-url').value,
+    model_api_key: document.getElementById('run-model-apikey').value,
+    ground_model: document.getElementById('run-ground').value,
+    ground_url: document.getElementById('run-ground-url').value,
+    ground_type: currentGroundType,
   };
   fetch('/run/start', {
     method: 'POST',
@@ -2122,5 +2116,6 @@ setInterval(poll, 2000);
 // 初始加载时切换到运行配置视图（正确隐藏状态栏 + 加载任务列表）
 switchView('run');
 </script>
+<script src="/static/capture.js"></script>
 </body>
 </html>

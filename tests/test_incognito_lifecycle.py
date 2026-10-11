@@ -195,6 +195,8 @@ def test_process_matching_handles_spaces_quotes_case_and_same_prefix(profile_roo
 
 
 def _fake_playwright(monkeypatch):
+    monkeypatch.setattr("osworld_agent.utils.cdp_websocket_endpoint",
+                        lambda host, port, timeout: f"ws://{host}:{port}/devtools/browser/owned")
     session = SimpleNamespace(send=Mock())
     browser = SimpleNamespace(new_browser_cdp_session=Mock(return_value=session), close=Mock())
     chromium = SimpleNamespace(connect_over_cdp=Mock(return_value=browser))
@@ -242,7 +244,7 @@ def test_cdp_close_sends_browser_close_only_to_owned_listener(monkeypatch, profi
 
     assert runner._close_owned_cdp(9222, profile) is True
     chromium.connect_over_cdp.assert_called_once()
-    assert chromium.connect_over_cdp.call_args.args == ("http://localhost:9222",)
+    assert chromium.connect_over_cdp.call_args.args == ("ws://localhost:9222/devtools/browser/owned",)
     session.send.assert_called_once_with("Browser.close")
 
 

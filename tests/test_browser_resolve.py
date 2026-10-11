@@ -36,6 +36,27 @@ def test_allowed_filter():
     assert s.resolve_target("The 'Remove Account' option", allowed={"2", "3"}) is None
 
 
+def test_empty_allowed_list_cannot_resolve_any_node():
+    s = _session()
+    assert s.resolve_target("The 'Submit' button", allowed=set()) is None
+    assert s.resolve_target("The Submit button [2]", allowed=set()) is None
+
+
+def test_duplicate_labels_require_disambiguation():
+    s = _session()
+    s.nodes["5"] = dict(s.nodes["2"], ref="5")
+    assert s.resolve_target("The 'Submit' button in the second row") is None
+    assert s.last_resolution_error == "ambiguous"
+    assert s.resolve_target("The 'Submit' button", allowed={"5"}) == "5"
+
+
+def test_duplicate_html_ids_are_not_selected_arbitrarily():
+    s = _session()
+    s.nodes["1"]["id"] = "duplicate"
+    s.nodes["2"]["id"] = "duplicate"
+    assert s.resolve_id("duplicate") is None
+
+
 def test_no_match_returns_none():
     s = _session()
     assert s.resolve_target("The canvas drawing area") is None
