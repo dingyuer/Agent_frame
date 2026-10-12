@@ -17,6 +17,12 @@ from typing import Any, Dict, List, Optional
 
 from .config import ACTION_YAML, load_yaml
 
+# Policy capability boundary: configuration/skills cannot silently re-enable code shortcuts.
+BASIC_ACTIONS = frozenset({"click", "double_click", "right_click", "type", "scroll", "press",
+    "hotkey", "goto", "select", "drag_and_drop", "switch_applications", "wait", "get_page_source",
+    "handle_dialog", "list_tabs", "switch_tab", "close_tab", "observe_desktop", "observe_browser",
+    "request_finish", "fail"})
+
 
 # --------------------------------------------------------------------------- #
 # 动作定义
@@ -46,6 +52,8 @@ def load_action_registry() -> Dict[str, ActionSpec]:
     registry: Dict[str, ActionSpec] = {}
     for section in ("actions", "extra_actions"):
         for name, raw in (data.get(section) or {}).items():
+            if name not in BASIC_ACTIONS:
+                continue
             raw = raw or {}
             registry[name] = ActionSpec(
                 name=name,
@@ -133,7 +141,7 @@ def action_from_decision(obj: Dict[str, Any]) -> Optional[Action]:
 
 def validate_action(act: Action) -> Optional[str]:
     """校验动作是否合法；返回 None 表示合法，否则返回中文错误说明。"""
-    spec = ACTION_REGISTRY.get(act.action)
+    spec = ACTION_REGISTRY.get(act.action) if act.action in BASIC_ACTIONS else None
     if spec is None:
         return f"未知动作类型「{act.action}」。可选动作：{', '.join(ACTION_REGISTRY)}"
     # 策略只能输出语义目标，不能提供执行器内部坐标 / 状态字段

@@ -24,17 +24,21 @@ def http_fixture(session, *, url="https://arxiv.org/pdf/2505.16301", headers=Non
     return page, context, response
 
 
-def test_pdf_mime_adds_extension_to_dotted_arxiv_identifier(session):
+
+def browser_artifact(session, *, filename="original.pdf", url="https://arxiv.org/pdf/2505.16301", body=b"%PDF fixture"):
+    # Fixture represents the browser's completed UI-initiated download event.
+    path = Path(session.downloads_dir) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return session._record_artifact(path=str(path), url=url, final_url=url, download_id="browser-file")
+
+def test_direct_download_is_disabled_without_network_or_files(session):
     _, context, response = http_fixture(session)
-    session.options.download_timeout_s = 12.5
     result = session.download(response.url)
-    assert result["status"] == "executed"
-    assert Path(result["path"]).name == "2505.16301.pdf"
-    assert context.request.get.call_args.kwargs["timeout"] == 12500
-    artifact = result["artifacts"][0]
-    assert artifact["artifact_id"] == artifact["download_id"] == result["artifact_id"]
-    assert artifact["sha256"] == artifact["initial_sha256"]
-    assert artifact["version"] == 1 and artifact["rename_history"] == []
+    assert result["status"] == "rejected" and result["dispatched"] is False
+    context.request.get.assert_not_called()
+    assert not session.event_metadata()["artifacts"]
+    assert BrowserSession._response_filename("", response.url, "application/pdf") == "2505.16301.pdf"
 
 
 @pytest.mark.parametrize("disposition,expected", [
@@ -47,50 +51,39 @@ def test_content_disposition_extended_name_precedence(disposition, expected):
     assert BrowserSession._response_filename(disposition, "https://host/irrelevant", "application/pdf") == expected
 
 
-def test_explicit_filename_and_redirect_alias_do_not_redownload(session):
-    _, context, response = http_fixture(session)
-    original = "https://arxiv.org/dl/observed?signature=unchanged"
-    first = session.download(original, filename="first.pdf")
-    second = session.download(response.url + "#page=1", filename="requested.pdf")
-    assert second["status"] == "already_downloaded"
-    assert context.request.get.call_count == 1
-    assert second["artifact_id"] == first["artifact_id"]
-    assert second["url"] == response.url + "#page=1"
-    assert Path(second["path"]).name == "requested.pdf"
-    assert second["artifacts"][0]["version"] == 2
+def test_obsolete_download_cannot_rename_existing_file(session):
+    original = browser_artifact(session)
+    result = session.download(original["url"], filename="requested.pdf")
+    assert result["status"] == "rejected"
+    assert Path(original["path"]).exists()
+    assert not (Path(session.downloads_dir) / "requested.pdf").exists()
 
 
-def test_rename_preserves_hash_inode_and_full_history(session):
-    _, context, response = http_fixture(session)
-    first = session.download(response.url)
-    original = first["artifacts"][0]
-    inode = Path(original["path"]).stat().st_ino
-    renamed = session.rename_artifact(first["artifact_id"], "paper.pdf")
-    renamed_again = session.rename_artifact(first["artifact_id"], "final.pdf")
-    final = renamed_again["artifacts"][0]
-    assert renamed["status"] == renamed_again["status"] == "executed"
-    assert final["version"] == 3
+def test_ui_rename_is_observed_without_mutating_files(session):
+    original = browser_artifact(session)
+    intermediate = Path(session.downloads_dir) / "paper.pdf"
+    final_path = Path(session.downloads_dir) / "final.pdf"
+    Path(original["path"]).rename(intermediate)  # stand-in for a user's file-manager operation
+    first = session.event_metadata()["artifacts"][0]
+    intermediate.rename(final_path)
+    final = session.event_metadata()["artifacts"][0]
+    assert first["version"] == 2 and final["version"] == 3
     assert final["sha256"] == final["initial_sha256"] == original["sha256"]
-    assert Path(final["path"]).stat().st_ino == inode
-    assert not Path(original["path"]).exists()
+    assert final["path"] == str(final_path)
     assert [e["to_version"] for e in final["rename_history"]] == [2, 3]
-    assert final["rename_history"][0]["from_path"] == original["path"]
+    assert all(e["source"] == "observed_ui_rename" for e in final["rename_history"])
     assert session.event_metadata()["artifact_events"][-1]["event"] == "artifact_renamed"
-    assert session.download(response.url)["path"] == final["path"]
-    assert context.request.get.call_count == 1
 
 
-def test_rename_refuses_collision_and_modified_contents(session):
-    _, _, response = http_fixture(session)
-    first = session.download(response.url)
-    destination = Path(session.downloads_dir) / "occupied.pdf"
-    destination.write_bytes(b"other artifact")
-    assert session.rename_artifact(first["artifact_id"], destination.name)["status"] == "rejected"
-    assert destination.read_bytes() == b"other artifact"
-    assert Path(first["path"]).exists()
-    Path(first["path"]).write_bytes(b"changed")
-    assert session.rename_artifact(first["artifact_id"], "new.pdf")["status"] == "rejected"
-    assert session.event_metadata()["artifacts"][0]["version"] == 1
+def test_direct_rename_is_disabled_and_modified_file_is_not_rebound(session):
+    original = browser_artifact(session)
+    assert session.rename_artifact(original["artifact_id"], "other.pdf")["status"] == "rejected"
+    assert Path(original["path"]).exists()
+    other = Path(session.downloads_dir) / "other.pdf"
+    Path(original["path"]).rename(other)
+    other.write_bytes(b"different")
+    artifact = session.event_metadata()["artifacts"][0]
+    assert artifact["version"] == 1 and artifact["path"] == original["path"]
 
 
 @pytest.mark.parametrize("filename", ["../out.pdf", "/tmp/out.pdf", "CON.pdf", "", "a/b.pdf"])

@@ -445,6 +445,8 @@ class BrowserSession:
             "bytes": os.path.getsize(path), "transport": transport, "completed_at": time.time()}
         artifact["sha256"] = self._file_hash(path)
         artifact["initial_sha256"] = artifact["sha256"]
+        stat = os.stat(path, follow_symlinks=False)
+        artifact["file_identity"] = [stat.st_dev, stat.st_ino]
         self._artifacts.append(artifact)
         self._downloaded[url] = artifact["path"]
         self._downloaded_sizes[url] = artifact["bytes"]
@@ -456,69 +458,47 @@ class BrowserSession:
             raise ValueError("filename must be a safe basename (no paths or reserved characters)")
         return value
 
-    @staticmethod
-    def _rename_noreplace(source, destination):
-        """Atomic rename without the POSIX rename() overwrite race."""
-        if os.name == "nt":
-            os.rename(source, destination)  # Windows refuses an existing target.
-            return
-        import ctypes
-        import errno
-        libc = ctypes.CDLL(None, use_errno=True)
-        rename = getattr(libc, "renameat2", None)
-        if rename is None:
-            raise OSError(errno.ENOTSUP, "Atomic non-overwriting rename is unavailable")
-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error), destination)
-
     @browser_thread
     def rename_artifact(self, artifact_id, filename):
-        """Rename only an unchanged completed artifact, preserving its identity."""
-        artifact = next((a for a in self._artifacts
-                         if a.get("artifact_id", a.get("download_id")) == artifact_id), None)
-        if artifact is None:
-            return self._failure("Unknown artifact ID", "not_found", action="rename_artifact")
-        dispatched = False
+        """Compatibility rejection: filenames must be changed through the interface."""
+        return self._failure("Use Save As or the file manager UI to rename files", "unsupported",
+                             action="rename_artifact", artifact_id=artifact_id)
+
+    def _observe_artifact_renames(self):
+        """Track UI renames read-only, within this task's directory, without rebaselining content."""
+        missing = [a for a in self._artifacts if not os.path.lexists(a["path"]) and a.get("file_identity")]
+        if not missing:
+            return
         try:
-            filename = self._explicit_filename(filename)
-            source = artifact["path"]
-            directory = os.path.abspath(self.downloads_dir)
-            destination = os.path.join(directory, filename)
-            if os.path.dirname(os.path.abspath(source)) != directory or os.path.islink(source):
-                raise ValueError("Artifact is outside the task directory or is a symlink")
-            before = os.stat(source)
-            digest = self._file_hash(source)
-            if digest != artifact.get("initial_sha256", artifact["sha256"]):
-                raise ValueError("Artifact contents changed since download")
-            if destination == source:
-                return {"status": "already_named", "dispatched": False, "action": "rename_artifact",
-                    "artifact_id": artifact_id, "path": source, "artifacts": [copy.deepcopy(artifact)]}
-            if destination in self._reserved_artifact_paths:
-                raise FileExistsError("Destination is reserved for an active download")
-            self._rename_noreplace(source, destination)
-            dispatched = True
-            after = os.stat(destination)
-            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or self._file_hash(destination) != digest:
-                raise ValueError("Artifact changed during rename; verification is required")
-            version = artifact.get("version", 1)
+            with os.scandir(self.downloads_dir) as entries:
+                candidates = [(os.path.abspath(e.path), e.stat(follow_symlinks=False))
+                              for e in entries if e.is_file(follow_symlinks=False)]
+        except OSError:
+            return
+        for artifact in missing:
+            identity = artifact["file_identity"]
+            matches = [(path, stat) for path, stat in candidates if [stat.st_dev, stat.st_ino] == identity
+                       and stat.st_size == artifact["bytes"] and stat.st_nlink == 1]
+            if len(matches) != 1 or not identity[1]:
+                continue
+            destination, _ = matches[0]
+            try:
+                digest = self._file_hash(destination)
+                after = os.stat(destination, follow_symlinks=False)
+                if digest != artifact["initial_sha256"] or [after.st_dev, after.st_ino] != identity:
+                    continue
+            except OSError:
+                continue
+            source, version = artifact["path"], artifact.get("version", 1)
             migration = {"from_path": source, "to_path": destination, "from_version": version,
-                "to_version": version + 1, "sha256": digest, "renamed_at": time.time()}
+                         "to_version": version + 1, "sha256": digest, "renamed_at": time.time(), "source": "observed_ui_rename"}
             artifact.setdefault("rename_history", []).append(migration)
             artifact.update(path=destination, version=version + 1)
             for url, path in list(self._downloaded.items()):
                 if path == source:
                     self._downloaded[url] = destination
-            event = {"event": "artifact_renamed", "artifact_id": artifact_id,
-                     "download_id": artifact["download_id"], **migration}
-            self._artifact_events.append(event)
-            return {"status": "executed", "dispatched": True, "action": "rename_artifact",
-                    "artifact_id": artifact_id, "path": destination, "artifact_event": copy.deepcopy(event),
-                    "artifacts": [copy.deepcopy(artifact)]}
-        except Exception as exc:
-            return self._failure(exc, "blocked", dispatched=dispatched, action="rename_artifact", artifact_id=artifact_id)
+            self._artifact_events.append({"event": "artifact_renamed", "artifact_id": artifact["artifact_id"],
+                                          "download_id": artifact["download_id"], **migration})
 
     def _drain_downloads(self):
         if self._loop is not None:
@@ -541,6 +521,7 @@ class BrowserSession:
 
     @browser_thread
     def event_metadata(self):
+        self._observe_artifact_renames()
         # Frequent lightweight polling can keep the worker queue nonempty, so
         # do not rely solely on its 25 ms idle timeout to pump browser events.
         if self._loop is not None and not self._loop.is_running():
@@ -603,13 +584,24 @@ class BrowserSession:
         # Random suffix prevents retries/repeated user IDs from sharing files.
         directory_id = self._filename(episode_id) + "_" + uuid.uuid4().hex[:12]
         context = browser.new_context(accept_downloads=True, viewport=size, locale="en-US",
-            timezone_id="UTC", color_scheme="light", reduced_motion="reduce", service_workers="block")
+            timezone_id="UTC", color_scheme="light", reduced_motion="reduce", service_workers="block",
+            ignore_https_errors=True)
         self._owned_context = context
         self.downloads_dir = os.path.join(self._base_downloads_dir, directory_id)
         os.makedirs(self.downloads_dir, exist_ok=False)
         self._watch_contexts(browser)
         page = context.new_page()
         self._watch_page(page)
+        # 关闭 launch 时 --incognito 留下的初始 about:blank 页面（只关页面，不动上下文/浏览器，
+        # 避免出现两个浏览器窗口；之前关上下文会连带破坏 CDP 会话导致 TargetClosedError）
+        for other_context in list(browser.contexts):
+            if other_context is context:
+                continue
+            for other_page in list(other_context.pages):
+                try:
+                    other_page.close()
+                except Exception:  # noqa: BLE001  关闭孤儿窗口失败不影响任务
+                    pass
         self._task_page_id = self._target_info(page)["targetId"]
         self._page_target_ids[id(page)] = self._task_page_id
         profile = {"version": "blank-browser-v1", "viewport": size,
@@ -1612,6 +1604,8 @@ class BrowserSession:
                         page.keyboard.press("ControlOrMeta+A")
                         page.keyboard.press("Backspace")
                     page.keyboard.insert_text(str(args["text"]))
+                else:
+                    self._settle(page)
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "target_ref": ref, "coord": [point["x"], point["y"]],
                     "coordinate_space": "css_viewport", "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
@@ -1657,6 +1651,7 @@ class BrowserSession:
                 return self._failure("Task page unavailable", "stale")
             dispatched = True
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            self._settle(page)
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "action": "goto", "url": page.url[:300],
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
@@ -1664,6 +1659,38 @@ class BrowserSession:
             return self._failure(exc, "blocked", dispatched, started)
         finally:
             self._disconnect(p, browser)
+
+    @staticmethod
+    def _settle(page, timeout_ms=4000):
+        """等待点击/导航后页面稳定；非导航点击会立即返回，失败不阻塞。
+
+        PDF 查看器（arxiv.org/pdf/...）的 load 事件只代表 HTML 就绪，PDF 本体是
+        之后异步 fetch + 渲染的；谷歌学术等站点的搜索结果也是 JS 异步渲染。所以：
+        1) networkidle 等主资源 fetch 完成（上限 4s）；
+        2) 再等屏幕连续两次一致（异步渲染收尾），避免截图仍是空白/加载态。
+        """
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except Exception:  # noqa: BLE001  页面持续有连接时按超时放行，不阻塞主流程
+            pass
+        BrowserSession._wait_screen_stable(page)
+
+    @staticmethod
+    def _wait_screen_stable(page, max_wait_ms=2000, interval_ms=350):
+        """连续两次 viewport 截图一致才返回；页面在异步渲染时会一直等到稳定。"""
+        import hashlib
+        deadline = time.monotonic() + max_wait_ms / 1000.0
+        prev = None
+        while time.monotonic() < deadline:
+            try:
+                buf = page.screenshot(full_page=False, scale="css")
+                digest = hashlib.sha1(bytes(buf)).hexdigest()
+            except Exception:  # noqa: BLE001
+                return
+            if prev == digest:
+                return
+            prev = digest
+            time.sleep(interval_ms / 1000.0)
 
     def screenshot(self):
         """CSS 像素 viewport 截图，同时建立其页面/文档绑定。"""
@@ -1790,6 +1817,7 @@ class BrowserSession:
                 dispatched = True
                 page.mouse.click(vx, vy, button="right" if name == "right_click" else "left",
                                  click_count=2 if name == "double_click" else 1)
+                self._settle(page)
             elif name == "type":
                 dispatched = True
                 page.mouse.click(vx, vy)
@@ -1831,91 +1859,14 @@ class BrowserSession:
 
     @browser_thread
     def download(self, url, filename=None):
-        """Download with the task BrowserContext's cookies, recording transport evidence."""
-        from urllib.parse import urlparse
-        url = (url or "").strip()
-        requested_filename = filename
-        if not url.startswith(("http://", "https://")):
-            return self._failure("Invalid download URL", "unsupported", action="download", url=url)
-        if filename is not None:
-            try:
-                filename = self._explicit_filename(filename)
-            except ValueError as exc:
-                return self._failure(exc, "unsupported", action="download", url=url)
+        """Legacy read-only status query; never initiates HTTP transfers or changes files."""
         pending = self._find_pending_download(url)
         if pending is not None:
             return {"status": "in_progress", "dispatched": False, "action": "download", "url": url,
                     "download_id": pending["download_id"], "artifact_id": pending["artifact_id"],
                     "pending_downloads": [copy.deepcopy(pending)], "download_events": [copy.deepcopy(pending)]}
-        cached = self._cached_artifact(url)
-        if cached:
-            rename = None
-            if filename is not None and os.path.basename(cached["path"]) != filename:
-                rename = self.rename_artifact(cached["artifact_id"], filename)
-                if rename["status"] not in {"executed", "already_named"}:
-                    return rename
-            return {"status": "already_downloaded", "dispatched": bool(rename and rename.get("dispatched")),
-                "action": "download", "url": url, "final_url": cached["final_url"], "path": cached["path"],
-                "download_id": cached["download_id"], "artifact_id": cached["artifact_id"],
-                "bytes": cached["bytes"], "verified": True, "semantic_verified": False,
-                "artifacts": [copy.deepcopy(cached)]}
-        if requested_filename is not None:
-            requested_path = os.path.join(os.path.abspath(self.downloads_dir), requested_filename)
-            if os.path.lexists(requested_path) or requested_path in self._reserved_artifact_paths:
-                return self._failure("Requested filename already exists or is reserved", "blocked", action="download", url=url)
-        response, path, created = None, None, False
-        started = time.perf_counter()
-        try:
-            _, browser = self._connect()
-            page = self._pick_page(browser)
-            if page is None:
-                return self._failure("Task page unavailable", "not_found", action="download", url=url)
-            response = page.context.request.get(url, timeout=max(1, int(self.options.download_timeout_s * 1000)),
-                headers={"Referer": page.url} if page.url.startswith(("http://", "https://")) else {})
-            if response.status != 200:
-                return self._failure(f"HTTP {response.status}", "blocked", action="download", url=url)
-            headers = {k.lower(): v for k, v in response.headers.items()}
-            declared = headers.get("content-length", "")
-            if declared.isdigit() and int(declared) > 128 * 1024 * 1024:
-                return self._failure("HTTP download exceeds 128 MiB; use browser download", "unsupported", action="download", url=url)
-            content_type = headers.get("content-type", "")
-            if filename is None:
-                filename = self._response_filename(headers.get("content-disposition", ""), response.url, content_type)
-            download_id = uuid.uuid4().hex
-            if requested_filename is not None:
-                os.makedirs(self.downloads_dir, exist_ok=True)
-                path = os.path.join(os.path.abspath(self.downloads_dir), filename)
-                self._reserved_artifact_paths.add(path)
-            else:
-                path = self._artifact_path(filename, download_id)
-            body = response.body()
-            if len(body) > 128 * 1024 * 1024:
-                raise ValueError("HTTP download exceeds 128 MiB")
-            with open(path, "xb") as stream:
-                created = True
-                stream.write(body)
-            artifact = self._record_artifact(path=path, url=url, final_url=response.url,
-                download_id=download_id, page_url=page.url, content_type=content_type, transport="http_context")
-            return {"status": "executed", "dispatched": True, "channel": "browser_dom",
-                "action": "download", "path": path, "bytes": artifact["bytes"], "verified": True,
-                "semantic_verified": False, "url": url, "final_url": response.url,
-                "download_id": download_id, "artifact_id": download_id,
-                "artifacts": [artifact], "message": "Transfer completed; document identity still requires framework verification.",
-                "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
-        except Exception as exc:
-            if created and path:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            return self._failure(exc, "blocked", action="download", url=url, verified=False)
-        finally:
-            self._reserved_artifact_paths.discard(path)
-            if response is not None:
-                try:
-                    response.dispose()
-                except Exception:
-                    pass
+        return self._failure("Direct download is disabled; click a DOM element or use the browser UI",
+                             "unsupported", action="download", url=url, verified=False)
 
     @staticmethod
     def _response_filename(disposition, url, content_type):

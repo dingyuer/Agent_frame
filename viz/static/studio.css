@@ -20,3 +20,18 @@ html{font-size:14px}body{padding-left:var(--sidebar);font-family:Inter,-apple-sy
 @media(max-width:520px){.page-intro p{font-size:12px}.model-label>span:last-child{font-size:9px}.mirror-caption{font-size:9px}.capture-start-row .field-tip{font-size:10px}.capture-navigation input{font-size:10px}}
 
 .execution-warning{background:#fbf5e8;color:#a48244;margin:0 12px 12px;padding:9px!important;border:1px solid #efe1c1;border-radius:5px}
+
+/* Evidence-driven queue and review, shared by live and history views. */
+.review-card { border-left: 3px solid var(--border); }
+.review-passed { border-left-color: #399d78; }
+.review-failed { border-left-color: #d28941; }
+.review-running { border-left-color: #6789d7; }
+.review-state { font-weight: 600; font-size: 13px; }
+.review-evidence { padding-left: 20px; overflow-wrap: anywhere; line-height: 1.7; }
+.review-note { color: var(--dim); }
+.queue-steps { list-style: none; margin: 0; padding: 8px 20px 16px; }
+.queue-steps li { display: flex; gap: 12px; align-items: baseline; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.queue-steps li span { flex: 0 0 68px; font-size: 12px; color: var(--dim); }
+.queue-steps .queue-doing { font-weight: 600; }
+.queue-steps .queue-doing span { color: #587fc4; }
+.queue-steps .queue-done span { color: #399d78; }

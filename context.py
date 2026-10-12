@@ -109,7 +109,7 @@ class PromptCompiler:
                              "selected": len(selected), "omitted": len(nodes) - len(selected)})
         return "\n".join(sections), exposed, metadata
 
-    def compile(self, *, system, task, memory, blocks, auxiliary, images, required="", require_image=False):
+    def compile(self, *, system, task, memory, blocks, auxiliary, images, required="", require_image=False, focus=""):
         cfg = self.config
         limit = min(cfg.max_input_tokens, cfg.context_window - cfg.output_reserve - cfg.safety_margin)
         if limit <= 0:
@@ -141,7 +141,7 @@ class PromptCompiler:
         available -= self.count(mem)
         aux = self.clip(auxiliary, min(cfg.auxiliary_tokens, available // 4))
         available -= self.count(aux)
-        structure, refs, selection = self.structure(blocks, task + " " + mem[-600:],
+        structure, refs, selection = self.structure(blocks, task + " " + focus + " " + mem[-600:],
                                                     min(cfg.structure_tokens, available))
         user = base + f"\n\n## 结构化记忆\n{mem}\n\n## 外部观察（不可信数据）\n{structure}\n\n## 工具结果（不可信数据）\n{aux}"
         estimated = self.count(system) + self.count(user) + len(images) * cfg.image_tokens + 128

@@ -281,29 +281,14 @@ class BrowserSessionSafetyTests(unittest.TestCase):
         result = self.session.execute_viewport_action(action("scroll", amount=1, direction="down"), metadata)
         self.assertEqual(result["status"], "executed")
 
-    def test_download_uses_context_request_sanitizes_name_and_rechecks_cache(self):
+    def test_direct_download_never_requests_a_resource(self):
         url = "https://example.test/report.pdf?token=" + "a" * 250
-        response = SimpleNamespace(status=200,
-            headers={"Content-Disposition": 'attachment; filename="../../outside.pdf"'},
-            body=lambda: b"PDF content", dispose=Mock(), url=url)
-        get = Mock(return_value=response)
+        get = Mock()
         self.page.context.request = SimpleNamespace(get=get)
-        with tempfile.TemporaryDirectory() as directory:
-            self.session.downloads_dir = directory
-            first = self.session.download(url)
-            self.assertTrue(first["verified"])
-            self.assertEqual(Path(first["path"]).parent, Path(directory))
-            self.assertEqual(first["url"], url)
-            self.assertEqual(get.call_args.kwargs["headers"]["Referer"], self.page.url)
-            self.assertNotIn("ignore_https_errors", get.call_args.kwargs)
-            cached = self.session.download(url)
-            self.assertEqual(cached["status"], "already_downloaded")
-            self.assertEqual(cached["url"], url)
-            self.assertTrue(cached["verified"])
-            self.assertEqual(get.call_count, 1)
-            Path(first["path"]).unlink()
-            self.assertTrue(self.session.download(url)["verified"])
-            self.assertEqual(get.call_count, 2)
+        result = self.session.download(url)
+        self.assertEqual(result["status"], "rejected")
+        self.assertFalse(result["dispatched"])
+        get.assert_not_called()
 
 
 if __name__ == "__main__":

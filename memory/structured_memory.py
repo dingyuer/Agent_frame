@@ -49,15 +49,11 @@ class StructuredMemory:
     def apply_state_update(self, patch: Dict[str, Any]) -> None:
         if not patch:
             return
-        # The original task is framework-owned and cannot be overwritten by the model.
-        if patch.get("current_subgoal") is not None:
-            self.task_state["current_subgoal"] = patch["current_subgoal"]
-        for item in patch.get("completed_add") or []:
-            if item and item not in self.task_state["completed"]:
-                self.task_state["completed"].append(item)
-        for item in patch.get("pending_add") or []:
-            if item and item not in self.task_state["pending"]:
-                self.task_state["pending"].append(item)
+        # Queue progress, task and completion state belong exclusively to the framework.
+        if not isinstance(patch, dict):
+            return
+        if not isinstance(patch.get("known_fact_add", {}), dict):
+            return
         for k, v in (patch.get("known_fact_add") or {}).items():
             self.known_facts[k] = v
 

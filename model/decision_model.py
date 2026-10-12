@@ -1,4 +1,4 @@
-"""决策模型层：可插拔注册表 + OpenAI 兼容客户端（支持视觉）。
+﻿"""决策模型层：可插拔注册表 + OpenAI 兼容客户端（支持视觉）。
 
 换决策模型只改两处之一：
 1. 改 config.yaml 里的 model.name（对应 MODEL_REGISTRY 的键）；
@@ -254,7 +254,7 @@ class _ModelEntry:
 
 # 决策模型注册表：key 是给人看的别名，换模型改 config 里的 name 即可。
 MODEL_REGISTRY: Dict[str, _ModelEntry] = {
-    "9b": _ModelEntry("Qwen3.5-9B", "9B 决策模型（vLLM @ 7.246.80.237:9028）"),
+    "9b": _ModelEntry("Qwen3.5-9B", "9B 决策模型（vLLM @ 10.44.101.62:8094）"),
     "27b": _ModelEntry("Qwen3.6-27B", "27B 决策模型（需要 api_key）"),
     # 下面是要接外部 API 时再加的占位示例：
     # "gpt-4o": _ModelEntry("gpt-4o", "OpenAI GPT-4o"),

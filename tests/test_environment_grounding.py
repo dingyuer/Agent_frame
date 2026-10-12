@@ -152,10 +152,10 @@ def test_windows_failed_viewport_capture_discards_browser_identity(monkeypatch):
         None, {"kind": "browser_ax", "snapshot_id": "old"}, {"page_id": "old"}))
     monkeypatch.setattr(env, "_take_screenshot", lambda: image_bytes())
     obs = env.observe()
-    assert obs.info["screenshot_space"] == "screen_pixels"
-    assert obs.info["scene"]["browser_use"] == 0
+    assert obs.info["screenshot_space"] == "css_viewport"
+    assert obs.screenshot is None  # missing browser capture must not silently use desktop pixels
     assert "page_id" not in obs.info
-    assert obs.context == []
+    assert obs.info["observation_error"]
 
 
 def test_windows_viewport_rejection_is_not_replayed_on_desktop(monkeypatch):
@@ -186,6 +186,7 @@ def test_windows_missing_coordinate_space_is_rejected(monkeypatch):
 def test_windows_explicit_screen_coordinates_do_not_use_an_open_browser(monkeypatch):
     from osworld_agent.adapters import windows_env
     env = WindowsEnvironment()
+    env._observation_surface = "desktop"
     env._browser_session = SimpleNamespace(execute_viewport_action=lambda *a, **kw: pytest.fail("wrong space"))
     monkeypatch.setattr(env, "observe", lambda: Observation())
     monkeypatch.setattr(env, "_focus_is_browser", lambda: pytest.fail("focus probe"))
@@ -198,6 +199,7 @@ def test_windows_explicit_screen_coordinates_do_not_use_an_open_browser(monkeypa
 def test_windows_execution_error_is_reported(monkeypatch):
     from osworld_agent.adapters import windows_env
     env = WindowsEnvironment()
+    env._observation_surface = "desktop"
     monkeypatch.setattr(env, "_build_observation", lambda: Observation())
     monkeypatch.setattr(windows_env, "to_pyautogui", lambda action: "raise ValueError('execution failed')")
     result = env.step(Action("click", {"x": 10, "y": 20, "coordinate_space": "screen_pixels"}))

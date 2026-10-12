@@ -1,21 +1,14 @@
-"""Bounded framework assistance for an explicit paper-download goal.
-
-The original model decision is never rewritten. Identity resolution and file
-operations are separate framework events and consume wall time, not model steps.
-"""
+"""Read-only paper identity binding. All downloads originate from UI interaction."""
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import time
 from dataclasses import dataclass, field
 
-from .env import Observation
-
 from .paper_resolver import ADAPTER_VERSION, arxiv_id_from_url, resolve_arxiv_candidates
 
-WORKFLOW_VERSION = "paper-workflow-v1"
+WORKFLOW_VERSION = "paper-workflow-v2-ui-only"
 
 
 @dataclass
@@ -58,12 +51,11 @@ class PaperWorkflow:
         self.resolver = resolver or resolve_arxiv_candidates
         self.max_resolution_rounds = max_resolution_rounds
         self._resolutions = set()
-        self._downloads = set()
 
-    def advance(self, observation, completion, env, emit, *, remaining_s=None, allow_download=True):
+    def advance(self, observation, completion, env, emit, *, remaining_s=None, allow_download=False):
         result = WorkflowResult(observation)
         session = getattr(env, "_browser_session", None)
-        if observation is None or session is None or not callable(getattr(session, "download", None)):
+        if observation is None or session is None:
             return result
         started = time.monotonic()
 
@@ -95,67 +87,14 @@ class PaperWorkflow:
                 result.messages.append("候选论文不满足任务约束：" + str(exc))
                 continue
             record("goal_binding", check_id=goal["check_id"], binding=resolution.binding.to_dict())
-            result.messages.append("框架已根据官方证据确认论文：" + resolution.binding.full_title)
+            pdf = resolution.binding.pdf_url
+            filename = goal.get("filename", "")
+            result.messages.append(
+                "框架已确认论文身份：" + resolution.binding.full_title
+                + "。请打开 PDF 页面 " + pdf
+                + "，在浏览器里点击「下载 / Download」按钮保存 PDF"
+                + (("，交付文件名应为 " + filename) if filename else "")
+                + "；点击后浏览器会自动下载，框架会等待并核验文件名与内容。")
 
         completion.observe(observation)
-        if not allow_download:
-            return result
-        metadata = session.event_metadata()
-        if metadata.get("dialogs") or metadata.get("dialog"):
-            return result
-        reports = {c["id"]: c for c in completion.public_report(completion.evaluate()).get("checks", [])}
-        for goal in completion.paper_goals():
-            binding = goal.get("binding")
-            if not binding or reports.get(goal["check_id"], {}).get("status") == "passed":
-                continue
-            if goal.get("count", 1) != 1 or remaining() <= 0:
-                continue
-            url = binding["pdf_url"]
-            key = (goal["check_id"], url, goal.get("filename"))
-            if key in self._downloads:
-                continue
-            metadata = session.event_metadata()
-            pending = metadata.get("pending_downloads", []) or metadata.get("download_events", [])
-            if any(p.get("status") == "in_progress" and str(p.get("url", "")).split("#", 1)[0] == url.split("#", 1)[0]
-                   for p in pending):
-                continue
-            self._downloads.add(key)
-            args = {"url": url}
-            if goal.get("filename"):
-                args["filename"] = goal["filename"]
-            record("framework_operation_started", operation="download", check_id=goal["check_id"], args=args)
-            operation_started = time.monotonic()
-            options = getattr(session, "options", None)
-            previous_timeout = getattr(options, "download_timeout_s", None)
-            if previous_timeout is not None:
-                options.download_timeout_s = min(previous_timeout, max(0.01, remaining()))
-            try:
-                info = session.download(**args)
-            except Exception as exc:
-                info = {"status": "uncertain", "error": str(exc), "action": "download",
-                        "reason": "下载调用异常，派发与完成状态需要重新观察确认"}
-            finally:
-                if previous_timeout is not None:
-                    options.download_timeout_s = previous_timeout
-            if info.get("status") == "in_progress":
-                # A raced download event is not a failed attempt. After settlement
-                # allow the completed cache to apply the requested filename.
-                self._downloads.discard(key)
-            operation = {"operation": "download", "check_id": goal["check_id"], "args": args,
-                         "result": copy.deepcopy(info), "actor_role": "framework", "policy_trainable": False,
-                         "elapsed_s": round(time.monotonic() - operation_started, 3)}
-            result.operations.append(operation)
-            record("framework_operation_finished", **operation)
-            completion.observe(None, info)
-            result.messages.append("框架下载结果：" + str(info.get("status", "unknown")) +
-                                   ("；" + str(info["error"]) if info.get("error") else ""))
-        if result.operations:
-            try:
-                result.observation = env.observe()
-            except Exception:
-                # Never leave stale references/coordinates available to execution.
-                result.observation = Observation(screenshot=None, context=[],
-                    info={"observation_error": "Refresh after framework operation failed",
-                          "screenshot_stale": True, **session.event_metadata()})
-            completion.observe(result.observation)
         return result

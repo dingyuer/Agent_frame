@@ -1,4 +1,4 @@
-"""配置包：所有可调项 + 动作/skill 注册表文件的定位。
+﻿"""配置包：所有可调项 + 动作/skill 注册表文件的定位。
 
 - Config 系列 dataclass：模型、grounding、agent 循环、环境的可调项。
 - ACTION_YAML / SKILLS_YAML：动作 / skill 注册表文件路径（随包分发，改这些 yaml 不动代码）。
@@ -33,7 +33,7 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 class ModelConfig:
     """决策模型的连接配置。"""
     name: str = "9b"
-    url: str = "http://7.246.80.237:9028/v1"
+    url: str = "http://10.44.101.62:8094/v1"
     api_key: str = "EMPTY"
     temperature: float = 0.3
     max_tokens: int = 2048
@@ -50,8 +50,8 @@ class ModelConfig:
 @dataclass
 class GroundingConfig:
     """视觉定位模型的连接配置。"""
-    name: str = "ui_tars_7b"
-    url: str = "http://7.246.80.237:49999/v1"
+    name: str = "ui_venus2_9b"
+    url: str = "http://7.246.80.189:8001/v1"
     api_key: str = "EMPTY"
     width: int = 1920
     height: int = 1080

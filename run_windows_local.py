@@ -1,4 +1,4 @@
-"""Windows 本地手动任务运行器：自由文本任务 → Agent + WindowsEnvironment。
+﻿"""Windows 本地手动任务运行器：自由文本任务 → Agent + WindowsEnvironment。
 
 跑一个本地 GUI 任务（重点：浏览器任务），逐步回放 + 落盘轨迹/截图。
 
@@ -284,10 +284,12 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Windows 本地手动任务运行器")
     parser.add_argument("--task", required=True, help="自由文本任务描述")
-    parser.add_argument("--model", default="Qwen3.5-9B")
-    parser.add_argument("--model-url", default="http://7.246.80.189:9028/v1")
+    parser.add_argument("--model", default="Qwen3.6-27B")
+    parser.add_argument("--model-url", default="http://10.44.101.62:8094/v1")
     parser.add_argument("--planner-model", help="可选独立规划模型；默认使用决策模型")
     parser.add_argument("--planner-url", help="独立规划端点；默认沿用 --model-url")
+    parser.add_argument("--verifier-model", help="独立核查模型；默认使用决策模型同端点的独立会话")
+    parser.add_argument("--verifier-url", help="独立核查端点；默认沿用 --model-url")
     parser.add_argument("--capture-rollout", action="store_true", help="请求服务端实际token与logprobs，缺元数据不允许导出RL")
     parser.add_argument("--policy-revision", default="")
     parser.add_argument("--tokenizer-revision", default="")
@@ -340,6 +342,9 @@ def main() -> int:
             chat_template_revision=args.chat_template_revision)))
         planner = (LoggingChatModel(ChatModel(ModelConfig(name=args.planner_model,
             url=args.planner_url or args.model_url, api_key="EMPTY"))) if args.planner_model else None)
+        verifier = (ChatModel(ModelConfig(name=args.verifier_model or args.model,
+            url=args.verifier_url or args.model_url, api_key="EMPTY", temperature=0, max_tokens=768,
+            timeout=45)) if args.verifier_model or args.verifier_url else None)
         ground_cls = RealUItarsGrounding if args.ground_type == "ui-tars" else UIVenus2Grounding
         grounding = LoggingGrounding(ground_cls(url=args.ground_url, api_key="EMPTY",
                                                        model=args.ground_model, width=width, height=height))
@@ -354,6 +359,7 @@ def main() -> int:
                       wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout},
                       step_callback=_live_step, completion_spec=completion_spec,
                       private_completion_spec=private_completion_spec, planner_model=planner,
+                      verifier_model=verifier,
                       event_path=os.path.join(args.result_dir, "events.jsonl") if args.result_dir else None)
         if args.result_dir:
             set_results_dir(args.result_dir)

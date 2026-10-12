@@ -286,6 +286,7 @@
   .json-null { color: #808080; font-style: italic; }
 </style>
 <link rel="stylesheet" href="/static/studio.css">
+<link rel="stylesheet" href="/static/studio-motion.css">
 </head>
 <body>
   <svg class="icon-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -396,10 +397,10 @@
         <section class="run-panel model-panel">
           <div class="section-heading"><span class="section-index">02</span><div><h2>连接模型</h2><p>决策与视觉定位，各司其职</p></div><span class="subtle-pill">REMOTE</span></div>
           <div class="model-section"><div class="model-label"><span class="model-dot"></span>决策模型<span>理解页面 · 规划行动</span></div>
-          <div class="run-row"><label for="run-model">模型</label><select id="run-model"></select></div><div class="run-row"><label for="run-model-url">服务地址</label><input id="run-model-url" value="http://127.0.0.1:9028/v1" placeholder="http://模型主机:端口/v1"></div>
+          <div class="run-row"><label for="run-model">模型</label><select id="run-model"></select></div><div class="run-row"><label for="run-model-url">服务地址</label><input id="run-model-url" value="http://10.44.101.62:8094/v1" placeholder="http://模型主机:端口/v1"></div>
           <details class="inline-details"><summary>认证与 Provider</summary><div class="run-row"><label>Provider</label><select id="run-model-provider"><option value="openai">OpenAI compatible</option><option value="anthropic">Anthropic</option><option value="vllm" selected>vLLM</option><option value="gemini">Gemini</option><option value="open_router">OpenRouter</option></select></div><div class="run-row"><label>API Key</label><input id="run-model-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
           <div class="model-section"><div class="model-label"><span class="model-dot muted"></span>定位模型<span>视觉回退 · 元素定位</span></div>
-          <div class="run-row"><label for="run-ground">模型</label><select id="run-ground"></select></div><div class="run-row"><label for="run-ground-url">服务地址</label><input id="run-ground-url" value="http://127.0.0.1:8001/v1" placeholder="http://模型主机:端口/v1"></div><details class="inline-details"><summary>认证</summary><div class="run-row"><label>API Key</label><input id="run-ground-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
+          <div class="run-row"><label for="run-ground">模型</label><select id="run-ground"></select></div><div class="run-row"><label for="run-ground-url">服务地址</label><input id="run-ground-url" value="http://7.246.80.189:8001/v1" placeholder="http://模型主机:端口/v1"></div><details class="inline-details"><summary>认证</summary><div class="run-row"><label>API Key</label><input id="run-ground-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
           <button id="btn-test" class="studio-btn secondary full-width">测试决策模型连接</button><div id="test-result" class="run-note" style="display:none"></div>
         </section>
         <details class="advanced-settings"><summary><svg><use href="#i-sliders"/></svg><div>高级实验设置<small>记忆、视觉策略与提示词预设</small></div><span class="subtle-pill">预览 · 尚未接入</span></summary><div class="advanced-notice">这些实验控件为配置预览；当前运行后端尚未完整接入，修改不保证影响任务执行。</div><div class="advanced-grid">        <div class="run-panel">
@@ -463,7 +464,7 @@
           <label>Provider</label><select id="debug-provider"><option value="vllm">vllm</option><option value="openai">openai</option><option value="anthropic">anthropic</option><option value="gemini">gemini</option><option value="open_router">open_router</option></select>
           <label>模型</label><input id="debug-model" list="debug-model-options">
           <datalist id="debug-model-options">
-            <option value="Qwen3.5-9B"></option>
+            <option value="Qwen3.6-27B"></option>
             <option value="UI-TARS-1.5-7B"></option>
           </datalist>
           <label>模型 URL</label><input id="debug-url">
@@ -514,7 +515,7 @@
           </select>
           <input id="chat-model" list="chat-model-options" placeholder="模型名">
           <datalist id="chat-model-options">
-            <option value="Qwen3.5-9B"></option>
+            <option value="Qwen3.6-27B"></option>
             <option value="UI-TARS-1.5-7B"></option>
           </datalist>
           <input id="chat-url" placeholder="模型 URL">
@@ -535,7 +536,7 @@
       <div class="chat-modal-box">
         <h3>新建会话</h3>
         <p>请选择初始模型类型（顶部可随时切换）</p>
-        <button class="chat-new-type" data-type="decision">决策模型<br><small>Qwen3.5-9B</small></button>
+        <button class="chat-new-type" data-type="decision">决策模型<br><small>Qwen3.6-27B</small></button>
         <button class="chat-new-type" data-type="grounding">Grounding 模型<br><small>UI-TARS-1.5-7B</small></button>
         <button class="chat-new-type" data-type="ui-venus2">UI-Venus-2 Grounding<br><small>UI-Venus-2-9B</small></button>
         <button id="chat-new-cancel">取消</button>
@@ -633,6 +634,8 @@ function renderStatus(s) {
     // done=true 只代表 episode 结束（可能主动放弃/超时/成功），不等于成功；
     // 真正成功/失败要等 task_end 的 result，故用中性态"已结束（待评分）"。
     if (s.done) { statusState.done = true; setStatus('ended', '已结束（待评分）'); }
+  } else if (s.event === 'step_verification') {
+    setStatus('running', (s.method === 'model' ? '独立模型核查' : '代码核查') + ' · ' + ({running:'进行中',passed:'通过',failed:'尚未完成',unknown:'证据不足'}[s.status] || ''));
   } else if (s.event === 'framework_wait') {
     setStatus('running', s.status === 'completed' ? '等待结束，正在验收' : '等待下载 · 不消耗步数');
   } else if (s.event === 'executing') {
@@ -748,12 +751,35 @@ function renderShotThumb(img, fullB64, coord) {
 /* ===== 卡片构造（统一逻辑，实时/历史共用） ===== */
 const pendingCards = {};  // log_id -> {card, responseEl, shotWrap}
 
+function plannerHtml(response) {
+  // 把规划器返回的 JSON 渲染成可读的步骤/关键词/判据，而不是一大坨 JSON
+  try {
+    const p = JSON.parse(response);
+    let html = '';
+    if (p.steps && Array.isArray(p.steps)) {
+      html += '<div class="plan-steps">';
+      p.steps.forEach(s => {
+        html += '<div class="plan-step"><b>' + esc(s.idx + '') + '. ' + esc(s.goal || '') + '</b>';
+        if (s.expected_evidence) html += '<div class="plan-ev" style="color:var(--dim)">预期证据：' + esc(s.expected_evidence) + '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    if (p.keywords && p.keywords.length) html += '<div class="plan-kw">🔑 关键词：' + esc(p.keywords.join('、')) + '</div>';
+    if (p.final_check) html += '<div class="plan-fc">✅ 完成判据：' + esc(p.final_check) + '</div>';
+    return html || ('<pre>' + esc(response) + '</pre>');
+  } catch (e) {
+    return '<pre>' + esc(response) + '</pre>';
+  }
+}
+
 function modelCardHtml(payload) {
   const isGrounding = payload.type === 'grounding';
   const isSubAgent = payload.type === 'code_agent';
+  const isPlanner = payload.type === 'planner';
   const time = new Date(payload.ts * 1000).toLocaleTimeString();
-  const tag = isGrounding ? 'Grounding' : (isSubAgent ? '子 agent' : '决策模型');
-  const tagCls = isGrounding ? 'grounding' : (isSubAgent ? 'status' : 'decision');
+  const tag = payload.type === 'verify' ? '独立模型核查' : isGrounding ? 'Grounding' : (isSubAgent ? '子 agent' : (isPlanner ? '规划器' : '决策模型'));
+  const tagCls = isGrounding ? 'grounding' : (isSubAgent ? 'status' : (isPlanner ? 'status' : 'decision'));
   const stepLabel = payload.step != null ? (isSubAgent && payload.substep != null ? (payload.step + '-' + payload.substep) : String(payload.step)) : null;
   const stepHtml = stepLabel != null ? '<span class="step">Step ' + stepLabel + '</span>' : '';
   const elapsedHtml = payload.elapsed != null ? '<span class="elapsed">⏱ ' + formatElapsed(payload.elapsed) + '</span>' : '';
@@ -775,23 +801,82 @@ function modelCardHtml(payload) {
     const c = parseCoord(payload.response);
     if (c) coordNote = '<div class="coord-note">📍 定位坐标：( ' + c.x + ' , ' + c.y + ' )</div>';
   }
-  const respHtml = '<div class="sec-title">输出 Response</div><div class="response">' + esc(payload.response) + '</div>';
+  const respHtml = '<div class="sec-title">输出 Response</div><div class="response">' + (isPlanner ? plannerHtml(payload.response) : esc(payload.response)) + '</div>';
   return '<div class="card ' + (isGrounding ? 'grounding' : 'decision') + '" data-id="' + (payload.id || '') + '" data-kind="model" data-mtype="' + payload.type + '">' +
     '<div class="card-head"><span class="tag ' + tagCls + '">' + tag + '</span>' + stepHtml + elapsedHtml +
     '<span class="time">' + time + '</span></div>' +
     '<div class="card-body">' + shotHtml + '<div class="texts">' + coordNote + promptHtml + respHtml + '</div></div></div>';
 }
 
+// 框架等待：轮询期间只保留一张卡片原地刷新，不叠加多个「等待」框
+let activeWaitCard = null;
+function waitDetail(payload) {
+  if (payload.status === 'completed') return '✅ 系统操作完成，继续执行';
+  if (payload.status === 'failed') return '⚠️ 系统操作失败：' + esc(payload.reason || '');
+  const r = payload.reason || '';
+  const downloading = r === 'pending_download' || r === 'download_start_grace' || /下载|download|论文传输|传输中/i.test(r);
+  const label = downloading ? '📥 正在下载文件' : (r && r !== 'waiting' ? esc(r) : '等待系统完成操作');
+  return '<span class="spinner"></span> ' + label + ' · 已等待 ' + Math.round(Number(payload.elapsed_s) || 0) + ' 秒';
+}
+function updateWaitCard(tl, payload) {
+  if (!activeWaitCard || !activeWaitCard.isConnected) {
+    const temp = document.createElement('div');
+    temp.innerHTML = statusCardHtml(payload);
+    activeWaitCard = temp.firstElementChild;
+    tl.appendChild(activeWaitCard);
+  } else {
+    const prompt = activeWaitCard.querySelector('.prompt');
+    const timeEl = activeWaitCard.querySelector('.time');
+    if (prompt) prompt.innerHTML = waitDetail(payload);
+    if (timeEl) timeEl.textContent = new Date(payload.ts * 1000).toLocaleTimeString();
+  }
+  if (payload.status === 'completed' || payload.status === 'failed') {
+    activeWaitCard = null;
+  }
+}
+
+function reviewCardHtml(report) {
+  const labels = {running:'正在核查', passed:'核查通过', failed:'尚未完成', unknown:'证据不足'};
+  const state = ['running','passed','failed','unknown'].includes(report.status) ? report.status : 'unknown';
+  const method = report.method === 'model' ? '独立模型核查' : '代码核查';
+  const evidence = (report.evidence || []).map(e => '<li>' + esc(String(e)) + '</li>').join('');
+  return '<div class="card review-card review-' + state + '" data-kind="review">' +
+    '<div class="card-head"><span class="tag status">' + method + '</span><span class="review-state">' +
+    (state === 'running' ? '<span class="spinner"></span> ' : '') + labels[state] + '</span>' +
+    '<span class="step">动作 ' + esc(String(report.decision_step ?? '—')) + ' · ' + esc(report.plan_step_id || '') + '</span></div>' +
+    '<div class="card-body"><div class="texts"><strong>' + esc(report.goal || '') + '</strong><p>' + esc(report.reason || '') +
+    '</p>' + (evidence ? '<ul class="review-evidence">' + evidence + '</ul>' : '') +
+    '<small class="review-note">步骤状态由框架维护 · 核查不消耗操作步数</small></div></div></div>';
+}
+function updateReviewCard(container, report) {
+  const key = (report.review_id || '') + ':' + report.method;
+  let card = Array.from(container.querySelectorAll('[data-review-id]')).find(c => c.dataset.reviewId === key);
+  const temp = document.createElement('div'); temp.innerHTML = reviewCardHtml(report);
+  const replacement = temp.firstElementChild; replacement.dataset.reviewId = key;
+  if (card) card.replaceWith(replacement); else container.appendChild(replacement);
+}
+function updateQueueCard(container, queue) {
+  let card = container.querySelector('[data-kind="execution-queue"]');
+  if (!card) { card = document.createElement('div'); card.className = 'card queue-card'; card.dataset.kind = 'execution-queue'; container.prepend(card); }
+  const labels = {done:'已核查',doing:'当前步骤',pending:'待执行'};
+  card.innerHTML = '<div class="card-head"><span class="tag status">执行队列</span><span>' +
+    Number(queue.cursor || 0) + ' / ' + Number(queue.total || 0) + ' 已核查</span></div><ol class="queue-steps">' +
+    (queue.steps || []).map(s => '<li class="queue-' + (['done','doing','pending'].includes(s.status) ? s.status : 'pending') + '"><span>' +
+      esc(labels[s.status] || '待执行') + '</span>' + esc(s.goal || '') + '</li>').join('') + '</ol>';
+}
+
 function statusCardHtml(payload) {
   const time = new Date(payload.ts * 1000).toLocaleTimeString();
   let detail = '';
   if (payload.event === 'task_start') detail = '开始任务：' + esc(payload.instruction);
-  else if (payload.event === 'step') detail = 'Step ' + payload.step + ' 执行完成，reward=' + payload.reward + '，done=' + payload.done;
+  else if (payload.event === 'step') detail = '动作 ' + payload.step +
+    (payload.reward == null && payload.done == null ? ' · 正在决策' :
+     ' · 执行结束' + (payload.reward != null ? '，reward=' + payload.reward : '') + (payload.done ? '，等待整项任务验收' : ''));
   else if (payload.event === 'manual_mode') detail = '🧑 手动模式：请在 VMware 窗口中手动完成任务，完成后点「评估结果」';
   else if (payload.event === 'error') detail = '⚠️ Step ' + payload.step + ' 出错：' + esc(payload.error || '');
   else if (payload.event === 'task_end') detail = (payload.success === true) ? '✅ 任务结束，成功' : ('任务结束，最终 result=' + payload.result);
   else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
-  else if (payload.event === 'framework_wait') detail = '<span class="spinner"></span> 框架等待：' + esc(payload.reason || '下载进行中') + ' · 已等待 ' + Math.round(Number(payload.elapsed_s) || 0) + ' 秒 · 不消耗决策步数';
+  else if (payload.event === 'framework_wait') detail = waitDetail(payload);
   else if (payload.event === 'executed') detail = '执行结果：' + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '');
   else detail = esc(payload.event || '');
   return '<div class="card status" data-kind="status">' +
@@ -891,9 +976,19 @@ function addCard(payload) {
   } else if (payload.kind === 'status') {
     renderStatus(payload);
     if (payload.event === 'task_end') group.result = payload.result;
-    const temp = document.createElement('div');
-    temp.innerHTML = statusCardHtml(payload);
-    tl.appendChild(temp.firstElementChild);
+    if (payload.event === 'step_verification') {
+      updateReviewCard(tl, payload);
+    } else if (payload.event === 'execution_queue') {
+      updateQueueCard(tl, payload.queue || {});
+    } else if (payload.event === 'framework_wait') {
+      updateWaitCard(tl, payload);
+    } else if (payload.event === 'executing' || payload.event === 'executed') {
+      // 执行中/执行结果只在状态栏显示，不再单独开卡片（避免每步多出「执行中」卡片）
+    } else {
+      const temp = document.createElement('div');
+      temp.innerHTML = statusCardHtml(payload);
+      tl.appendChild(temp.firstElementChild);
+    }
   }
   // 实时监控默认始终跟随最新卡片；用户可通过切换历史任务页查看旧轨迹。
   // 先等 DOM 布局完成再滚动，避免图片异步插入时 scrollHeight 尚未更新。
@@ -1011,8 +1106,8 @@ function updateStrategyHelp() {
 function updatePromptTokens() {
   const el = document.getElementById('run-prompt-tokens');
   const prompt = document.getElementById('run-system-prompt').value;
-  const model = document.getElementById('run-model').value || 'Qwen3.5-9B';
-  const url = document.getElementById('run-model-url').value || 'http://7.246.80.237:9028/v1';
+  const model = document.getElementById('run-model').value || 'Qwen3.6-27B';
+  const url = document.getElementById('run-model-url').value || 'http://10.44.101.62:8094/v1';
   if (!prompt) { el.textContent = 'System prompt token：0'; return; }
   el.textContent = 'System prompt token：计算中…';
   clearTimeout(window.promptTokenTimer);
@@ -1109,7 +1204,7 @@ document.getElementById('run-domain').addEventListener('change', updateTaskOptio
 
 /* ===== 模型预设：下拉选择，URL/key 自动填充（从后端 /model-presets 读取） ===== */
 let MODEL_PRESETS = { decision_models: [], grounding_models: [] };
-let currentGroundType = 'ui-tars';
+let currentGroundType = 'ui-venus2';
 function applyDecisionPreset() {
   const name = document.getElementById('run-model').value;
   const m = (MODEL_PRESETS.decision_models || []).find(x => x.name === name);
@@ -1125,7 +1220,7 @@ function applyGroundPreset() {
   if (m) {
     document.getElementById('run-ground-url').value = m.url || '';
     document.getElementById('run-ground-apikey').value = m.api_key || 'EMPTY';
-    currentGroundType = m.type || 'ui-tars';
+    currentGroundType = m.type || 'ui-venus2';
   }
 }
 function loadModelPresets() {
@@ -1540,7 +1635,7 @@ function localStepCard(runId, t) {
       (t.subagent.result ? '<div class="prompt">' + esc(t.subagent.result) + '</div>' : '');
   }
   return '<div class="card"><div class="card-head"><span class="step">Step ' + stepNum + '</span>' + channelHtml + elapsedHtml + statusHtml + '</div>' +
-    '<div class="card-body">' + shotHtml + '<div class="texts">' + promptHtml + actionHtml + planHtml + expectHtml + gHtml + subHtml + outcomeHtml + observeHtml + '</div></div></div>';
+    '<div class="card-body">' + shotHtml + '<div class="texts">' + promptHtml + actionHtml + planHtml + expectHtml + gHtml + subHtml + outcomeHtml + observeHtml + (t.step_reviews?.length ? t.step_reviews.map(reviewCardHtml).join('') : (t.step_verification ? reviewCardHtml(t.step_verification) : '')) + '</div></div></div>';
 }
 
 function loadRunDetail(model, domain, task) {
@@ -1766,8 +1861,8 @@ function renderDebugImage(messages, coordinate) {
   host.innerHTML = '<img src="' + esc(url) + '" title="提交给模型的最后一张图片">' + marker;
 }
 const DEBUG_DEFAULTS = {
-  decision:  { provider: 'vllm', model: 'Qwen3.5-9B', url: 'http://7.246.80.237:9028/v1', key: 'EMPTY' },
-  grounding: { provider: 'vllm', model: 'UI-TARS-1.5-7B', url: 'http://7.246.80.237:49999/v1', key: 'EMPTY' },
+  decision:  { provider: 'vllm', model: 'Qwen3.6-27B', url: 'http://10.44.101.62:8094/v1', key: 'EMPTY' },
+  grounding: { provider: 'vllm', model: 'UI-Venus-2-9B', url: 'http://7.246.80.189:8001/v1', key: 'EMPTY' },
 };
 function applyDebugDefaults(type) {
   const d = DEBUG_DEFAULTS[type];
@@ -1836,8 +1931,8 @@ let chatSeq = 1;
 let chatLoaded = false;
 
 const CHAT_DEFAULTS = {
-  decision:  { type: 'decision', label: '决策模型', provider: 'vllm', model: 'Qwen3.5-9B', url: 'http://7.246.80.237:9028/v1', key: 'EMPTY' },
-  grounding: { type: 'grounding', label: 'Grounding 模型', provider: 'vllm', model: 'UI-TARS-1.5-7B', url: 'http://7.246.80.237:49999/v1', key: 'EMPTY' },
+  decision:  { type: 'decision', label: '决策模型', provider: 'vllm', model: 'Qwen3.6-27B', url: 'http://10.44.101.62:8094/v1', key: 'EMPTY' },
+  grounding: { type: 'grounding', label: 'Grounding 模型', provider: 'vllm', model: 'UI-Venus-2-9B', url: 'http://7.246.80.189:8001/v1', key: 'EMPTY' },
   'ui-venus2': { type: 'ui-venus2', label: 'UI-Venus-2 Grounding', provider: 'vllm', model: 'UI-Venus-2-9B', url: 'http://7.246.80.189:8001/v1', key: 'EMPTY' },
 };
 const CHAT_LS_KEY = 'agent_chat_sessions_v1';
@@ -2126,5 +2221,6 @@ setInterval(poll, 2000);
 switchView('run');
 </script>
 <script src="/static/capture.js"></script>
+<script src="/static/studio-motion.js"></script>
 </body>
 </html>

@@ -11,7 +11,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from ..actions import Action
+from ..actions import Action, BASIC_ACTIONS
 from ..env import Environment, Observation, StepResult, run_local_command, run_local_python
 from .uno_commands import SET_CELL_VALUES_CMD, SAVE_DOC_CMD
 
@@ -246,6 +246,9 @@ class VMwareEnvironment(Environment):
 
     def execute_routed(self, action, route):
         """执行已路由的 browser_dom 动作（DOM 定位 + actionability check）。"""
+        if action.action in {"download", "rename_artifact", "run_in_terminal", "call_code_agent", "set_cell_values", "save"}:
+            return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                "error_code": "non_basic_action", "action": action.action})
         session = self._get_browser_session()
         if session is None:
             return StepResult(observation=self.observe(), info={
@@ -487,10 +490,13 @@ class VMwareEnvironment(Environment):
 
     def step(self, action: Action) -> StepResult:
         name = action.action
+        if name not in BASIC_ACTIONS:
+            return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                "error_code": "non_basic_action", "action": name})
         if name in {"observe_desktop", "observe_browser"}:
             self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
             return StepResult(observation=self.observe(), info={"status": "executed", "dispatched": False, "action": name})
-        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab", "download", "goto", "rename_artifact"}:
+        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab", "goto"}:
             session = self._get_browser_session()
             if session is None:
                 return StepResult(observation=self.observe(), info={"status": "rejected", "dispatched": False,

@@ -25,8 +25,44 @@ git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
 也可以使用独立模型；定位模型保持固定，只参与执行，不采集 grounding SFT 或更新其权重。
 
 任务必须先形成包含目标、操作前提和预期证据的计划。规划格式错误会修复重试一次；
-仍失败则返回 `planning_failed`，不开始操作。完整计划、公开验收条件与当前截图是
-受保护的决策输入，历史记忆与 AX 节点按预算裁剪。
+仍失败则返回 `planning_failed`，不开始操作。完整计划保存在框架执行队列中；每轮决策仅发送原始任务、
+当前步骤和相邻步骤、本步骤关联的公开验收条件、精简记忆、当前截图及按预算选择的 AX 节点。
+决策模型的 `state_update` 只能补充事实，不能修改当前步骤或把任务标为已完成。
+
+### 基础动作、执行队列与逐步核查
+
+操作模型只能调用基础 GUI/DOM 动作（点击、输入、选择、拖拽、按键、滚动、导航等），以及
+观察表面切换、标签页和对话框处理。`download`、`rename_artifact`、终端、代码代理和 UNO
+文件写入均已从策略动作空间移除，执行入口也会拒绝；下载、另存、改名通过界面完成。
+`completion_spec` 中的 `download` 是只读验收条件，不是操作动作。
+
+规划步骤格式示例：
+
+```json
+{"steps":[{"goal":"打开 arXiv 首页","expected_evidence":"当前页面位于 arxiv.org",
+  "verification":[{"kind":"url_host","host":"arxiv.org"}],"actions":["goto"],"check_ids":[]},
+ {"goal":"搜索用户指定论文并核对结果","expected_evidence":"结果中的论文标题、作者与任务匹配",
+  "verification":[{"kind":"visual"}],"actions":["click","type","press"],"check_ids":[]}],
+ "keywords":["用户指定的论文名"],"final_check":"原始任务的全部要求得到满足"}
+```
+
+每个动作结束、异步操作等待完成后，先用代码核对当前步骤。支持 `url_equals`、`url_host`、
+`text_present`、`element_state`、`app_open` 和已有可信条件的 `check_ids`；应用检查使用操作系统
+窗口/进程证据，目前 Windows 提供该元数据，其他环境证据缺失时转入视觉核查。
+对不能由代码充分核实的目标，独立核查员接收动作后的截图、AX、系统证据和原始任务，输出
+`passed/failed/unknown`、理由和证据。明确失败的代码条件不能由模型覆盖；失败或未知时不推进队列。
+一个规划步骤可以需要多次基础动作，只有核查通过才移到下一个步骤。队列全部核查通过后，还要
+检查整项原始任务，防止初始规划遗漏要求。
+
+前端实时监控显示执行队列、代码核查和独立模型核查的进行中/通过/未通过/证据不足状态，历史
+步骤保留两种核查的理由与证据。核查和自动等待不增加操作步数。
+
+默认核查员复用决策模型的端点配置，但使用独立客户端、独立提示和独立调用记录（温度 0、
+最多输出 768 token、单次超时不超过 45 秒及剩余任务预算）。可在 Python 中传入
+`Agent(..., verifier_model=review_model)`，本机 CLI 可用 `--verifier-model` 和 `--verifier-url`。
+核查调用保存在 `review_calls` 和事件日志中，标记 `actor_role=verifier, policy_trainable=false`，
+不会混入操作/规划的 SFT 或策略 RL 样本。轨迹新增 `step_verification`、`step_reviews`、`execution_queue`。
+
 
 持续卡住时，框架把实际失败和验收反馈交给规划器修订计划；默认最多重规划一次，
 可通过 `Agent(max_replans=...)` 或配置的 `agent.max_replans` 调整，重规划不会重置环境。
@@ -47,8 +83,8 @@ git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
 短名先作为查询保留，框架根据实际观察到的 arXiv 候选 URL，从官方元数据绑定完整标题和论文 ID。
 适配器只接受完整标题或冒号前的完整别名；多个匹配、来源不可达或不支持的附加要求不会被静默忽略。
 身份绑定单独追加到事件中，原始任务契约不变；官方来源与实际 PDF 交叉验收。
-绑定后框架可直接下载对应 PDF 并交付为 `Roboclaw.pdf`，无需点击查看器工具栏。
-自动身份解析目前支持 arXiv；其他来源仍可用显式完整标题合同和普通下载动作。
+绑定后模型通过页面链接或查看器下载按钮保存 PDF，通过另存为/文件管理器界面满足文件名要求。
+自动身份解析目前支持 arXiv；其他来源仍可用显式完整标题合同和界面下载。
 多篇或规则不能完整理解的指令应提供可信的 `completion_spec`，避免遗漏条件。
 规划模型不能自行新增或放宽验收标准。领域流程提示也不能保证小模型在所有网站都能正确决策。
 
@@ -94,11 +130,13 @@ AX 不足时可按需读取精简 DOM。优先使用 DOM 引用或唯一语义�
 
 1. 有可信合同：逐项检查全部条件，条件之间为 AND。
 2. 有独立环境评测器：任务结束时调用一次；同时存在合同时，环境评测与合同都必须通过。
-3. 缺少证据或评测异常：保留 `unknown`，不会让模型自述代替验证。
+3. 没有完整确定性合同，或存在明确的语义要求时：独立核查员检查原始任务的所有要求。
+   它不能覆盖任何失败的硬性条件或私有评测条件。证据不足、调用失败或输出非法时保留 `unknown`。
 
-没有可信条件或独立评测器的任务，结束申请得到 `success=false` 和
-`termination_reason=completion_unverifiable`。训练轨迹对未知验收使用
-`reward=null, reward_valid=false`；兼容字段 `score=0` 不能独自作为失败标签。
+只有独立模型核查通过的任务使用 `termination_reason=verified_by_model`，并明确记录
+`source=independent_model_review`；任务可以显示完成，但 `evaluation_available=false`、
+`reward=null, reward_valid=false`，不会冒充确定性训练奖励。无核查模型也无可信证据时仍返回
+`completion_unverifiable`。兼容字段 `score=0` 不能独自作为失败标签。
 
 `completion_spec` 格式为 `{"checks": [...]}`。每项可填唯一 `id`，`scope` 默认为
 `final`，表示结束时仍须成立。`milestone` 可记录中途已核实的页面状态；所有文件条件无论 scope
@@ -118,10 +156,9 @@ AX 不足时可按需读取精简 DOM。优先使用 DOM 引用或唯一语义�
 有作者、年份、DOI 或 arXiv ID 条件时，还须提供对应身份依据；arXiv 页边标识和绑定后的
 官方 PDF 来源会专门核验，正文或参考文献中出现某个 ID 不能单独通过。
 
-`download(url, filename=...)` 可直接指定交付文件名。后续改名使用
-`rename_artifact(artifact_id, filename)`，仅处理本轮已登记文件，不覆盖现有目标。
-文件 ID、初始摘要和改名链保持不变；内容、论文身份与最终文件名必须由同一份文件满足。
-手工在框架之外移动文件不等同于登记的改名事件。
+下载事件被动登记浏览器实际保存的文件。通过文件管理器界面改名后，框架只读扫描本任务下载目录，
+在文件身份、大小、内容摘要都一致且无歧义时登记改名链；不自行移动或修改文件。
+跨目录移动、复制替换或内容变化不会被自动认作原文件。内容、论文身份与最终文件名须由同一份文件满足。
 
 这是刻意保守的验证器。扫描件缺少可提取文字、加密 PDF、缺少 `pypdf`、超过 100 MiB 的文件、
 提取顺序异常或标题/附加身份无法精确确定时可能返回 `unknown`；损坏的 PDF 或非 PDF 字节会失败。
@@ -276,7 +313,7 @@ credit assignment 还要求任务、验收规范 hash、初态和策略版本一
 语义树 credit 是可选的归因估计，不是局部动作成功的真值，也不能消除动态网页随机性。
 同策略 planner 与 decision 的实际采样都记录；固定 teacher 和定位器不更新。
 导出按模型调用事件的实际追加顺序排列，保留中途重规划的位置。
-当前代码子 Agent 的内部采样尚未纳入这一契约，包含 `call_code_agent` 的 episode 会被 RL 导出拒绝。
+当前策略不提供代码子 Agent 动作；历史上包含 `call_code_agent` 的 episode 仍被 RL 导出拒绝。
 OCR 定位兜底仅使用唯一精确文字匹配，不会暗中额外调用决策模型。
 
 本仓库提供执行、验收、持续采集和导出，尚未集成梯度更新、PPO/GRPO 优化器或分布式训练调度。

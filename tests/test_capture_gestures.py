@@ -48,7 +48,8 @@ def test_capture_gestures_are_serial_semantic_steps(request):
         if path == "/":
             route.fulfill(content_type="text/html", body=(static / "index.html").read_text())
             return
-        if path in ("/static/studio.css", "/static/capture.js"):
+        if path in ("/static/studio.css", "/static/capture.js",
+                    "/static/studio-motion.css", "/static/studio-motion.js"):
             route.fulfill(content_type="text/css" if path.endswith(".css") else "text/javascript",
                           body=(static / Path(path).name).read_text())
             return

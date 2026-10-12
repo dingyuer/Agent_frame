@@ -1,4 +1,4 @@
-"""Docker 批量评测：在服务器上用 Docker provider 跑 OSWorld test_small。
+﻿"""Docker 批量评测：在服务器上用 Docker provider 跑 OSWorld test_small。
 
 用法（在 runner 容器内，PYTHONPATH 含 /osworld_agent、/osworld）：
     python3.11 run_docker.py \
@@ -6,8 +6,8 @@
         --vm-path /data/osworld-agent-s/vm/uploaded/Ubuntu.qcow2 \
         --test-meta /osworld/evaluation_examples/test_small.json \
         --result-dir /data/osworld-agent-s/results/<RUN_ID> \
-        --model Qwen3.5-9B --model-url http://7.246.80.237:9028/v1 \
-        --ground-model UI-TARS-1.5-7B --ground-url http://7.246.80.237:49999/v1
+        --model Qwen3.6-27B --model-url http://10.44.101.62:8094/v1 \
+        --ground-model UI-Venus-2-9B --ground-url http://7.246.80.189:8001/v1
 """
 from __future__ import annotations
 
@@ -48,11 +48,11 @@ def main() -> int:
     parser.add_argument("--vm-path", required=True)
     parser.add_argument("--test-meta", required=True)
     parser.add_argument("--result-dir", required=True)
-    parser.add_argument("--model", default="Qwen3.5-9B")
-    parser.add_argument("--model-url", default="http://7.246.80.237:9028/v1")
-    parser.add_argument("--ground-model", default="UI-TARS-1.5-7B")
-    parser.add_argument("--ground-url", default="http://7.246.80.237:49999/v1")
-    parser.add_argument("--ground-type", default="ui-tars", choices=["ui-tars", "ui-venus2"],
+    parser.add_argument("--model", default="Qwen3.6-27B")
+    parser.add_argument("--model-url", default="http://10.44.101.62:8094/v1")
+    parser.add_argument("--ground-model", default="UI-Venus-2-9B")
+    parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
+    parser.add_argument("--ground-type", default="ui-venus2", choices=["ui-tars", "ui-venus2"],
                         help="grounding 模型类型：ui-tars / ui-venus2")
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--screen-width", type=int, default=1920)

@@ -17,6 +17,8 @@ PAGE = b"""<!doctype html><meta charset=utf-8><title>Paper fixture</title>
 <h1>AAA</h1>
 <a id=pdf href=/paper.pdf download>Download AAA PDF</a>
 <a id=slow href=/slow.pdf download>Slow download</a>
+<a id=private href=/private.pdf download>Private PDF</a>
+<a id=fake href=/fake.pdf download>Fake PDF</a>
 <button id=alert onclick="alert('Fixture dialog')">Show dialog</button>
 <a id=popup href=/child target=_blank>Open child</a>
 <button id=overlay onclick="document.getElementById('modal').hidden=false">Show modal</button>
@@ -60,7 +62,8 @@ def live_browser(request, tmp_path, monkeypatch):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
-            self.send_header("Set-Cookie", "session=test-session; Path=/")
+            if path != "/no-cookie":
+                self.send_header("Set-Cookie", "session=test-session; Path=/")
             self.end_headers()
             self.wfile.write(PAGE if path != "/child" else b"<h1>Child tab</h1>")
         def log_message(self, *args):
@@ -152,20 +155,20 @@ def test_real_popup_requires_explicit_switch_then_returns_to_parent(live_browser
     assert next(tab["tab_id"] for tab in session.list_tabs()["tabs"] if tab["active"]) == original
 
 
-def test_real_http_download_shares_browser_session(live_browser):
+def test_real_ui_download_shares_browser_session(live_browser):
     session, base = live_browser
-    result = session.download(base + "/private.pdf")
+    result = click(session, "private")
     assert result["status"] == "executed"
     verifier = CompletionVerifier("请下载一篇叫做AAA的论文")
-    verifier.observe(observe(session), result)
+    verifier.observe(wait_for(session, lambda o: bool(o.info.get("artifacts"))), result)
     assert verifier.evaluate()["status"] == "passed"
 
 
 def test_real_html_disguised_as_pdf_is_not_task_success(live_browser):
     session, base = live_browser
-    result = session.download(base + "/fake.pdf")
+    result = click(session, "fake")
     verifier = CompletionVerifier("请下载一篇叫做AAA的论文")
-    verifier.observe(observe(session), result)
+    verifier.observe(wait_for(session, lambda o: bool(o.info.get("artifacts"))), result)
     assert verifier.evaluate()["status"] == "failed"
 
 
@@ -182,8 +185,8 @@ def test_real_slow_download_times_out_without_blocking_observation(live_browser)
 def test_real_episode_reset_isolates_session_and_downloads(live_browser):
     session, base = live_browser
     first = dict(session.initial_state)
-    assert session.download(base + "/private.pdf")["status"] == "executed"
-    assert observe(session).info["artifacts"]
+    assert click(session, "private")["status"] == "executed"
+    assert wait_for(session, lambda o: bool(o.info.get("artifacts"))).info["artifacts"]
     second = session.begin_episode(viewport={"width": 900, "height": 700})
     assert first["initial_state_id"] == second["initial_state_id"]
     assert first["context_id"] != second["context_id"]
@@ -191,9 +194,10 @@ def test_real_episode_reset_isolates_session_and_downloads(live_browser):
     obs = observe(session)
     assert not obs.info.get("artifacts") and obs.info["url"] == "about:blank"
     assert len(session.list_tabs()["tabs"]) == 1
-    result = session.download(base + "/private.pdf")
+    assert session.goto(base + "/no-cookie")["status"] == "executed"
+    result = click(session, "private")
     verifier = CompletionVerifier("请下载一篇叫做AAA的论文")
-    verifier.observe(observe(session), result)
+    verifier.observe(wait_for(session, lambda o: bool(o.info.get("artifacts"))), result)
     assert verifier.evaluate()["status"] == "failed"  # No cookie leaked into the new context.
 
 

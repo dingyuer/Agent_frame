@@ -243,39 +243,23 @@ def test_modal_subtree_is_kept_even_after_normal_node_budget(session):
     assert snapshot['active_modals'] == ['1']
 
 
-def test_http_download_html_is_only_transport_evidence_and_preserves_source(session):
-    browser = EventBrowser()
-    context = browser.new_context()
-    page = context.new_page()
-    page.url = 'https://papers.example/AAA'
-    response = SimpleNamespace(status=200, url='https://papers.example/login',
-        headers={'content-type': 'text/html'}, body=lambda: b'<html>Login required</html>', dispose=Mock())
-    context.request.get.return_value = response
-    session._connect = Mock(return_value=(None, browser))
-    result = session.download('https://papers.example/AAA.pdf')
-    assert result['verified'] is True  # transport / local file only
-    assert result['semantic_verified'] is False
-    artifact = result['artifacts'][0]
-    assert artifact['page_url'] == page.url
-    assert artifact['url'] == 'https://papers.example/AAA.pdf'
-    assert artifact['final_url'] == 'https://papers.example/login'
-    assert artifact['content_type'] == 'text/html'
+def test_browser_html_artifact_is_only_transport_evidence(session):
+    from test_browser_downloads import browser_artifact
+    from osworld_agent.verifiers import CompletionVerifier
+    artifact = browser_artifact(session, url="https://papers.example/AAA.pdf", body=b"<html>Login required</html>")
+    verifier = CompletionVerifier('请下载一篇叫做AAA的论文')
+    verifier.observe(None, {"artifacts": [artifact]})
+    assert verifier.evaluate()["status"] != "passed"
+    assert artifact["source_url"] == "https://papers.example/AAA.pdf"
 
 
-def test_same_size_cache_corruption_produces_new_download_identity(session):
-    browser = EventBrowser()
-    context = browser.new_context()
-    context.new_page()
-    response = SimpleNamespace(status=200, url='https://example.test/AAA.pdf',
-        headers={}, body=lambda: b'abc', dispose=Mock())
-    context.request.get.return_value = response
-    session._connect = Mock(return_value=(None, browser))
-    first = session.download(response.url)
-    Path(first['path']).write_bytes(b'xyz')
-    second = session.download(response.url)
-    assert context.request.get.call_count == 2
-    assert first['artifacts'][0]['download_id'] != second['artifacts'][0]['download_id']
-    assert first['path'] != second['path']
+def test_same_size_cache_corruption_is_not_rebaselined(session):
+    from test_browser_downloads import browser_artifact
+    artifact = browser_artifact(session, body=b"abc")
+    Path(artifact["path"]).write_bytes(b"xyz")
+    assert session._cached_artifact(artifact["url"]) is None
+    assert session.event_metadata()["artifacts"][0]["initial_sha256"] == artifact["initial_sha256"]
+    assert session.download(artifact["url"])["status"] == "rejected"
 
 
 def test_async_browser_download_never_blocks_observation_and_cancels_on_deadline(session):

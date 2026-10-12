@@ -93,6 +93,29 @@ class UItarsGrounding(Grounding):
         return self._delegate.locate(screenshot, target)
 
 
+class UIVenus2Grounding(Grounding):
+    """UI-Venus-2 定位客户端（[0,1000] 归一化坐标，OpenAI 兼容端点）。"""
+
+    def __init__(self, url: str, api_key: str, model: str,
+                 width: int = 1920, height: int = 1080, timeout: float = 180.0):
+        self.url = url
+        self.api_key = api_key
+        self.model = model
+        self.width = width
+        self.height = height
+        self.timeout = timeout
+
+    def locate(self, screenshot, target: str) -> GroundingResult:
+        """Use the same real endpoint protocol as the specialized runners."""
+        if not hasattr(self, "_delegate"):
+            from ..adapters.uivenus2_grounding import UIVenus2Grounding as _RealUIVenus2
+            self._delegate = _RealUIVenus2(
+                self.url, self.api_key, self.model, self.width, self.height,
+                timeout=self.timeout,
+            )
+        return self._delegate.locate(screenshot, target)
+
+
 class NullGrounding(Grounding):
     """无定位模型时的降级实现（始终返回屏幕中心），用于离线测试链路。"""
 
@@ -151,6 +174,7 @@ class _ModelEntry:
 # 视觉定位模型注册表
 GROUNDING_REGISTRY: Dict[str, _ModelEntry] = {
     "ui_tars_7b": _ModelEntry("UI-TARS-1.5-7B", "UI-TARS 定位模型（vLLM @ 49999）"),
+    "ui_venus2_9b": _ModelEntry("UI-Venus-2-9B", "UI-Venus-2 定位模型（vLLM @ 8001）"),
 }
 
 
@@ -158,5 +182,8 @@ def build_grounding_model(cfg: GroundingConfig) -> Grounding:
     """根据配置构造视觉定位客户端。"""
     entry = GROUNDING_REGISTRY.get(cfg.name)
     real_name = entry.name if entry else cfg.name
+    if (cfg.name or "").startswith("ui_venus"):
+        return UIVenus2Grounding(url=cfg.url, api_key=cfg.api_key, model=real_name,
+                                 width=cfg.width, height=cfg.height, timeout=cfg.timeout)
     return UItarsGrounding(url=cfg.url, api_key=cfg.api_key, model=real_name,
                            width=cfg.width, height=cfg.height, timeout=cfg.timeout)

@@ -1,4 +1,4 @@
-"""可视化运行器：跑一个真实 OSWorld 任务，边跑边把模型调用推给 viz 服务器，结束后落盘轨迹。
+﻿"""可视化运行器：跑一个真实 OSWorld 任务，边跑边把模型调用推给 viz 服务器，结束后落盘轨迹。
 
 历史轨迹目录命名：{example_id}__{run_ts}，其中 run_ts = YYYYMMDD_NNN（日期+当日序号），
 供前端历史列表区分多次运行、显示编号。traj.jsonl 写成前端 renderRunDetail 期望的格式。
@@ -39,13 +39,13 @@ def main() -> None:
     parser.add_argument("--cache-dir", default=None, help="OSWorld 缓存目录（复用原框架的 cache，避免重复下载）")
     parser.add_argument("--vm-path", default=None)
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--model", default="Qwen3.5-9B")
-    parser.add_argument("--model-url", default="http://7.246.80.237:9028/v1")
+    parser.add_argument("--model", default="Qwen3.6-27B")
+    parser.add_argument("--model-url", default="http://10.44.101.62:8094/v1")
     parser.add_argument("--model-api-key", default="EMPTY")
-    parser.add_argument("--ground-model", default="UI-TARS-1.5-7B")
-    parser.add_argument("--ground-url", default="http://7.246.80.237:49999/v1")
+    parser.add_argument("--ground-model", default="UI-Venus-2-9B")
+    parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
     parser.add_argument("--ground-api-key", default="EMPTY")
-    parser.add_argument("--ground-type", default="ui-tars", choices=["ui-tars", "ui-venus2"],
+    parser.add_argument("--ground-type", default="ui-venus2", choices=["ui-tars", "ui-venus2"],
                         help="grounding 模型类型：ui-tars / ui-venus2")
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--operation-timeout", type=float, default=300)

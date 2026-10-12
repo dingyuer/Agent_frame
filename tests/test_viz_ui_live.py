@@ -98,6 +98,35 @@ def test_studio_human_demonstration_from_buttons_to_dataset(request, tmp_path):
             page.screenshot(path=str(tmp_path / "studio-finished.png"), full_page=True)
             page.set_viewport_size({"width": 390, "height": 844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+            # The same event renderer handles live websocket and reloaded history.
+            page.set_viewport_size({"width": 1440, "height": 1050})
+            page.emulate_media(reduced_motion="reduce")
+            page.evaluate("""() => {
+              addCard({kind:'status',event:'task_start',instruction:'核查测试',max_steps:8,ts:1});
+              addCard({kind:'status',event:'step',step:1,ts:1});
+              addCard({kind:'status',event:'execution_queue',queue:{cursor:0,total:2,steps:[
+                {id:'p0_1',goal:'搜索目标论文',status:'doing'}, {id:'p0_2',goal:'下载 PDF',status:'pending'}]},ts:1});
+              for (const status of ['running','unknown']) addCard({kind:'status',event:'step_verification',
+                review_id:'fixture-r1',plan_step_id:'p0_1',decision_step:1,method:'code',status,
+                goal:'搜索目标论文',reason:'需要图像证据',evidence:[],ts:1});
+              for (const status of ['running','passed']) addCard({kind:'status',event:'step_verification',
+                review_id:'fixture-r1',plan_step_id:'p0_1',decision_step:1,method:'model',status,
+                goal:'搜索目标论文',reason:'标题符合任务',evidence:['<script>bad()</script>'],ts:1});
+            }""")
+            assert page.locator('[data-kind="review"]').count() == 2  # pending cards update in place
+            assert page.locator('[data-kind="execution-queue"]').count() == 1
+            assert page.locator('.review-passed').inner_text().find('独立模型核查') >= 0
+            assert page.locator('.review-evidence').inner_text() == '<script>bad()</script>'
+            assert page.locator('#st-step').inner_text() == '1 / 8'
+            page.locator('#nav-live').click()
+            expect(page.locator('.review-passed')).to_be_visible()
+            expect(page.locator('[data-kind="execution-queue"]')).to_be_visible()
+            assert 'undefined' not in page.locator('#timeline').inner_text()
+            page.screenshot(path=str(tmp_path / 'studio-step-review.png'), full_page=True)
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            assert not errors
             browser.close()
     finally:
         controller.close()

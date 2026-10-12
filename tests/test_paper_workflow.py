@@ -63,19 +63,19 @@ def environment(tmp_path, url="https://arxiv.org/abs/2603.11558"):
     return env
 
 
-def test_short_query_and_filename_resolve_to_one_verified_file(tmp_path):
+def test_short_query_and_filename_bind_identity_without_downloading(tmp_path):
     env = environment(tmp_path)
     verifier = CompletionVerifier("请下载一篇叫做Roboclaw的论文，并重命名为Roboclaw")
     workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=metadata_fetch))
     events = []
     result = workflow.advance(env.observe(), verifier, env, lambda name, **p: events.append((name, p)))
-    assert env._browser_session.calls == [(URL, "Roboclaw.pdf")]
-    assert verifier.evaluate()["status"] == "passed"
-    assert result.operations and result.messages
+    assert not env._browser_session.calls
+    assert verifier.bindings and verifier.evaluate()["status"] != "passed"
+    assert not result.operations and result.messages
     assert all(e[1]["policy_trainable"] is False for e in events)
     assert "goal_binding" in [e[0] for e in events]
     workflow.advance(result.observation, verifier, env, lambda *a, **k: None)
-    assert len(env._browser_session.calls) == 1
+    assert not env._browser_session.calls
 
 
 def test_selected_paper_does_not_mix_in_bibliography_links():
@@ -122,7 +122,7 @@ def test_pending_or_uncertain_execution_never_triggers_another_transfer(tmp_path
     assert not env._browser_session.calls
 
 
-def test_last_stale_click_is_rescued_without_becoming_positive_sft(tmp_path, monkeypatch):
+def test_stale_click_cannot_trigger_automatic_download_or_positive_sft(tmp_path, monkeypatch):
     monkeypatch.setattr("osworld_agent.pipeline._viz_log_status", None)
     monkeypatch.setattr("osworld_agent.paper_workflow.resolve_arxiv_candidates",
                         partial(resolve_arxiv_candidates, fetcher=metadata_fetch))
@@ -135,7 +135,8 @@ def test_last_stale_click_is_rescued_without_becoming_positive_sft(tmp_path, mon
     model = Model([{"type": "click", "target": "Download PDF", "target_ref": "1000,17"}], paper_plan())
     result = Pipeline(model=model, env=env, grounding=None, system_prompt="test", max_steps=1).run(
         "请下载一篇叫做Roboclaw的论文，并重命名为Roboclaw")
-    assert result.success and result.steps == 1 and len(model.calls) == 2
+    assert not result.success and result.steps == 1 and len(model.calls) == 2
+    assert not browser._browser_session.calls
     assert result.trajectory[0]["execution_info"]["status"] == "rejected"
     assert result.run_manifest["goal_bindings"] and result.run_manifest["goal_binding_hash"]
     trajectory = build_trajectory("short-paper", "browser", result.task, result)
@@ -143,15 +144,14 @@ def test_last_stale_click_is_rescued_without_becoming_positive_sft(tmp_path, mon
     assert any(e["event_type"] == "goal_binding" for e in trajectory["events"])
 
 
-def test_unsupported_extra_requirement_is_reported_before_spending_steps(monkeypatch):
+def test_semantic_extra_requirement_is_preserved_for_independent_review(monkeypatch):
     monkeypatch.setattr("osworld_agent.pipeline._viz_log_status", None)
-    model, env = Model([]), Env()
-    result = Pipeline(model=model, env=env, grounding=None, system_prompt="test").run(
+    model, env = Model([{"type": "fail"}], paper_plan()), Env()
+    result = Pipeline(model=model, env=env, grounding=None, system_prompt="test", max_steps=1).run(
         "请下载一篇叫做Roboclaw的论文，并发送给导师")
-    assert result.termination_reason == "completion_unverifiable"
-    assert result.steps == 0 and not result.success
-    assert not model.calls and env.reset_count == 0
-    assert "发送给导师" in result.final_answer
+    assert not result.success and result.steps == 1
+    unresolved = [e for e in result.events if e["event_type"] == "contract_unresolved"]
+    assert unresolved and "发送给导师" in str(unresolved)
 
 
 @pytest.mark.parametrize("phases,valid", [(["download", "verify"], True),

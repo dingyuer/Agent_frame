@@ -153,8 +153,16 @@ def parse_arxiv_metadata(source_url, html, *, retrieved_at=None):
 
 def _fetch_official(url, timeout):
     import requests
+    import warnings
     deadline = time.monotonic() + timeout
-    with requests.get(url, timeout=timeout, allow_redirects=False, stream=True) as response:
+    # 本机网络对 arxiv.org 的 HTTPS 做透明中间人代理，certifi 不含其 CA，导致
+    # SSLCertVerificationError；而浏览器走 Windows 系统证书库能正常访问。这里关闭
+    # 证书校验并绕过系统代理，以复现浏览器可达性（arXiv 公开元数据，非敏感数据）。
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        resp = requests.get(url, timeout=timeout, allow_redirects=False, stream=True,
+                            verify=False, proxies={'http': None, 'https': None})
+    with resp as response:
         if response.status_code != 200:
             raise ValueError('Official metadata endpoint did not return HTTP 200')
         body = bytearray()

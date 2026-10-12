@@ -22,6 +22,7 @@ from ..model import build_decision_model, GROUNDING_REGISTRY
 from ..agent import Agent
 from .vmware_env import VMwareEnvironment
 from .uitars_grounding import RealUItarsGrounding
+from .uivenus2_grounding import UIVenus2Grounding
 from .task_loader import load_task_config
 
 
@@ -49,7 +50,7 @@ def main() -> None:
     # 3) 真实 grounding
     entry = GROUNDING_REGISTRY.get(cfg.grounding_model.name)
     grounding_model_name = entry.name if entry else cfg.grounding_model.name
-    grounding = RealUItarsGrounding(
+    grounding = UIVenus2Grounding(
         url=cfg.grounding_model.url,
         api_key=cfg.grounding_model.api_key,
         model=grounding_model_name,

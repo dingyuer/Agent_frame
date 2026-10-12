@@ -1,4 +1,4 @@
-"""viz 服务器：前端启动 / 实时看过程 / 看历史。
+﻿"""viz 服务器：前端启动 / 实时看过程 / 看历史。
 
 适配新框架（osworld_agent）：
 - 核心端点 /log /history /ws /run/* /runs /tasks 保留，契约与原 Agent-S3 viz 一致；
@@ -330,6 +330,9 @@ def _local_traj_to_frontend(traj):
             "routing": s.get("routing") or {},
             "outcome": (s.get("execution") or {}).get("outcome", ""),
             "assessment": assessment,
+            "step_verification": s.get("step_verification"),
+            "step_reviews": s.get("step_reviews", []),
+            "execution_queue": s.get("execution_queue"),
             "prompt": s.get("prompt_text", ""),
             "timing_ms": timing,
             "decision_elapsed_ms": decision_elapsed,
@@ -440,8 +443,8 @@ async def test_connection(request: Request):
         cfg = await request.json()
     except Exception:
         cfg = {}
-    model = cfg.get("model", "Qwen3.5-9B")
-    url = cfg.get("model_url", "http://7.246.80.237:9028/v1")
+    model = cfg.get("model", "Qwen3.6-27B")
+    url = cfg.get("model_url", "http://10.44.101.62:8094/v1")
     api_key = cfg.get("model_api_key") or "EMPTY"
     png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
     b64 = base64.b64encode(png).decode()
@@ -467,8 +470,8 @@ def _start_local(cfg: dict):
     task = str(cfg.get("task") or "").strip()
     if not task:
         return {"ok": False, "error": "请输入任务描述"}
-    model = cfg.get("model", "Qwen3.5-9B")
-    model_url = cfg.get("model_url", "http://7.246.80.189:9028/v1")
+    model = cfg.get("model", "Qwen3.6-27B")
+    model_url = cfg.get("model_url", "http://10.44.101.62:8094/v1")
     ground_model = cfg.get("ground_model", "UI-Venus-2-9B")
     ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
     max_steps = int(cfg.get("max_steps", 15))
@@ -569,13 +572,13 @@ async def start_run(request: Request):
     if not DESKTOP_ENV_PATH:
         return {"ok": False, "error": "未配置 OSWORLD_DESKTOP_ENV_PATH（包含 desktop_env 的目录）"}
 
-    model = cfg.get("model", "Qwen3.5-9B")
-    model_url = cfg.get("model_url", "http://7.246.80.237:9028/v1")
+    model = cfg.get("model", "Qwen3.6-27B")
+    model_url = cfg.get("model_url", "http://10.44.101.62:8094/v1")
     model_api_key = cfg.get("model_api_key") or "EMPTY"
-    ground_model = cfg.get("ground_model", "UI-TARS-1.5-7B")
-    ground_url = cfg.get("ground_url", "http://7.246.80.237:49999/v1")
+    ground_model = cfg.get("ground_model", "UI-Venus-2-9B")
+    ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
     ground_api_key = cfg.get("ground_api_key", "EMPTY")
-    ground_type = cfg.get("ground_type", "ui-tars")
+    ground_type = cfg.get("ground_type", "ui-venus2")
     max_steps = int(cfg.get("max_steps", 20))
 
     cmd = [
@@ -934,11 +937,11 @@ def _keep_model_warm():
     import requests as _req
     from osworld_agent.prompts import build_system_prompt
     sys_prompt = build_system_prompt(browser_only=True)
-    dec_url = os.getenv("OSWORLD_DECISION_URL", "http://7.246.80.189:9028/v1/chat/completions")
+    dec_url = os.getenv("OSWORLD_DECISION_URL", "http://10.44.101.62:8094/v1/chat/completions")
     grd_url = os.getenv("OSWORLD_GROUNDING_URL", "http://7.246.80.189:8001/v1/chat/completions")
     while True:
         try:
-            _req.post(dec_url, json={"model": "Qwen3.5-9B",
+            _req.post(dec_url, json={"model": "Qwen3.6-27B",
                                      "messages": [{"role": "system", "content": sys_prompt},
                                                   {"role": "user", "content": "keepalive"}],
                                      "max_tokens": 1}, timeout=120)

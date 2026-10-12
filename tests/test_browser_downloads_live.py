@@ -19,19 +19,21 @@ def test_live_download_candidates_and_response_mime(live_browser):
     assert observation.context[0]["download_candidates"] == info["download_candidates"]
 
 
-def test_live_http_download_rename_and_alias_cache(live_browser):
+def test_live_ui_download_and_passive_rename_tracking(live_browser):
     session, base = live_browser
-    first = session.download(base + "/private.pdf", filename="original.pdf")
-    identity = first["artifact_id"]
-    result = session.rename_artifact(identity, "requested.pdf")
-    assert result["status"] == "executed", result
-    assert not Path(first["path"]).exists()
-    assert Path(result["path"]).is_file()
-    cached = session.download(base + "/private.pdf#page=1")
-    assert cached["status"] == "already_downloaded"
-    assert cached["artifact_id"] == identity and cached["path"] == result["path"]
-    assert cached["artifacts"][0]["version"] == 2
-    assert cached["artifacts"][0]["initial_sha256"] == first["artifacts"][0]["sha256"]
+    assert session.download(base + "/private.pdf")["status"] == "rejected"
+    assert click(session, "pdf")["status"] == "executed"
+    deadline = time.monotonic() + 5
+    info = session.event_metadata()
+    while not info["artifacts"] and time.monotonic() < deadline:
+        time.sleep(.02)
+        info = session.event_metadata()
+    first = info["artifacts"][0]
+    new_path = Path(first["path"]).with_name("requested.pdf")
+    Path(first["path"]).rename(new_path)  # emulate native file manager operation in headless fixture
+    final = session.event_metadata()["artifacts"][0]
+    assert final["artifact_id"] == first["artifact_id"] and final["version"] == 2
+    assert final["path"] == str(new_path) and final["sha256"] == first["sha256"]
 
 
 def test_live_pending_download_is_idempotent_and_cancelable(live_browser):

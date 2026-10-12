@@ -117,6 +117,9 @@ def build_trajectory(
             "execution_info": s.get("execution_info", {}),
             "framework_operations": copy.deepcopy(s.get("framework_operations", [])),
             "verification": s.get("verification"),
+            "step_verification": copy.deepcopy(s.get("step_verification", {})),
+            "step_reviews": copy.deepcopy(s.get("step_reviews", [])),
+            "execution_queue": copy.deepcopy(s.get("execution_queue", {})),
             "timing_ms": s.get("timing_ms", {}),
             "trainable": bool(s.get("policy_input") and s.get("policy_output") and s.get("valid_action", False)),
             "events": copy.deepcopy(s.get("events", [])),
@@ -144,6 +147,7 @@ def build_trajectory(
         "steps": steps,
         "plan": getattr(result, "plan", None),
         "planning_calls": getattr(result, "planning_calls", []),
+        "review_calls": copy.deepcopy(getattr(result, "review_calls", [])),
         "run_manifest": copy.deepcopy(getattr(result, "run_manifest", {})),
         "events": copy.deepcopy(getattr(result, "events", [])),
         # Full evidence is archival data; it is never injected into training prompts.

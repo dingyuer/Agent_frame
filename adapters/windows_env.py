@@ -17,7 +17,7 @@ import sys
 from typing import Any, Dict, Optional
 
 from ..env import Environment, Observation, StepResult
-from ..actions import Action, get_action_spec
+from ..actions import Action, get_action_spec, BASIC_ACTIONS
 from .vmware_env import to_pyautogui
 
 
@@ -99,21 +99,38 @@ class WindowsEnvironment(Environment):
             return None
 
     def _build_observation(self) -> Observation:
-        """Collect screenshot and AX on one page, with an explicit coordinate space."""
+        """Collect screenshot and AX on one page, with an explicit coordinate space.
+
+        浏览器模式（后台独立浏览器）只取 CDP 截图，绝不回退到 pyautogui 截取用户整屏；
+        pyautogui 整屏截图仅用于显式 observe_desktop。这样即使用户把浏览器窗口挡在后面，
+        截图仍是该浏览器页面的完整内容，不受遮挡/前台影响。
+        """
         from ..model.grounding import screenshot_size
         from ..scene import Scene
 
         screenshot, snapshot, metadata = None, None, {}
         error = ""
-        try:
-            session = self._get_browser_session()
-            if session is not None and self._observation_surface == "browser":
-                screenshot, snapshot, metadata = session.collect_observation()
-                metadata = dict(metadata or {})
-            elif session is not None and hasattr(session, "event_metadata"):
-                metadata = session.event_metadata()
-        except Exception as exc:  # noqa: BLE001
-            error = str(exc)
+        if self._observation_surface == "browser":
+            # 页面仍在导航/渲染时截图会瞬时失败，重试几次再放弃。
+            import time as _time
+            for _ in range(4):
+                try:
+                    session = self._get_browser_session()
+                    if session is not None:
+                        screenshot, snapshot, metadata = session.collect_observation()
+                        metadata = dict(metadata or {})
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                if screenshot is not None and metadata.get("screenshot_space") == "css_viewport":
+                    break
+                _time.sleep(0.25)
+        else:
+            try:
+                session = self._get_browser_session()
+                if session is not None and hasattr(session, "event_metadata"):
+                    metadata = session.event_metadata()
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
 
         if screenshot is not None and metadata.get("screenshot_space") == "css_viewport":
             info = metadata
@@ -126,16 +143,28 @@ class WindowsEnvironment(Environment):
                 snapshot_id=metadata.get("snapshot_id", ""),
             ).to_dict()
             context = [snapshot] if snapshot else []
+        elif self._observation_surface == "browser":
+            # 浏览器模式：CDP 截图失败 → 返回错误观测（无截图），不截取用户桌面。
+            info = {"screenshot_space": "css_viewport",
+                    "scene": Scene(browser_use=1, structure_available=bool(snapshot),
+                                   mode="browser_dom" if snapshot else "visual",
+                                   reason="browser_observation_failed").to_dict(),
+                    "observation_error": error or str(metadata.get("error") or "浏览器截图/快照采集失败")}
+            for key in ("artifacts", "download_events", "pending_downloads", "dialogs", "dialog",
+                        "initial_state", "tabs", "artifact_events"):
+                if key in metadata:
+                    info[key] = metadata[key]
+            context = [snapshot] if snapshot else []
         else:
-            # Never attach viewport AX to a desktop screenshot from a different
-            # surface: both the scene and execution space must describe the image.
+            # 桌面模式：显式 observe_desktop 才用 pyautogui 截取整屏。
             screenshot = self._take_screenshot()
             size = screenshot_size(screenshot)
             info = {"screenshot_space": "screen_pixels",
                     "screenshot_size": list(size) if size else None,
                     "scene": Scene(browser_use=0, structure_available=False,
                                    mode="visual", reason="desktop_fallback").to_dict()}
-            for key in ("artifacts", "download_events", "pending_downloads", "dialogs", "dialog", "initial_state", "tabs"):
+            for key in ("artifacts", "download_events", "pending_downloads", "dialogs", "dialog",
+                        "initial_state", "tabs", "artifact_events"):
                 if key in metadata:
                     info[key] = metadata[key]
             if error or metadata.get("error") or metadata.get("observation_errors"):
@@ -144,6 +173,8 @@ class WindowsEnvironment(Environment):
         self._last_observation_info = dict(info)
         info["active_surface"] = "browser" if info.get("screenshot_space") == "css_viewport" else "desktop"
         info["requested_surface"] = self._observation_surface
+        from ..desktop_state import windows_runtime_state
+        info["runtime_state"] = windows_runtime_state()
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
     def _derive_scene(self, snapshot):
@@ -241,6 +272,9 @@ class WindowsEnvironment(Environment):
 
     def execute_routed(self, action, route):
         """执行已路由的 browser_dom 动作：goto / DOM(ref) / scroll/press/hotkey 全部走 CDP。"""
+        if action.action in {"download", "rename_artifact", "run_in_terminal", "call_code_agent", "set_cell_values", "save"}:
+            return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                "error_code": "non_basic_action", "action": action.action})
         session = self._get_browser_session()
         if session is None:
             return StepResult(observation=self.observe(), info={
@@ -248,9 +282,6 @@ class WindowsEnvironment(Environment):
                 "error": "browser session unavailable"})
         if action.action == "goto" or route.get("goto_url"):
             result = session.goto(str(action.args.get("url") or route.get("goto_url")))
-        elif action.action == "download":
-            kwargs = {"filename": action.args["filename"]} if "filename" in action.args else {}
-            result = session.download(str(action.args.get("url") or ""), **kwargs)
         elif route.get("target_ref"):
             result = session.execute(action, route)
         elif action.action in ("scroll", "press", "hotkey"):
@@ -276,6 +307,9 @@ class WindowsEnvironment(Environment):
 
     def step(self, action: Action) -> StepResult:
         name = action.action
+        if name not in BASIC_ACTIONS:
+            return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                "error_code": "non_basic_action", "action": name})
         spec = get_action_spec(name)
         kind = spec.kind if spec else "env"
         if name in {"observe_desktop", "observe_browser"}:
@@ -283,7 +317,7 @@ class WindowsEnvironment(Environment):
             obs = self.observe()
             return StepResult(observation=obs, info={"status": "executed", "dispatched": False,
                 "action": name, "artifacts": obs.info.get("artifacts", [])})
-        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab", "rename_artifact", "download"}:
+        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab"}:
             session = self._get_browser_session()
             kwargs = {k: v for k, v in action.args.items() if k in {
                 "accept", "prompt_text", "dialog_id", "tab_id", "artifact_id", "filename", "url"}}
@@ -324,7 +358,12 @@ class WindowsEnvironment(Environment):
             output = self.run_command(str(action.args.get("command", "")))
             return StepResult(observation=self._build_observation(), info={"terminal_result": output})
 
-        # env / uno 动作：坐标化后执行 pyautogui 命令
+        # 浏览器表面使用 CDP；显式切到桌面并重新观察后才允许桌面输入。
+        if self.browser_only and self._observation_surface != "desktop" and name != "wait":
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False, "channel": "desktop",
+                "error": "请先 observe_desktop 获取桌面截图后再执行 GUI 操作；网页操作使用 DOM 或 observe_browser"})
+        # 坐标化后执行 pyautogui 命令
         cmd = to_pyautogui(action)
         if cmd:
             try:
@@ -354,6 +393,19 @@ class WindowsEnvironment(Environment):
         return session.get_page_source(target_ref=target_ref, max_chars=max_chars)
 
     def run_command(self, command: str) -> str:
+        stripped = (command or "").strip()
+        # `start` 用于启动 GUI 程序/打开文件：分离进程、不捕获输出、立即返回。
+        # 否则 subprocess.run(capture_output=True) 会等被启动的 GUI 进程关闭其
+        # 继承的 stdout/stderr 管道才结束，导致 run_in_terminal 卡到 120s 超时。
+        if re.match(r'^start\b', stripped, re.IGNORECASE):
+            try:
+                subprocess.Popen(["cmd", "/c", command],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL,
+                                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                return "已启动（后台进程，不等待退出）：" + command[:120]
+            except Exception as exc:  # noqa: BLE001
+                return f"命令执行失败: {exc}"
         try:
             r = subprocess.run(["cmd", "/c", command], capture_output=True, text=True,
                                timeout=120, encoding="utf-8", errors="replace")

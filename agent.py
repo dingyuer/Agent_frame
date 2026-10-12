@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from .env import Environment
 from .model import ChatModel, Grounding
-from .code_agent import CodeAgent
 from .pipeline import Pipeline, AgentResult
 from .prompts import build_system_prompt
 
@@ -24,7 +23,7 @@ class Agent:
                  code_agent_budget: int = 20, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
                  planner_model=None, event_path=None, run_manifest=None, max_replans=1,
-                 wait_config=None):
+                 wait_config=None, verifier_model=None):
         self.model = decision_model
         self.grounding = grounding
         self.env = env
@@ -34,6 +33,7 @@ class Agent:
         self.early_stop_repeat = early_stop_repeat
         self.max_replans = max_replans
         self.wait_config = wait_config
+        self.verifier_model = verifier_model
         self.step_callback = step_callback
         self.completion_spec = completion_spec
         self.context_config = context_config
@@ -45,7 +45,7 @@ class Agent:
         # 浏览器专用环境（WindowsEnvironment）用精简提示词：去掉表格/子Agent/技能，强化 DOM 定位
         self.browser_only = bool(getattr(env, "browser_only", False))
         self.system_prompt = build_system_prompt(os_name=self.os_name, browser_only=self.browser_only)
-        self.code_agent = CodeAgent(self.model, self.env, budget=code_agent_budget)
+        self.code_agent = None
 
     def run(self, task: str, completion_spec=None, *, private_completion_spec=None,
             max_steps=None, event_path=None, run_id=None) -> AgentResult:
@@ -70,6 +70,7 @@ class Agent:
             context_config=self.context_config,
             private_completion_spec=self.private_completion_spec if private_completion_spec is None else private_completion_spec,
             planner_model=self.planner_model,
+            verifier_model=self.verifier_model,
             event_path=self.event_path if event_path is None else event_path,
             run_id=run_id, run_manifest=self.run_manifest,
         )

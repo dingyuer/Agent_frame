@@ -6,8 +6,6 @@
 #   description:  中文描述，会原样写进 system prompt 给模型看
 #   kind:         执行方式：
 #                   env      —— 交给环境执行（可带坐标定位）
-#                   shell    —— 终端命令（run_in_terminal），在目标机终端执行
-#                   subagent —— 子 Agent（call_code_agent），独立跑批量代码/文件操作
 #                   browser  —— 浏览器操作（DOM 定位，走 CDP，不经视觉定位模型）
 #                   terminal —— 终止动作（done / fail），结束整个任务
 #   resolve:      （仅 kind=env 需要）坐标解析方式：
@@ -66,18 +64,6 @@ actions:
     kind: env
     resolve: none
 
-  download:
-    params: [url]
-    description: "从当前真实观察取得完整 URL 后下载到任务目录，可选 filename 指定交付文件名（如 Roboclaw.pdf）。框架自动等待传输，不需重复点击或输出 wait；下载后由系统核验内容和文件名"
-    kind: env
-    resolve: none
-
-  rename_artifact:
-    params: [artifact_id, filename]
-    description: "将当前观察中已登记的下载文件改名，artifact_id 原样复制，filename 只含文件名（保留 .pdf 等扩展名）。系统保持文件身份和内容摘要并重新验收"
-    kind: browser
-    resolve: none
-
   select:
     params: [target, option]
     description: "在下拉框里选一项（target=下拉框描述，option=要选的选项文字）。优先用 DOM 定位：加可选参数 element_id（HTML id）或 target_ref（完整 ref）直接引用，走 DOM 确定性定位；都找不到时用英文 target 走视觉定位"
@@ -90,18 +76,6 @@ actions:
     kind: env
     resolve: drag
 
-  set_cell_values:
-    params: [new_cell_values, app_name, sheet_name]
-    description: "批量直写表格单元格（不经 GUI）。new_cell_values 如 {\"A1\": 5, \"B1\": \"=SUM(A1:A10)\"}；app_name 填【文档标题/文件名】（从窗口标题栏看，如 NetIncome.xlsx），不是应用名；sheet_name 填工作表名（如 Sheet1）"
-    kind: uno
-    resolve: none
-
-  save:
-    params: []
-    description: "保存当前文档（程序化保存，避开格式确认弹窗）"
-    kind: uno
-    resolve: none
-
   switch_applications:
     params: [app_code]
     description: "切换活动应用窗口（app_code 如 libreoffice_calc / chrome / libreoffice_writer）"
@@ -112,12 +86,6 @@ actions:
     params: [seconds]
     description: "等待若干秒（seconds）"
     kind: env
-    resolve: none
-
-  run_in_terminal:
-    params: [command]
-    description: "在终端里执行一条命令（command），命令输出会在下一步返回给你（按当前操作系统写命令）"
-    kind: shell
     resolve: none
 
   get_page_source:
@@ -162,12 +130,6 @@ actions:
     kind: browser
     resolve: none
 
-  call_code_agent:
-    params: []
-    description: "委托子 Agent 执行批量代码/文件操作（task 可省略，省略则处理整个任务；如 openpyxl 批量填表、unzip 解压、pdftotext 提取文本）"
-    kind: subagent
-    resolve: none
-
   # ---- 终止动作 ----
   request_finish:
     params: [answer]
@@ -183,16 +145,6 @@ actions:
 
 
 # =============================================================
-# 额外动作（扩展区）
-# =============================================================
-# 测试 / 新任务想给模型增加一个可输出的动作，就在这里按上面的字段格式注册，
-# 会与上面的 actions 自动合并。例如：
-#
-# extra_actions:
-#   hover:
-#     params: [target]
-#     description: "鼠标悬停在某个元素上"
-#     kind: env
-#     resolve: point
+# 扩展需同时经 actions.BASIC_ACTIONS 明确登记为基础交互动作；禁止代码/文件捷径。
 # =============================================================
 extra_actions: {}

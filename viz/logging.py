@@ -123,9 +123,11 @@ def _extract_last_user(messages) -> tuple:
 def _classify_mtype(text: str, screenshot) -> str:
     """给一次模型调用分类（供前端展示）。区分决策/格式重试/完成验证/反思/真子Agent，
     避免把「无截图的辅助调用」统统标成 code_agent（子Agent）。"""
+    t = text or ""
+    if "独立步骤核查" in t or "任务完成度核对" in t:
+        return "verify"
     if screenshot:
         return "decision"
-    t = text or ""
     if "你是任务规划器" in t:
         return "planner"
     if "## 当前观察" in t and "## 任务" in t:
@@ -185,7 +187,7 @@ class LoggingChatModel:
                 "screenshot_file": f"step_{step}.png",
                 "elapsed": round(time.time() - start, 3),
             })
-        if screenshot and _results_dir:
+        if screenshot and _results_dir and mtype == "decision":
             self._save_shot(screenshot, step)
         return response
 

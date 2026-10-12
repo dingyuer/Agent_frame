@@ -65,11 +65,13 @@ class Env:
         if action.action == "goto":
             self.obs = observation(action.args["url"])
             info["url"] = action.args["url"]
-        elif action.action == "download":
-            filename = action.args["url"].rsplit("/", 1)[-1]
+        elif action.action == "click" and action.args.get("target", "").startswith("https://"):
+            url = action.args["target"]
+            filename = url.rsplit("/", 1)[-1]
             path = self.tmp_path / filename
             path.write_bytes(b"%PDF-test bytes")
-            info.update(url=action.args["url"], path=str(path), verified=True, bytes=path.stat().st_size)
+            info.update(artifacts=[{"url": url, "final_url": url, "source_url": url, "path": str(path),
+                                   "completed": True, "download_id": filename, "status": "completed"}])
         return StepResult(self.obs, info=info)
 
     def step(self, action):
@@ -122,7 +124,7 @@ def test_two_downloads_require_two_real_artifacts(tmp_path):
     urls = ["https://example.test/a.pdf", "https://example.test/b.pdf"]
     spec = {"checks": [{"id": name, "kind": "download", "url": url}
                        for name, url in zip(["a", "b"], urls)]}
-    model = Model([{"type": "download", "url": u} for u in urls])
+    model = Model([{"type": "click", "target": u} for u in urls])
     result = pipeline(model, Env(tmp_path), spec).run("下载两篇论文")
     assert result.success and result.steps == 2
     assert result.trajectory[0]["verification"]["status"] != "passed"
@@ -219,7 +221,7 @@ def test_state_update_cannot_rewrite_task_or_contract():
 
 def test_final_artifact_recheck_revokes_earlier_success(tmp_path):
     url = "https://example.test/a.pdf"
-    p = pipeline(Model([{"type": "download", "url": url}]), Env(tmp_path))
+    p = pipeline(Model([{"type": "click", "target": url}]), Env(tmp_path))
     p.step_callback = lambda *args: (tmp_path / "a.pdf").unlink()
     result = p.run("下载 " + url)
     assert not result.success and result.score == 0
@@ -268,7 +270,7 @@ def test_evaluator_finalizes_transition_flags(score, reason):
     assert not result.trajectory[-1]["truncated"]
 
 
-def test_full_plan_and_exact_criteria_survive_memory_pressure():
+def test_current_step_and_exact_criteria_survive_without_entire_plan():
     checks = [{"id": f"check_{i}", "kind": "element_state", "role": "textbox",
                "name": f"字段{i}", "value": f"precise_value_{i}"} for i in range(12)]
     plan = {"steps": [{"goal": f"步骤{i}：找到表单中的指定字段并按照任务要求填写，然后检查显示的值",
@@ -277,9 +279,9 @@ def test_full_plan_and_exact_criteria_survive_memory_pressure():
     model = Model([{"type": "request_finish", "answer": "完成"}], plan)
     pipeline(model, Env(), {"checks": checks}, steps=1).run("填写全部字段")
     decision_prompt = model.calls[1][-1]["content"]
-    for i in range(12):
-        assert f"步骤{i}：" in decision_prompt
-        assert f"precise_value_{i}" in decision_prompt
+    assert "步骤0：" in decision_prompt and "precise_value_0" in decision_prompt
+    assert "步骤1：" in decision_prompt  # nearby step
+    assert "步骤11：" not in decision_prompt and "precise_value_11" not in decision_prompt
 
 
 def test_browser_recovery_never_replays_target_on_desktop():
