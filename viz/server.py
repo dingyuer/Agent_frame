@@ -486,6 +486,10 @@ def _start_local(cfg: dict):
         "--max-steps", str(max_steps),
         "--result-dir", result_dir,
     ]
+    try:
+        cmd += _wait_cli_args(cfg)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if cfg.get("completion_spec") is not None:
         from osworld_agent.verifiers import CompletionVerifier
         try:
@@ -525,6 +529,21 @@ def _start_local(cfg: dict):
     except Exception as e:
         _agent_state["status"] = "failed"
         return {"ok": False, "error": str(e)}
+
+
+def _wait_cli_args(cfg):
+    import math
+    result = []
+    for field, flag, default in (("operation_timeout_s", "--operation-timeout", 300),
+                                  ("task_timeout_s", "--task-timeout", 1800)):
+        try:
+            value = float(cfg.get(field, default))
+        except (TypeError, ValueError):
+            raise ValueError("等待时限必须是大于零的秒数") from None
+        if isinstance(cfg.get(field), bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError("等待时限必须是大于零的秒数")
+        result += [flag, str(value)]
+    return result
 
 
 @app.post("/run/start")
@@ -575,6 +594,10 @@ async def start_run(request: Request):
         "--desktop-env-path", DESKTOP_ENV_PATH,
         "--cache-dir", os.path.join(DESKTOP_ENV_PATH, "cache"),
     ]
+    try:
+        cmd += _wait_cli_args(cfg)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     vm_path = VM_PATH or _detect_vm_path()
     if vm_path:
         cmd += ["--vm-path", vm_path]

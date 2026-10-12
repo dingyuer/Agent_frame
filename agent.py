@@ -23,7 +23,8 @@ class Agent:
                  enable_reflection: bool = True, early_stop_repeat: int = 3,
                  code_agent_budget: int = 20, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
-                 planner_model=None, event_path=None, run_manifest=None, max_replans=1):
+                 planner_model=None, event_path=None, run_manifest=None, max_replans=1,
+                 wait_config=None):
         self.model = decision_model
         self.grounding = grounding
         self.env = env
@@ -32,6 +33,7 @@ class Agent:
         self.enable_reflection = enable_reflection
         self.early_stop_repeat = early_stop_repeat
         self.max_replans = max_replans
+        self.wait_config = wait_config
         self.step_callback = step_callback
         self.completion_spec = completion_spec
         self.context_config = context_config
@@ -62,6 +64,7 @@ class Agent:
             enable_reflection=self.enable_reflection,
             early_stop_repeat=self.early_stop_repeat,
             max_replans=self.max_replans,
+            wait_config=self.wait_config,
             step_callback=self.step_callback,
             completion_spec=self.completion_spec if completion_spec is None else completion_spec,
             context_config=self.context_config,

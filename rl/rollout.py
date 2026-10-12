@@ -30,6 +30,8 @@ class RolloutResult:
     episode_id: str = ""
     policy_revision: str = ""
     task_spec_hash: str = ""
+    runtime_config_hash: str = ""
+    goal_binding_hash: str = ""
     trajectory: dict = field(default_factory=dict)
     initial_state: dict = field(default_factory=dict)
 
@@ -119,7 +121,8 @@ def _collect_episode(agent, instruction, max_steps, *, completion_spec,
         list(iter_on_policy_records(trajectory, policy_revision))
     return RolloutResult(
         instruction=instruction,
-        semantic_actions=[semantic_action(step["action"]) for step in result.trajectory if step.get("action")],
+        semantic_actions=[_step_semantic(step) for step in result.trajectory
+                          if step.get("action") or step.get("decision_calls")],
         score=float(score) if valid else None, success=bool(result.success) and valid,
         steps=int(result.steps), final_answer=result.final_answer,
         evaluation_available=available, reward_valid=valid,
@@ -128,7 +131,27 @@ def _collect_episode(agent, instruction, max_steps, *, completion_spec,
         initial_state_id=initial_state["initial_state_id"], episode_id=episode_id,
         policy_revision=policy_revision or "", trajectory=trajectory,
         task_spec_hash=task_spec_hash,
+        runtime_config_hash=trajectory["run_manifest"].get("runtime_config_hash", ""),
+        goal_binding_hash=trajectory["run_manifest"].get("goal_binding_hash", ""),
         initial_state=copy.deepcopy(initial_state))
+
+
+def _step_semantic(step):
+    """Credit uses sampled intent, including invalid calls, not framework repairs."""
+    if not step.get("action"):
+        return "invalid_decision()"
+    from .semantic import parse_action
+    action = copy.deepcopy(parse_action(step["action"]))
+    if action.get("action") == "rename_artifact":
+        args = action.setdefault("args", {})
+        artifact_id = args.get("artifact_id")
+        artifacts = ((step.get("observation") or {}).get("info") or {}).get("artifacts", [])
+        artifact = next((a for a in artifacts if isinstance(a, dict) and
+                         (a.get("artifact_id") or a.get("download_id")) == artifact_id), None)
+        args["artifact_source"] = ((artifact.get("source_url") or artifact.get("url") or
+                                    artifact.get("initial_sha256") or artifact.get("sha256"))
+                                   if artifact else "unresolved_artifact")
+    return semantic_action(action)
 
 
 def run_rollouts(agent, instruction, n, max_steps=20, **kwargs):

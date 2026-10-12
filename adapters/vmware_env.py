@@ -490,12 +490,12 @@ class VMwareEnvironment(Environment):
         if name in {"observe_desktop", "observe_browser"}:
             self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
             return StepResult(observation=self.observe(), info={"status": "executed", "dispatched": False, "action": name})
-        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab", "download", "goto"}:
+        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab", "download", "goto", "rename_artifact"}:
             session = self._get_browser_session()
             if session is None:
                 return StepResult(observation=self.observe(), info={"status": "rejected", "dispatched": False,
                     "error": "Browser session unavailable"})
-            args = {k: v for k, v in action.args.items() if k in {"accept", "prompt_text", "dialog_id", "tab_id", "url"}}
+            args = {k: v for k, v in action.args.items() if k in {"accept", "prompt_text", "dialog_id", "tab_id", "url", "filename", "artifact_id"}}
             result = getattr(session, name)(**args)
             obs = self.observe()
             result["artifacts"] = obs.info.get("artifacts", result.get("artifacts", []))

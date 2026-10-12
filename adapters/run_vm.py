@@ -76,6 +76,8 @@ def main() -> None:
         max_retries=cfg.agent.max_retries,
         enable_reflection=cfg.agent.enable_reflection,
         early_stop_repeat=cfg.agent.early_stop_repeat,
+        max_replans=cfg.agent.max_replans,
+        wait_config=cfg.agent.wait_config,
     )
     try:
         result = agent.run(instruction)

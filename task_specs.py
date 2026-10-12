@@ -39,23 +39,82 @@ def infer_paper_goal(task: str):
     return None
 
 
+def infer_paper_spec(task: str):
+    """Compile a bounded paper/download/rename grammar without dropping tails.
+
+    Old exact-title sentences retain their literal-title check. Shorthand or
+    compound sentences become a query that needs an official identity binding.
+    Anything left over is an explicit unresolved obligation, never success.
+    """
+    exact = infer_paper_goal(task)
+    if exact:
+        return {'checks': [exact]}
+    if not isinstance(task, str) or not re.search(r'下载.*论文', task):
+        return None
+    prefix = r'(?:请(?:你|帮我|帮忙)?\s*|帮我\s*)?下载\s*(?:一篇|这篇|该)?\s*'
+    patterns = (
+        prefix + r'(?:叫做|叫|名为|题为)?\s*(?P<query>.+?)\s*(?:这篇|的)?论文(?P<tail>.*)',
+        prefix + r'论文\s*(?P<query>《[^》]+》|"[^"]+"|[^，,；;。!！]+?)(?P<tail>(?:并且|并|然后|再|[，,；;。]).*)?',
+    )
+    match = next((m for pattern in patterns if (m := re.fullmatch(pattern, task.strip()))), None)
+    unresolved = lambda text: {'kind': 'unresolved_requirement', 'text': text}
+    if not match:
+        return {'checks': [unresolved(task.strip())]}
+    query = match.group('query').strip()
+    quoted = ((query.startswith('《') and query.endswith('》')) or
+              (query.startswith('"') and query.endswith('"')))
+    if quoted:
+        query = query[1:-1].strip()
+    if (not query or len(query) > 500 or re.search(r'两篇|三篇|\d+篇|https?://|[\n\r]', query)
+            or (not quoted and re.search(r'和|与|、|以及|并|然后', query))):
+        return {'checks': [unresolved(task.strip())]}
+    goal = {'kind': 'paper_download', 'query': query, 'count': 1, 'format': 'pdf'}
+    tail = (match.group('tail') or '').strip().strip('。！.! ')
+    if not tail:
+        return {'checks': [goal]}
+    remainder = re.sub(r'^[\s,，;；]*(?:并且|然后|并|再)?\s*', '', tail)
+    rename = re.fullmatch(
+        r'(?:(?:将|把)(?:下载的|下载后(?:的)?)?(?:论文|文件)(?:名)?\s*)?'
+        r'(?:重命名|改名|命名|另存|保存)(?:为|成)\s*'
+        r'(?P<name>《[^》]+》|"[^"]+"|[^，,；;。!！]+?)(?P<rest>(?:并且|并|然后|再|[，,；;。]).*)?', remainder)
+    if not rename:
+        rename = re.fullmatch(r'以\s*(?P<name>[^，,；;。!！]+?)\s*命名(?P<rest>.*)', remainder)
+    checks = [goal]
+    if rename:
+        name = rename.group('name').strip().strip('《》"')
+        if (name and len(name) <= 180 and not re.search(r'[<>:"/\\|?*\x00-\x1f]', name)
+                and name not in ('.', '..')):
+            # Supply the PDF extension only for a bare name. An explicit
+            # extension is part of the user's filename constraint, even when
+            # the actual downloaded document must still parse as PDF.
+            goal['filename'] = name if '.' in name else name + '.pdf'
+            rest = (rename.group('rest') or '').strip(' ,，;；。！.!')
+            if rest:
+                checks.append(unresolved(rest))
+        else:
+            checks.append(unresolved(tail))
+    else:
+        checks.append(unresolved(tail))
+    return {'checks': checks}
+
+
 def task_profile(task: str, public_spec=None):
     """Return only public goals and procedural hints, never evaluation answers."""
     checks = public_spec.get("checks", []) if isinstance(public_spec, dict) else []
     papers = [copy.deepcopy(c) for c in checks if isinstance(c, dict) and c.get("kind") == "paper_download"]
     if not papers and public_spec is None:
-        inferred = infer_paper_goal(task)
-        papers = [inferred] if inferred else []
+        inferred = infer_paper_spec(task)
+        papers = [c for c in (inferred or {}).get('checks', []) if c['kind'] == 'paper_download']
     if not papers:
         return {"kind": "generic", "goals": [], "workflow": []}
     return {
         "kind": "paper_download",
         "goals": papers,
         "workflow": [
-            {"phase": "search", "instruction": "确认浏览器可用；选择可访问的学术搜索入口（如 arXiv、Google Scholar 或出版机构），使用完整论文标题检索。"},
-            {"phase": "identify", "instruction": "从当前页面核对论文标题及用户指定的作者、年份、DOI 或 arXiv ID；有歧义则继续检索。"},
+            {"phase": "search", "instruction": "确认浏览器可用；选择可访问的学术搜索入口（如 arXiv、Google Scholar 或出版机构），先按用户提供的短名或标题检索。"},
+            {"phase": "identify", "instruction": "由框架根据官方页面元数据绑定完整标题、作者和论文ID；用户短名不是完整标题。有歧义继续检索，模型不能自行改验收目标。"},
             {"phase": "locate_fulltext", "instruction": "找到对应论文的 PDF 全文地址；不要将摘要页、引用记录、登录页当作全文。"},
-            {"phase": "download", "instruction": "使用浏览器下载或显式 download 动作，并等待框架报告下载完成。"},
+            {"phase": "download", "instruction": "优先使用已验证论文的直接PDF地址下载，避免反复操作PDF工具栏；按用户指定名称保存或用artifact_id改名，并等待框架报告下载完成。"},
             {"phase": "verify", "instruction": "检查框架对实际文件、PDF 可解析性和论文身份的验收结果；未通过时根据证据继续处理。"},
         ],
         "interaction_guidance": "每步结合当前截图与 AX；优先使用 DOM 引用。被弹窗遮挡时先处理弹窗，再重新观察和定位；不要重复派发状态不明的操作。",

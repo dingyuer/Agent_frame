@@ -68,8 +68,14 @@ actions:
 
   download:
     params: [url]
-    description: "下载指定完整 URL 的文件到任务下载目录，返回文件路径及大小。普通点击 PDF 链接只打开页面，不代替下载。下载后由系统核验全部任务条件"
+    description: "从当前真实观察取得完整 URL 后下载到任务目录，可选 filename 指定交付文件名（如 Roboclaw.pdf）。框架自动等待传输，不需重复点击或输出 wait；下载后由系统核验内容和文件名"
     kind: env
+    resolve: none
+
+  rename_artifact:
+    params: [artifact_id, filename]
+    description: "将当前观察中已登记的下载文件改名，artifact_id 原样复制，filename 只含文件名（保留 .pdf 等扩展名）。系统保持文件身份和内容摘要并重新验收"
+    kind: browser
     resolve: none
 
   select:

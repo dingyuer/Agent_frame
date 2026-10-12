@@ -137,7 +137,7 @@ class BrowserOptions:
     max_nodes: int = 4000
     max_snapshot_age: float = 180.0
     require_focus: bool = True   # True=要求浏览器前台聚焦；Windows 本地模式设 False（虚拟鼠标，用户可同时用电脑）
-    download_timeout_s: float = 90.0
+    download_timeout_s: float = 300.0
 
 
 class BrowserSession:
@@ -177,6 +177,11 @@ class BrowserSession:
         self._async_objects = {}
         self._background_downloads = set()
         self._active_downloads = {}
+        self._download_tasks = {}
+        self._reserved_artifact_paths = set()
+        self._main_responses = {}
+        self._page_target_ids = {}
+        self._artifact_events = []
 
     # ---- 临时连接的 attach 帮助 ----
     def _resolve_cdp_endpoint(self):
@@ -278,6 +283,18 @@ class BrowserSession:
         self._watched_pages.add(id(page))
         page.on("dialog", lambda dialog: self._record_dialog(page, dialog))
         page.on("download", lambda download: self._queue_download(page, download))
+        page.on("response", lambda response: self._record_response(page, response))
+
+    def _record_response(self, page, response):
+        """Keep headers of the current main resource, never its body."""
+        try:
+            if response.request.is_navigation_request() and response.frame is page.main_frame:
+                headers = response.headers
+                self._main_responses[id(page)] = {"url": response.url,
+                    "content_type": headers.get("content-type", "").split(";", 1)[0].strip().lower(),
+                    "status": response.status}
+        except Exception:
+            pass  # Some browser-internal responses do not expose a frame.
 
     def _record_dialog(self, page, dialog):
         if self._owned_context is not None and page.context is not self._owned_context:
@@ -292,16 +309,40 @@ class BrowserSession:
     def _queue_download(self, page, download):
         if self._owned_context is not None and page.context is not self._owned_context:
             return
+        # Browser-generated signed URLs are kept intact. Only exact URL aliases
+        # actually observed in a completed transfer are considered equivalent.
+        duplicate = self._find_pending_download(download.url)
+        if duplicate is not None:
+            if self._loop is not None:
+                async def cancel_duplicate():
+                    try:
+                        await self._unwrap_async(download).cancel()
+                    except Exception:
+                        pass
+                task = self._loop.create_task(cancel_duplicate())
+                self._background_downloads.add(task)
+                task.add_done_callback(self._background_downloads.discard)
+            return
         download_id = uuid.uuid4().hex
         source_page_url = page.url
+        started_at = time.time()
+        self._active_downloads[download_id] = {"download_id": download_id, "artifact_id": download_id,
+            "url": download.url, "page_url": source_page_url, "page_id": self._page_target_ids.get(id(page)),
+            "status": "in_progress", "completed": False, "started_at": started_at,
+            "deadline_at": started_at + self.options.download_timeout_s, "transport": "browser"}
         if self._loop is None:  # Deterministic in-memory transports used by offline tests.
             self._pending_downloads.append((page, download, download_id, source_page_url))
             return
-        path = self._artifact_path(download.suggested_filename, download_id)
+        try:
+            path = self._artifact_path(download.suggested_filename, download_id)
+        except OSError as exc:
+            self._active_downloads.pop(download_id, None)
+            self._download_events.append({"download_id": download_id, "artifact_id": download_id,
+                "status": "failed", "completed": False, "url": download.url,
+                "finished_at": time.time(), "error": str(exc)[:300]})
+            return
         raw = self._unwrap_async(download)
         deadline = time.monotonic() + self.options.download_timeout_s
-        self._active_downloads[download_id] = {"download_id": download_id, "url": download.url,
-            "status": "in_progress", "completed": False, "started_at": time.time()}
         async def save():
             try:
                 await asyncio.wait_for(raw.save_as(path), max(0, deadline - time.monotonic()))
@@ -312,14 +353,59 @@ class BrowserSession:
                     await asyncio.wait_for(raw.cancel(), 5)
                 except BaseException:
                     pass
-                self._download_events.append({"download_id": download_id, "status": "failed",
+                self._download_events.append({"download_id": download_id, "artifact_id": download_id,
+                    "status": "canceled" if isinstance(exc, asyncio.CancelledError) else "failed",
                     "completed": False, "url": download.url,
+                    "finished_at": time.time(),
                     "error": "download deadline exceeded" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__})
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
             finally:
                 self._active_downloads.pop(download_id, None)
+                self._download_tasks.pop(download_id, None)
+                self._reserved_artifact_paths.discard(path)
         task = self._loop.create_task(save())
+        self._download_tasks[download_id] = task
         self._background_downloads.add(task)
         task.add_done_callback(self._background_downloads.discard)
+
+    @staticmethod
+    def _url_key(url):
+        from urllib.parse import urldefrag
+        return urldefrag(str(url))[0]  # Fragments never participate in HTTP transfer.
+
+    def _find_pending_download(self, url):
+        key = self._url_key(url)
+        return next((d for d in self._active_downloads.values()
+                     if self._url_key(d["url"]) == key), None)
+
+    def _cached_artifact(self, url):
+        key = self._url_key(url)
+        for artifact in reversed(self._artifacts):
+            if not any(self._url_key(artifact.get(k, "")) == key for k in ("url", "final_url")):
+                continue
+            try:
+                if os.path.isfile(artifact["path"]) and self._file_hash(artifact["path"]) == artifact["sha256"]:
+                    return artifact
+            except OSError:
+                pass
+        return None
+
+    @browser_thread
+    def cancel_download(self, download_id):
+        """Cancel one observed transfer; never restart its initiating action."""
+        task = self._download_tasks.get(download_id)
+        if task is None:
+            return self._failure("No active download with this ID", "not_found", action="cancel_download")
+        async def cancel():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._await(cancel(), 6)
+        return {"status": "executed", "dispatched": True, "action": "cancel_download",
+                "download_id": download_id, "artifact_id": download_id, **self.event_metadata()}
 
     @staticmethod
     def _filename(value):
@@ -332,9 +418,13 @@ class BrowserSession:
         os.makedirs(self.downloads_dir, exist_ok=True)
         name = self._filename(filename)
         path = os.path.join(os.path.abspath(self.downloads_dir), name)
-        if os.path.lexists(path):
+        if os.path.lexists(path) or path in self._reserved_artifact_paths:
             stem, ext = os.path.splitext(name)
             path = os.path.join(os.path.abspath(self.downloads_dir), f"{stem}_{download_id[:12]}{ext}")
+        while os.path.lexists(path) or path in self._reserved_artifact_paths:
+            stem, ext = os.path.splitext(name)
+            path = os.path.join(os.path.abspath(self.downloads_dir), f"{stem}_{uuid.uuid4().hex[:12]}{ext}")
+        self._reserved_artifact_paths.add(path)
         return path
 
     @staticmethod
@@ -350,11 +440,85 @@ class BrowserSession:
             raise ValueError("download did not produce a nonempty regular file")
         artifact = {"source_url": url, "url": url, "final_url": final_url,
             "path": os.path.abspath(path), "status": "completed", "completed": True,
-            "download_id": download_id, "page_url": page_url, "content_type": content_type,
+            "download_id": download_id, "artifact_id": download_id, "version": 1, "rename_history": [],
+            "page_url": page_url, "content_type": content_type,
             "bytes": os.path.getsize(path), "transport": transport, "completed_at": time.time()}
         artifact["sha256"] = self._file_hash(path)
+        artifact["initial_sha256"] = artifact["sha256"]
         self._artifacts.append(artifact)
+        self._downloaded[url] = artifact["path"]
+        self._downloaded_sizes[url] = artifact["bytes"]
         return copy.deepcopy(artifact)
+
+    @classmethod
+    def _explicit_filename(cls, value):
+        if not isinstance(value, str) or not value or cls._filename(value) != value:
+            raise ValueError("filename must be a safe basename (no paths or reserved characters)")
+        return value
+
+    @staticmethod
+    def _rename_noreplace(source, destination):
+        """Atomic rename without the POSIX rename() overwrite race."""
+        if os.name == "nt":
+            os.rename(source, destination)  # Windows refuses an existing target.
+            return
+        import ctypes
+        import errno
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "Atomic non-overwriting rename is unavailable")
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), destination)
+
+    @browser_thread
+    def rename_artifact(self, artifact_id, filename):
+        """Rename only an unchanged completed artifact, preserving its identity."""
+        artifact = next((a for a in self._artifacts
+                         if a.get("artifact_id", a.get("download_id")) == artifact_id), None)
+        if artifact is None:
+            return self._failure("Unknown artifact ID", "not_found", action="rename_artifact")
+        dispatched = False
+        try:
+            filename = self._explicit_filename(filename)
+            source = artifact["path"]
+            directory = os.path.abspath(self.downloads_dir)
+            destination = os.path.join(directory, filename)
+            if os.path.dirname(os.path.abspath(source)) != directory or os.path.islink(source):
+                raise ValueError("Artifact is outside the task directory or is a symlink")
+            before = os.stat(source)
+            digest = self._file_hash(source)
+            if digest != artifact.get("initial_sha256", artifact["sha256"]):
+                raise ValueError("Artifact contents changed since download")
+            if destination == source:
+                return {"status": "already_named", "dispatched": False, "action": "rename_artifact",
+                    "artifact_id": artifact_id, "path": source, "artifacts": [copy.deepcopy(artifact)]}
+            if destination in self._reserved_artifact_paths:
+                raise FileExistsError("Destination is reserved for an active download")
+            self._rename_noreplace(source, destination)
+            dispatched = True
+            after = os.stat(destination)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or self._file_hash(destination) != digest:
+                raise ValueError("Artifact changed during rename; verification is required")
+            version = artifact.get("version", 1)
+            migration = {"from_path": source, "to_path": destination, "from_version": version,
+                "to_version": version + 1, "sha256": digest, "renamed_at": time.time()}
+            artifact.setdefault("rename_history", []).append(migration)
+            artifact.update(path=destination, version=version + 1)
+            for url, path in list(self._downloaded.items()):
+                if path == source:
+                    self._downloaded[url] = destination
+            event = {"event": "artifact_renamed", "artifact_id": artifact_id,
+                     "download_id": artifact["download_id"], **migration}
+            self._artifact_events.append(event)
+            return {"status": "executed", "dispatched": True, "action": "rename_artifact",
+                    "artifact_id": artifact_id, "path": destination, "artifact_event": copy.deepcopy(event),
+                    "artifacts": [copy.deepcopy(artifact)]}
+        except Exception as exc:
+            return self._failure(exc, "blocked", dispatched=dispatched, action="rename_artifact", artifact_id=artifact_id)
 
     def _drain_downloads(self):
         if self._loop is not None:
@@ -371,11 +535,20 @@ class BrowserSession:
             except Exception as exc:
                 self._download_events.append({"download_id": download_id, "status": "failed",
                     "completed": False, "url": download.url, "error": str(exc)[:300]})
+            finally:
+                self._active_downloads.pop(download_id, None)
+                self._reserved_artifact_paths.discard(path)
 
     @browser_thread
     def event_metadata(self):
+        # Frequent lightweight polling can keep the worker queue nonempty, so
+        # do not rely solely on its 25 ms idle timeout to pump browser events.
+        if self._loop is not None and not self._loop.is_running():
+            self._await(asyncio.sleep(0))
         return {"artifacts": copy.deepcopy(self._artifacts),
             "download_events": copy.deepcopy(self._download_events + list(self._active_downloads.values())),
+            "pending_downloads": copy.deepcopy(list(self._active_downloads.values())),
+            "artifact_events": copy.deepcopy(self._artifact_events),
             "dialogs": [{k: v for k, v in d.items() if k not in {"object", "page"}}
                         for d in self._dialogs.values()], "initial_state": copy.deepcopy(self.initial_state)}
 
@@ -392,6 +565,7 @@ class BrowserSession:
         finally:
             self._background_downloads.clear()
             self._active_downloads.clear()
+            self._download_tasks.clear()
 
     @browser_thread
     def begin_episode(self, task_id=None, isolated=True, viewport=None):
@@ -418,6 +592,10 @@ class BrowserSession:
         self._download_events.clear()
         self._downloaded.clear()
         self._downloaded_sizes.clear()
+        self._reserved_artifact_paths.clear()
+        self._main_responses.clear()
+        self._page_target_ids.clear()
+        self._artifact_events.clear()
         self._last_screenshot = None
         self._last_screenshot_metadata = {}
         size = viewport or {"width": 1280, "height": 720}
@@ -433,6 +611,7 @@ class BrowserSession:
         page = context.new_page()
         self._watch_page(page)
         self._task_page_id = self._target_info(page)["targetId"]
+        self._page_target_ids[id(page)] = self._task_page_id
         profile = {"version": "blank-browser-v1", "viewport": size,
                    "browser_version": str(getattr(browser, "version", "unknown")),
                    "locale": "en-US", "timezone": "UTC", "color_scheme": "light",
@@ -450,6 +629,7 @@ class BrowserSession:
             for page in context.pages:
                 try:
                     item = self._target_info(page)
+                    self._page_target_ids[id(page)] = item["targetId"]
                     self._parents[item["targetId"]] = item.get("openerId")
                     records.append({"tab_id": item["targetId"], "url": page.url,
                         "title": item.get("title", ""),
@@ -549,6 +729,7 @@ class BrowserSession:
             for page in context.pages:
                 try:
                     info = self._target_info(page)
+                    self._page_target_ids[id(page)] = info["targetId"]
                     pages.append((page, info))
                     self._parents[info["targetId"]] = info.get("openerId")
                 except Exception:
@@ -589,7 +770,9 @@ class BrowserSession:
                     pass
 
     def _identity(self, page, cdp):
-        return {"page_id": self._target_info(page, cdp)["targetId"],
+        page_id = self._target_info(page, cdp)["targetId"]
+        self._page_target_ids[id(page)] = page_id
+        return {"page_id": page_id,
                 "document_id": cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]}
 
     @staticmethod
@@ -624,6 +807,95 @@ class BrowserSession:
         """同一连接、页面和文档的 (CSS 截图, AX 快照, 观察元数据)。"""
         return self._collect(True)
 
+    _RESOURCE_METADATA = """() => {
+      const links = Array.from(document.querySelectorAll('a[href]')).filter(a =>
+        a.hasAttribute('download') || /pdf|download|下载/i.test(a.textContent || '') ||
+        /\\.pdf(?:$|[?#])|\\/pdf\\//i.test(a.href)).slice(0, 100).map(a => ({
+          url:a.href, source:'anchor', label:(a.textContent || '').trim().slice(0,300),
+          download:a.hasAttribute('download'), type:a.getAttribute('type') || ''}));
+      const embeds = Array.from(document.querySelectorAll('embed,object')).slice(0,20).map(e => ({
+        type:e.getAttribute('type') || '', src:e.getAttribute('src') || e.getAttribute('data') || '',
+        original_url:e.getAttribute('original-url') || ''}));
+      const citation = {};
+      for (const e of document.querySelectorAll('meta[name]')) {
+        const key = e.getAttribute('name').toLowerCase();
+        if (['citation_title','citation_author','citation_pdf_url','citation_arxiv_id',
+             'citation_doi','citation_date','citation_publication_date'].includes(key)) {
+          (citation[key] ||= []).push(e.getAttribute('content') || '');
+        }
+      }
+      return {content_type:document.contentType || '', base_url:document.baseURI,
+              links, embeds, citation, pdf_viewer:!!document.querySelector('pdf-viewer')};
+    }"""
+
+    def _resource_metadata(self, page, identity):
+        """Small resource descriptors derived from observed headers/DOM, not PDF text."""
+        from urllib.parse import urljoin, urlsplit
+        try:
+            value = page.evaluate(self._RESOURCE_METADATA)
+        except Exception:
+            value = None
+        value = value if isinstance(value, dict) else {}
+        response = self._main_responses.get(id(page), {})
+        if response.get("url") != page.url:
+            response = {}
+        content_type = str(response.get("content_type") or value.get("content_type") or "").split(";", 1)[0].lower()
+        candidates, seen = [], set()
+        def add(url, source, **details):
+            if not isinstance(url, str) or not url:
+                return
+            resolved = urljoin(value.get("base_url") or page.url, url)
+            try:
+                parsed = urlsplit(resolved)
+            except ValueError:
+                return
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or (resolved, source) in seen:
+                return
+            seen.add((resolved, source))
+            candidates.append({"url": resolved, "source": source, **identity, **details})
+        pdf_embed = False
+        for embed in value.get("embeds", []):
+            if str(embed.get("type", "")).lower() in {"application/pdf", "application/x-google-chrome-pdf"}:
+                pdf_embed = True
+                add(embed.get("original_url"), "embed_original_url", resource_kind="pdf")
+                add(embed.get("src"), "embed", resource_kind="pdf")
+        viewer = pdf_embed or value.get("pdf_viewer") is True
+        metadata = {"download_candidates": candidates}
+        if content_type:
+            metadata["content_type"] = content_type
+        if viewer:
+            metadata["document_kind"] = "pdf_viewer"
+        elif content_type == "application/pdf":
+            metadata["document_kind"] = "pdf"
+        elif content_type in {"text/html", "application/xhtml+xml"}:
+            metadata["document_kind"] = "html"
+        # A .pdf URL is evidence of a candidate, never proof of the returned MIME.
+        # An HTML viewer/embedding page is not itself the embedded PDF resource.
+        if content_type == "application/pdf" or re.search(r"\.pdf(?:$|[?#])", page.url, re.I):
+            add(page.url, "current_url", resource_kind="pdf", mime_confirmed=content_type == "application/pdf")
+        for link in value.get("links", []):
+            add(link.get("url"), "anchor", label=str(link.get("label") or "")[:300],
+                download_attribute=link.get("download") is True)
+        citation = value.get("citation") or {}
+        for url in citation.get("citation_pdf_url", []):
+            add(url, "citation_pdf_url", resource_kind="pdf")
+        parsed = urlsplit(page.url)
+        arxiv = parsed.hostname in {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
+        if arxiv and parsed.path.startswith("/pdf/"):
+            add(page.url, "current_url", resource_kind="pdf", mime_confirmed=content_type == "application/pdf")
+        if arxiv and citation:
+            first = lambda key: next((str(x) for x in citation.get(key, []) if x), "")
+            canonical_id = first("citation_arxiv_id")
+            if not canonical_id:
+                match = re.match(r"/(?:abs|pdf)/(.+?)(?:\.pdf)?$", parsed.path)
+                canonical_id = match.group(1) if match else ""
+            metadata["paper_metadata"] = {"source_url": page.url, "canonical_id": canonical_id,
+                "title": first("citation_title"), "authors": citation.get("citation_author", []),
+                "pdf_url": urljoin(value.get("base_url") or page.url, first("citation_pdf_url"))
+                           if first("citation_pdf_url") else "",
+                "doi": first("citation_doi"), "source": "observed_arxiv_meta"}
+        return metadata
+
     @browser_thread
     def _collect(self, with_screenshot):
         start = time.perf_counter()
@@ -654,6 +926,7 @@ class BrowserSession:
                 snapshot = self._collect_page(page, cdp, identity, start)
             except Exception as exc:
                 errors.append(str(exc)[:200])
+            resources = self._resource_metadata(page, identity)
             viewport_script = "({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})"
             capture_viewport = page.evaluate(viewport_script)
             if with_screenshot:
@@ -672,12 +945,18 @@ class BrowserSession:
             metadata = {**identity, "snapshot_id": snapshot["snapshot_id"] if snapshot else uuid.uuid4().hex[:12],
                         "captured_at": time.time(), "url": page.url,
                         "scroll_offset": [final_viewport["x"], final_viewport["y"]],
+                        **resources,
                         **self.event_metadata(), "tabs": self._tab_records(browser)}
+            for candidate in metadata.get("download_candidates", []):
+                candidate["snapshot_id"] = metadata["snapshot_id"]
             if shot is not None:
                 metadata.update(screenshot_space="css_viewport", screenshot_size=list(shot.size))
             if errors:
                 metadata["observation_errors"] = errors
             if snapshot is not None:
+                snapshot.update(copy.deepcopy(resources))
+                metadata["ax_node_count"] = len(snapshot["nodes"])
+                metadata["ax_direct_count"] = sum(bool(n.get("direct")) for n in snapshot["nodes"])
                 self.snapshot = snapshot
                 self.nodes = {n["ref"]: n for n in snapshot["nodes"]}
             self._observation_metadata = metadata
@@ -1221,7 +1500,7 @@ class BrowserSession:
     @browser_thread
     def execute(self, action, route):
         if action.action == "download":
-            return self.download(str(action.args.get("url") or ""))
+            return self.download(str(action.args.get("url") or ""), filename=action.args.get("filename"))
         if action.action not in {"click", "double_click", "right_click", "type", "select", "scroll"}:
             return self._failure(f"Unsupported DOM action: {action.action}", "unsupported")
         try:
@@ -1551,23 +1830,39 @@ class BrowserSession:
             self._disconnect(p, browser)
 
     @browser_thread
-    def download(self, url):
+    def download(self, url, filename=None):
         """Download with the task BrowserContext's cookies, recording transport evidence."""
         from urllib.parse import urlparse
         url = (url or "").strip()
+        requested_filename = filename
         if not url.startswith(("http://", "https://")):
             return self._failure("Invalid download URL", "unsupported", action="download", url=url)
-        cached = next((a for a in reversed(self._artifacts) if a["url"] == url), None)
-        if cached:
+        if filename is not None:
             try:
-                digest = self._file_hash(cached["path"])
-                if digest == cached.get("sha256"):
-                    return {"status": "already_downloaded", "dispatched": False,
-                        "action": "download", "url": url, "path": cached["path"],
-                        "bytes": cached["bytes"], "verified": True, "semantic_verified": False,
-                        "artifacts": [copy.deepcopy(cached)]}
-            except OSError:
-                pass
+                filename = self._explicit_filename(filename)
+            except ValueError as exc:
+                return self._failure(exc, "unsupported", action="download", url=url)
+        pending = self._find_pending_download(url)
+        if pending is not None:
+            return {"status": "in_progress", "dispatched": False, "action": "download", "url": url,
+                    "download_id": pending["download_id"], "artifact_id": pending["artifact_id"],
+                    "pending_downloads": [copy.deepcopy(pending)], "download_events": [copy.deepcopy(pending)]}
+        cached = self._cached_artifact(url)
+        if cached:
+            rename = None
+            if filename is not None and os.path.basename(cached["path"]) != filename:
+                rename = self.rename_artifact(cached["artifact_id"], filename)
+                if rename["status"] not in {"executed", "already_named"}:
+                    return rename
+            return {"status": "already_downloaded", "dispatched": bool(rename and rename.get("dispatched")),
+                "action": "download", "url": url, "final_url": cached["final_url"], "path": cached["path"],
+                "download_id": cached["download_id"], "artifact_id": cached["artifact_id"],
+                "bytes": cached["bytes"], "verified": True, "semantic_verified": False,
+                "artifacts": [copy.deepcopy(cached)]}
+        if requested_filename is not None:
+            requested_path = os.path.join(os.path.abspath(self.downloads_dir), requested_filename)
+            if os.path.lexists(requested_path) or requested_path in self._reserved_artifact_paths:
+                return self._failure("Requested filename already exists or is reserved", "blocked", action="download", url=url)
         response, path, created = None, None, False
         started = time.perf_counter()
         try:
@@ -1575,7 +1870,7 @@ class BrowserSession:
             page = self._pick_page(browser)
             if page is None:
                 return self._failure("Task page unavailable", "not_found", action="download", url=url)
-            response = page.context.request.get(url, timeout=90000,
+            response = page.context.request.get(url, timeout=max(1, int(self.options.download_timeout_s * 1000)),
                 headers={"Referer": page.url} if page.url.startswith(("http://", "https://")) else {})
             if response.status != 200:
                 return self._failure(f"HTTP {response.status}", "blocked", action="download", url=url)
@@ -1583,14 +1878,16 @@ class BrowserSession:
             declared = headers.get("content-length", "")
             if declared.isdigit() and int(declared) > 128 * 1024 * 1024:
                 return self._failure("HTTP download exceeds 128 MiB; use browser download", "unsupported", action="download", url=url)
-            cd = headers.get("content-disposition", "")
-            match = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", cd, re.IGNORECASE)
-            filename = match.group(1).strip() if match else os.path.basename(urlparse(response.url).path)
             content_type = headers.get("content-type", "")
-            if "." not in filename:
-                filename += ".pdf" if "pdf" in content_type else ".html" if "html" in content_type else ""
+            if filename is None:
+                filename = self._response_filename(headers.get("content-disposition", ""), response.url, content_type)
             download_id = uuid.uuid4().hex
-            path = self._artifact_path(filename, download_id)
+            if requested_filename is not None:
+                os.makedirs(self.downloads_dir, exist_ok=True)
+                path = os.path.join(os.path.abspath(self.downloads_dir), filename)
+                self._reserved_artifact_paths.add(path)
+            else:
+                path = self._artifact_path(filename, download_id)
             body = response.body()
             if len(body) > 128 * 1024 * 1024:
                 raise ValueError("HTTP download exceeds 128 MiB")
@@ -1602,6 +1899,7 @@ class BrowserSession:
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                 "action": "download", "path": path, "bytes": artifact["bytes"], "verified": True,
                 "semantic_verified": False, "url": url, "final_url": response.url,
+                "download_id": download_id, "artifact_id": download_id,
                 "artifacts": [artifact], "message": "Transfer completed; document identity still requires framework verification.",
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except Exception as exc:
@@ -1612,11 +1910,31 @@ class BrowserSession:
                     pass
             return self._failure(exc, "blocked", action="download", url=url, verified=False)
         finally:
+            self._reserved_artifact_paths.discard(path)
             if response is not None:
                 try:
                     response.dispose()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _response_filename(disposition, url, content_type):
+        from email.message import Message
+        from email.utils import collapse_rfc2231_value
+        from urllib.parse import urlsplit, unquote
+        message = Message()
+        message["Content-Disposition"] = disposition
+        params = message.get_params(header="content-disposition", unquote=True) or []
+        extended = [v for k, v in params if k.lower() == "filename" and isinstance(v, tuple)]
+        regular = [v for k, v in params if k.lower() == "filename" and isinstance(v, str)]
+        name = collapse_rfc2231_value(extended[0]) if extended else regular[0] if regular else ""
+        name = name or unquote(urlsplit(url).path.rsplit("/", 1)[-1]) or "download"
+        mime = content_type.split(";", 1)[0].strip().lower()
+        if mime == "application/pdf" and not name.lower().endswith(".pdf"):
+            name += ".pdf"
+        elif mime == "text/html" and "." not in name:
+            name += ".html"
+        return BrowserSession._filename(name)
 
     @browser_thread
     def execute_target(self, action, target, allowed=None):
@@ -1625,7 +1943,7 @@ class BrowserSession:
         全程 CDP，不动真实鼠标。allowed = 已暴露给模型的 ref 集合。
         """
         if action.action == "download":
-            return self.download(str(action.args.get("url") or ""))
+            return self.download(str(action.args.get("url") or ""), filename=action.args.get("filename"))
         if action.action in {"scroll", "press", "hotkey"}:
             return self.execute_viewport_action(action)
         ref = self.resolve_target(target, allowed=allowed)

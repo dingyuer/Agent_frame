@@ -66,6 +66,7 @@ class AgentConfig:
     enable_reflection: bool = True
     early_stop_repeat: int = 3
     max_replans: int = 1
+    wait_config: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

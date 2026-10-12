@@ -48,6 +48,8 @@ def main() -> None:
     parser.add_argument("--ground-type", default="ui-tars", choices=["ui-tars", "ui-venus2"],
                         help="grounding 模型类型：ui-tars / ui-venus2")
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--operation-timeout", type=float, default=300)
+    parser.add_argument("--task-timeout", type=float, default=1800)
     parser.add_argument("--screen-width", type=int, default=1920)
     parser.add_argument("--screen-height", type=int, default=1080)
     args = parser.parse_args()
@@ -102,6 +104,7 @@ def main() -> None:
     # 5) 组装 + 跑
     agent = Agent(decision_model=model, grounding=grounding, env=env,
                   max_steps=args.max_steps, enable_reflection=False,
+                  wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout},
                   completion_spec=task_config.get("completion"),
                   private_completion_spec=task_config.get("private_completion"),
                   event_path=os.path.join(results_dir, "events.jsonl"))

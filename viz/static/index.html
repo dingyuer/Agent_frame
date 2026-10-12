@@ -378,7 +378,9 @@
             <label class="field-label" for="local-task">任务描述</label>
             <textarea id="local-task" rows="6" placeholder="例如：搜索论文 Attention Is All You Need，找到原文并下载 PDF。"></textarea>
             <div class="field-tip">描述明确的目标、限制和期望结果。</div>
-            <div class="run-row compact"><label for="local-maxsteps">最大执行步数</label><input id="local-maxsteps" type="number" value="15" min="1" max="200"></div>
+            <div class="run-row compact"><label for="local-maxsteps">最大决策步数</label><input id="local-maxsteps" type="number" value="15" min="1" max="200"></div>
+            <div class="form-two"><div class="run-row"><label for="local-operation-timeout">下载等待上限（秒）</label><input id="local-operation-timeout" type="number" value="300" min="1"></div><div class="run-row"><label for="local-task-timeout">任务时限（秒）</label><input id="local-task-timeout" type="number" value="1800" min="1"></div></div>
+            <div class="field-tip">框架等待下载时暂停决策，不消耗步数；任务时限仍然计时。</div>
             <button id="btn-local-start" class="run-btn primary-launch">启动任务<svg><use href="#i-arrow"/></svg></button>
             <p class="form-footnote">本机任务使用 Windows 浏览器环境。启动后可在实时监控中查看进度。</p>
           </div>
@@ -631,6 +633,10 @@ function renderStatus(s) {
     // done=true 只代表 episode 结束（可能主动放弃/超时/成功），不等于成功；
     // 真正成功/失败要等 task_end 的 result，故用中性态"已结束（待评分）"。
     if (s.done) { statusState.done = true; setStatus('ended', '已结束（待评分）'); }
+  } else if (s.event === 'framework_wait') {
+    setStatus('running', s.status === 'completed' ? '等待结束，正在验收' : '等待下载 · 不消耗步数');
+  } else if (s.event === 'executing') {
+    setStatus('running', '正在执行');
   } else if (s.event === 'task_end') {
     statusState.result = s.result;
     statusState.done = true;
@@ -785,7 +791,8 @@ function statusCardHtml(payload) {
   else if (payload.event === 'error') detail = '⚠️ Step ' + payload.step + ' 出错：' + esc(payload.error || '');
   else if (payload.event === 'task_end') detail = (payload.success === true) ? '✅ 任务结束，成功' : ('任务结束，最终 result=' + payload.result);
   else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
-  else if (payload.event === 'executed') detail = '✅ 执行完成：' + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '');
+  else if (payload.event === 'framework_wait') detail = '<span class="spinner"></span> 框架等待：' + esc(payload.reason || '下载进行中') + ' · 已等待 ' + Math.round(Number(payload.elapsed_s) || 0) + ' 秒 · 不消耗决策步数';
+  else if (payload.event === 'executed') detail = '执行结果：' + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '');
   else detail = esc(payload.event || '');
   return '<div class="card status" data-kind="status">' +
     '<div class="card-head"><span class="tag status">状态</span>' +
@@ -1218,6 +1225,8 @@ document.getElementById('btn-local-start').addEventListener('click', () => {
     mode: 'local',
     task: task,
     max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
+    operation_timeout_s: Number(document.getElementById('local-operation-timeout').value),
+    task_timeout_s: Number(document.getElementById('local-task-timeout').value),
     model: document.getElementById('run-model').value,
     model_url: document.getElementById('run-model-url').value,
     model_api_key: document.getElementById('run-model-apikey').value,

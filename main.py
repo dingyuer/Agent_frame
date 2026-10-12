@@ -30,6 +30,7 @@ def main() -> None:
         enable_reflection=cfg.agent.enable_reflection,
         early_stop_repeat=cfg.agent.early_stop_repeat,
         max_replans=cfg.agent.max_replans,
+        wait_config=cfg.agent.wait_config,
         completion_spec=cfg.completion,
         context_config=cfg.context,
         private_completion_spec=cfg.private_completion,

@@ -23,7 +23,14 @@ agent:
   max_steps: 20              # 单任务最大步数
   max_retries: 3             # 动作解析失败最多重试几次
   enable_reflection: true    # 是否开启反思（reflection）
-  early_stop_repeat: 3       # 连续相同动作 N 次即早停
+  early_stop_repeat: 3       # 相同动作无进展阈值；重复执行失败会提前进入恢复
+  max_replans: 1
+  wait_config:
+    enabled: true
+    poll_interval_s: 0.25
+    download_start_timeout_s: 2
+    operation_timeout_s: 300 # 一次传输的等待上限；自动等待不消耗决策步数
+    task_timeout_s: 1800    # 整个任务的墙钟时间预算
 
 # ---------------- 环境 ----------------
 env:

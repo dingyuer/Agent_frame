@@ -39,13 +39,37 @@ git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
 {"checks": [{"id": "check_1", "kind": "paper_download", "title": "AAA", "count": 1, "format": "pdf"}]}
 ```
 
-同时提供论文任务的流程提示：确认浏览器可用 → 用完整标题在可访问的学术搜索入口检索
+同时提供论文任务的流程提示：确认浏览器可用 → 用用户提供的名称在可访问的学术搜索入口检索
 （例如 arXiv、Google Scholar 或出版机构）→ 核对文章身份 → 找到 PDF 全文 → 下载 → 读取系统验收结果。
 搜索入口由规划和当前页面决定；框架不会假定某个外部站点始终可访问，也不会把摘要页当作下载完成。
 
-自然语言自动推断目前仅支持明确的单篇论文标题、单 URL 导航和单 URL 下载。
-多篇、附带其他操作或存在歧义的指令应提供可信的 `completion_spec`，避免遗漏条件。
+单篇论文的短名和改名要求也可识别，例如 `请下载一篇叫做Roboclaw的论文，并重命名为Roboclaw`。
+短名先作为查询保留，框架根据实际观察到的 arXiv 候选 URL，从官方元数据绑定完整标题和论文 ID。
+适配器只接受完整标题或冒号前的完整别名；多个匹配、来源不可达或不支持的附加要求不会被静默忽略。
+身份绑定单独追加到事件中，原始任务契约不变；官方来源与实际 PDF 交叉验收。
+绑定后框架可直接下载对应 PDF 并交付为 `Roboclaw.pdf`，无需点击查看器工具栏。
+自动身份解析目前支持 arXiv；其他来源仍可用显式完整标题合同和普通下载动作。
+多篇或规则不能完整理解的指令应提供可信的 `completion_spec`，避免遗漏条件。
 规划模型不能自行新增或放宽验收标准。领域流程提示也不能保证小模型在所有网站都能正确决策。
+
+### 自动等待与预算
+
+`max_steps` 约束模型决策轮次。下载发起后，框架读取浏览器事件并等待完成、失败或超时，
+不反复调用模型输出 `wait`，不增加决策步数，也不将传输中的静止画面计为卡死。
+最后一个决策步触发的下载同样先等待和验收，再判断是否耗尽步数。
+没有真实下载迹象时仅给有界启动宽限；对话框需要处理时返回决策。不会因一直标为
+`in_progress` 就无限续期，也不自动重发执行结果不确定的点击。
+
+```python
+agent = Agent(decision_model=model, grounding=grounding, env=env,
+              wait_config={"operation_timeout_s": 300, "task_timeout_s": 1800,
+                           "download_start_timeout_s": 2, "poll_interval_s": 0.25})
+```
+
+本机前端可设置下载等待上限和任务时限，等待状态显示“不消耗步数”，保留中断入口。
+命令行对应 `--operation-timeout 300 --task-timeout 1800`，YAML 对应 `agent.wait_config`。
+时间预算独立于决策预算；正在进行的外部模型请求仍受模型传输超时约束。
+框架自动等待只记录事件；模型主动输出一次 `wait` 仍是一次真实采样，不能从训练记录删除。
 
 ### 截图、DOM 与弹窗
 
@@ -86,12 +110,18 @@ AX 不足时可按需读取精简 DOM。优先使用 DOM 引用或唯一语义�
 | `element_state` | `role`, `name`，以及 `value` 或 `states` | 唯一 AX 节点的精确值/状态；可加 `element_id`, `url` |
 | `text_present` | `text` | AX 完整文本经空白归一化后精确匹配；可加 `url` |
 | `download` | `url` | 完成下载事件关联的实际文件；可加 `filename`, `min_bytes`, `sha256` |
-| `paper_download` | `title` | 完成事件、文件稳定性、真实 PDF 与首页标题；可加 `count`, `format`, `author`, `year`, `doi`, `arxiv_id`, `url`, `min_bytes`, `sha256` |
+| `paper_download` | `title` 或待绑定的 `query` | 完成事件、文件稳定性、真实 PDF 与首页标题；可加 `filename`, `count`, `format`, `author`, `year`, `doi`, `arxiv_id`, `url`, `min_bytes`, `sha256` |
 
 未知字段或类型会报错。`paper_download` 当前仅支持 `pdf`；系统检查实际字节、SHA256、PDF
 可解析性与页数，并在首页开头区域匹配完整标题。标题只做 Unicode、大小写和空白归一化，保留标点；
 文件名、PDF metadata、模型声称的标题、正文或参考文献中提到的论文都不足以通过。
-有作者、年份、DOI 或 arXiv ID 条件时，还须在首页标题区域找到对应证据。
+有作者、年份、DOI 或 arXiv ID 条件时，还须提供对应身份依据；arXiv 页边标识和绑定后的
+官方 PDF 来源会专门核验，正文或参考文献中出现某个 ID 不能单独通过。
+
+`download(url, filename=...)` 可直接指定交付文件名。后续改名使用
+`rename_artifact(artifact_id, filename)`，仅处理本轮已登记文件，不覆盖现有目标。
+文件 ID、初始摘要和改名链保持不变；内容、论文身份与最终文件名必须由同一份文件满足。
+手工在框架之外移动文件不等同于登记的改名事件。
 
 这是刻意保守的验证器。扫描件缺少可提取文字、加密 PDF、缺少 `pypdf`、超过 100 MiB 的文件、
 提取顺序异常或标题/附加身份无法精确确定时可能返回 `unknown`；损坏的 PDF 或非 PDF 字节会失败。

@@ -87,6 +87,17 @@ class Environment(ABC):
         """执行已路由的动作（browser_dom 通道）。默认回退 step()。"""
         return self.step(action)
 
+    def browser_event_metadata(self) -> dict:
+        """Poll an existing session without screenshots or opening a browser."""
+        session = getattr(self, "_browser_session", None)
+        return session.event_metadata() if session is not None else {}
+
+    def cancel_download(self, download_id: str):
+        session = getattr(self, "_browser_session", None)
+        if session is not None:
+            return session.cancel_download(download_id)
+        return {"status": "rejected", "dispatched": False, "error": "No active browser session"}
+
     @abstractmethod
     def evaluate(self) -> float:
         """任务结束后的得分（0 或 1）。"""

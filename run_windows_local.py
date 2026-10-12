@@ -297,6 +297,8 @@ def main() -> int:
     parser.add_argument("--ground-type", choices=["ui-venus2", "ui-tars"], default="ui-venus2")
     parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--operation-timeout", type=float, default=300, help="下载等操作等待上限（秒），自动等待不消耗决策步数")
+    parser.add_argument("--task-timeout", type=float, default=1800, help="任务总时间预算（秒）")
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
@@ -349,6 +351,7 @@ def main() -> int:
         # 4) 组装 + 跑，保留 1010 的规划流水线
         agent = Agent(decision_model=model, grounding=grounding, env=env,
                       max_steps=args.max_steps, enable_reflection=False,
+                      wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout},
                       step_callback=_live_step, completion_spec=completion_spec,
                       private_completion_spec=private_completion_spec, planner_model=planner,
                       event_path=os.path.join(args.result_dir, "events.jsonl") if args.result_dir else None)

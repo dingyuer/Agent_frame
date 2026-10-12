@@ -29,7 +29,7 @@ def _render_items(items) -> str:
 
 # 浏览器场景的动作白名单：只保留浏览器 + 通用动作，过滤表格/UNO/子Agent/桌面切换
 _BROWSER_ONLY_ACTIONS = {
-    "goto", "download", "click", "double_click", "right_click", "type", "scroll",
+    "goto", "download", "rename_artifact", "click", "double_click", "right_click", "type", "scroll",
     "press", "hotkey", "select", "drag_and_drop", "wait",
     "run_in_terminal", "get_page_source", "request_finish", "fail",
     "handle_dialog", "list_tabs", "switch_tab", "close_tab", "observe_desktop", "observe_browser",
@@ -123,7 +123,7 @@ def build_system_prompt(
    - 一定【不要】编造 id 或 ref：从当前观察的 browser_ax 里原样复制，抄错就定位不到。
    结构定位不可用时可以用英文 target 交给视觉定位。页面截图只包含网页；操作浏览器工具栏、权限气泡或系统窗口前，先 observe_desktop 获取桌面图，完成后 observe_browser 回到网页。不要输出 CSS/XPath、不要猜坐标。
 12. 打开网址/访问网站：必须用 goto 动作（url 填完整网址，如 scholar.google.com），【绝对不要】点击地址栏、也不要往地址栏 type 网址——地址栏是浏览器 chrome UI，不在页面 DOM。要搜索内容：先用 goto 打开搜索引擎首页，再在页面里的搜索框用 type 输入关键词。
-13. 下载文件：从真实页面取得完整下载 URL 后用 download；也可以点击真实下载按钮，由浏览器事件记录实际下载。只有系统产物验收通过才算完成；不得编造 URL，PDF文件名也不是论文身份依据。
+13. 下载文件：优先使用观察中的 download_candidates 或已绑定论文的真实 PDF 地址调用 download，可指定 filename。PDF 查看器打开不等于下载完成；AX 未覆盖查看器按钮时可用页面截图定位，浏览器外层或系统窗口才需 observe_desktop。传输和页面加载期间框架会自动等待，不需重复点击或反复 wait。文件改名用 rename_artifact，只有系统对实际内容、身份及文件名的验收通过才算完成；不得编造 URL 或 ref。
 14. 找不到目标元素时的排查（重要）：当你要操作的元素在 AX 树里找不到、或截图里看不到时，【不要】反复点同一个地方，按顺序排查：
    - 是否被【弹窗/对话框/提示条】遮挡了 → 先关掉它（点它的关闭按钮，或按 Esc）；
    - 是否页面需要【滚动】才能看到目标 → 用 scroll 上下滚一滚再看；
@@ -134,7 +134,7 @@ def build_system_prompt(
     else:
         browser_rule = """11. 浏览器规则：当你要操作的目标【是浏览器页面里的元素】时，优先加 element_id（HTML id）或 target_ref（ref 编号）直接走 DOM 定位；都拿不准才只用英文 target（程序会先结构匹配，匹配不到再视觉定位）。目标不在页面 DOM 里时（canvas、原生弹窗、地址栏、桌面窗口）才用英文 target 交给视觉定位。不要编造 id/ref。
 12. 打开网址/访问网站：必须用 goto 动作，不要点地址栏、不要往地址栏 type 网址。
-13. 下载文件：从页面取得完整 URL，使用 download 动作；不得编造 URL，点击链接不等于完成下载。
+13. 下载文件：从真实观察取得完整 URL，使用 download 动作，可指定 filename；传输期间由框架等待，不要重复点击。改名用 rename_artifact，文件内容和交付名称均须通过系统验收。不得编造 URL，点击 PDF 链接不等于下载完成。
 14. 找不到目标元素时的排查（重要）：当要操作的元素在 AX 树里找不到、或截图里看不到时，不要反复点同一个地方，按顺序排查：① 是否被弹窗/对话框遮挡 → 先关掉它；② 是否页面需要滚动才能看到 → 用 scroll；③ 是否需要先点击展开（菜单/tab/输入框）目标才会出现。"""
 
     # 桌面专用规则（表格/技能，browser_only 不渲染，经验见 docs/legacy_prompt.md）

@@ -185,6 +185,14 @@ def validate_action(act: Action) -> Optional[str]:
     if act.action in ("switch_tab", "close_tab") and "tab_id" in act.args:
         if not isinstance(act.args["tab_id"], str) or not act.args["tab_id"].strip():
             return "tab_id 必须来自当前标签页列表"
+    if act.action in {"download", "rename_artifact"} and "filename" in act.args:
+        name = act.args["filename"]
+        if (not isinstance(name, str) or not name.strip() or name in {".", ".."}
+                or any(c in name for c in '/\\\\\x00') or any(ord(c) < 32 for c in name)):
+            return "filename 必须是不含路径的文件名"
+    if act.action == "rename_artifact":
+        if not isinstance(act.args.get("artifact_id"), str) or not act.args["artifact_id"].strip():
+            return "artifact_id 必须来自当前观察中已登记的下载文件"
     return None
 
 

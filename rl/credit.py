@@ -57,9 +57,11 @@ def _validate_group(rollouts):
         task_spec_hash = getattr(rollout, "task_spec_hash", "")
         if not initial_state or not revision or not instruction or not task_spec_hash:
             raise ValueError("Credit grouping needs instruction, task_spec_hash, initial_state_id and fixed policy_revision")
-        groups.add((instruction, task_spec_hash, initial_state, revision))
+        groups.add((instruction, task_spec_hash, initial_state, revision,
+                    getattr(rollout, "runtime_config_hash", ""),
+                    getattr(rollout, "goal_binding_hash", "")))
     if len(groups) > 1:
-        raise ValueError("Split rollouts by task, initial_state_id and policy_revision before assigning credit")
+        raise ValueError("Split rollouts by task, initial_state_id, policy_revision, runtime configuration and goal binding before assigning credit")
     return next(iter(groups), None)
 
 

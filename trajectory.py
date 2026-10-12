@@ -115,6 +115,7 @@ def build_trajectory(
             "routing": s.get("routing", {}),
             "resolved_action": s.get("resolved_action"),
             "execution_info": s.get("execution_info", {}),
+            "framework_operations": copy.deepcopy(s.get("framework_operations", [])),
             "verification": s.get("verification"),
             "timing_ms": s.get("timing_ms", {}),
             "trainable": bool(s.get("policy_input") and s.get("policy_output") and s.get("valid_action", False)),
@@ -177,6 +178,8 @@ def _positive_step(step):
         return False
     info = step.get("execution_info") or {}
     assessment = step.get("assessment") or {}
+    if info.get("framework_replaced_action") or step.get("framework_replaced_action"):
+        return False
     if info.get("status") in {"rejected", "failed", "failure", "uncertain", "error"}:
         return False
     if assessment.get("action_status") in {"failure", "failed", "uncertain"}:

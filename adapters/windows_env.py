@@ -135,7 +135,7 @@ class WindowsEnvironment(Environment):
                     "screenshot_size": list(size) if size else None,
                     "scene": Scene(browser_use=0, structure_available=False,
                                    mode="visual", reason="desktop_fallback").to_dict()}
-            for key in ("artifacts", "download_events", "dialogs", "dialog", "initial_state", "tabs"):
+            for key in ("artifacts", "download_events", "pending_downloads", "dialogs", "dialog", "initial_state", "tabs"):
                 if key in metadata:
                     info[key] = metadata[key]
             if error or metadata.get("error") or metadata.get("observation_errors"):
@@ -249,7 +249,8 @@ class WindowsEnvironment(Environment):
         if action.action == "goto" or route.get("goto_url"):
             result = session.goto(str(action.args.get("url") or route.get("goto_url")))
         elif action.action == "download":
-            result = session.download(str(action.args.get("url") or ""))
+            kwargs = {"filename": action.args["filename"]} if "filename" in action.args else {}
+            result = session.download(str(action.args.get("url") or ""), **kwargs)
         elif route.get("target_ref"):
             result = session.execute(action, route)
         elif action.action in ("scroll", "press", "hotkey"):
@@ -282,10 +283,10 @@ class WindowsEnvironment(Environment):
             obs = self.observe()
             return StepResult(observation=obs, info={"status": "executed", "dispatched": False,
                 "action": name, "artifacts": obs.info.get("artifacts", [])})
-        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab"}:
+        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab", "rename_artifact", "download"}:
             session = self._get_browser_session()
             kwargs = {k: v for k, v in action.args.items() if k in {
-                "accept", "prompt_text", "dialog_id", "tab_id"}}
+                "accept", "prompt_text", "dialog_id", "tab_id", "artifact_id", "filename", "url"}}
             result = getattr(session, name)(**kwargs)
             obs = self.observe()
             result["artifacts"] = obs.info.get("artifacts", [])
