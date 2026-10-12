@@ -129,7 +129,8 @@ async def receive_log(request: Request):
         return {"ok": False, "error": "invalid json"}
     payload.setdefault("ts", time.time())
     stored = dict(payload)
-    stored.pop("screenshot", None)  # 存日志去掉截图 base64，省内存
+    # 保留 screenshot：前端 poll() 从 /history 拿日志渲染，去掉截图会导致实时监控截图缺失
+    # （poll 抢先消费事件、WebSocket 的有截图事件被 seenKeys 去重跳过）。
     logs.append(stored)
     if len(logs) > MAX_LOGS:
         del logs[0:len(logs) - MAX_LOGS]

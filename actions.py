@@ -139,6 +139,12 @@ def validate_action(act: Action) -> Optional[str]:
     # 策略只能输出语义目标，不能提供执行器内部坐标 / 状态字段
     if any(k in act.args for k in ("x", "y", "x1", "y1", "x2", "y2", "grounding_failed", "coordinate_space", "observation_metadata")):
         return "策略只能输出语义目标，不能提供执行器内部坐标或状态字段"
+    # 空字符串的 element_id / target_ref：模型常输出 element_id:"" 表示「没有 id」，
+    # 应忽略（移除）而非拒绝动作，让 target_ref / target 语义匹配继续生效。
+    if act.args.get("element_id") == "":
+        act.args.pop("element_id")
+    if act.args.get("target_ref") == "":
+        act.args.pop("target_ref")
     # target_ref：DOM 节点引用（可选，但有就必须是非空字符串）
     if "target_ref" in act.args and (not isinstance(act.args["target_ref"], str) or not act.args["target_ref"]):
         return "target_ref 必须是当前观察中的非空节点引用"
