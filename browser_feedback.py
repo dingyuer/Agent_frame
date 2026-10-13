@@ -85,11 +85,17 @@ def operational_facts(obs, completion, report, step=None, *, os_name=""):
             lines.append('当前打开的是其他论文，请回到上述已核实地址。')
     info = (obs.info or {}) if obs else {}
     if info.get('active_surface') == 'desktop':
+        from .desktop_readiness import foreground, window_ready
+        import json
         lines.append('当前为桌面接管：截图覆盖虚拟桌面，界面输入会使用真实鼠标键盘。返回后台网页操作用 observe_browser。')
-        foreground = next((a for a in info.get('runtime_state', {}).get('applications', []) if a.get('foreground')), None)
-        if foreground:
-            lines.append('系统观察到的前台窗口：' + str(foreground.get('process_name', '')) + ' / '
-                         + str(foreground.get('title', ''))[:160])
+        front = foreground(info.get('runtime_state', {}))
+        if front:
+            lines.append('系统观察到的前台窗口：' + str(front.get('process_name', ''))[:80] + ' / '
+                         + json.dumps(str(front.get('title', ''))[:160], ensure_ascii=False)
+                         + ('；窗口有响应，内容加载需另行核查。' if window_ready(front) else '；尚未确认可接收输入。'))
+        waiting = info.get('desktop_window_wait') or {}
+        if waiting.get('status') in {'timeout', 'cancelled', 'task_timeout'}:
+            lines.append('最近窗口等待结果：' + str(waiting['status']) + '；先核对当前前台窗口，不能盲发 Ctrl+L 或重复启动。')
     pending = info.get('pending_downloads', [])
     if pending:
         lines.append('系统仍有下载进行中；等待框架确认，不要重复点击下载。')

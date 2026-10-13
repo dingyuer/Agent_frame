@@ -16,12 +16,13 @@ from ..env import Environment, Observation, StepResult, run_local_command, run_l
 from .uno_commands import SET_CELL_VALUES_CMD, SAVE_DOC_CMD
 
 
-def to_pyautogui(action: Action, *, desktop_origin=None) -> str:
+def to_pyautogui(action: Action, *, desktop_origin=None, keyboard_guard=False) -> str:
     """把新框架的 Action（env 类，已坐标化）翻译成 OSWorld 的 pyautogui 命令字符串。"""
     name = action.action
     a = dict(action.args)
     head = "import pyautogui; import time; "
     writer = 'pyautogui.write'
+    guard = 'desktop_input_guard(); ' if keyboard_guard else ''
     if desktop_origin is not None:
         head += 'from osworld_agent.windows_text import type_unicode; '
         writer = 'type_unicode'
@@ -82,8 +83,8 @@ def to_pyautogui(action: Action, *, desktop_origin=None) -> str:
             cmd += f"pyautogui.click({x}, {y}); "
         if a.get('overwrite'):
             # 覆盖写：全选 + 退格删除旧内容，再输入新文字（对齐 Agent S3 的 type(overwrite=True)）。
-            cmd += "pyautogui.hotkey('ctrl', 'a'); pyautogui.press('backspace'); "
-        cmd += f"{writer}({str(a.get('text', ''))!r})"
+            cmd += guard + "pyautogui.hotkey('ctrl', 'a'); " + guard + "pyautogui.press('backspace'); "
+        cmd += f"{guard}{writer}({str(a.get('text', ''))!r})"
         return cmd
     if name == "scroll":
         amount = int(a.get("amount", 1))
@@ -93,21 +94,21 @@ def to_pyautogui(action: Action, *, desktop_origin=None) -> str:
             amount = -amount
         return f"{head} pyautogui.scroll({amount})"
     if name == "press":
-        return f"{head} pyautogui.press({str(a.get('key', ''))!r})"
+        return f"{head}{guard} pyautogui.press({str(a.get('key', ''))!r})"
     if name == "hotkey":
         keys = list(a.get("keys", []))
-        return f"{head} pyautogui.hotkey(*{keys!r})"
+        return f"{head}{guard} pyautogui.hotkey(*{keys!r})"
     if name == "goto":
         url = str(a.get("url", ""))
-        return (f"{head} pyautogui.hotkey('ctrl', 'l'); time.sleep(0.5); "
-                f"{writer}({url!r}); pyautogui.press('enter')")
+        return (f"{head}{guard} pyautogui.hotkey('ctrl', 'l'); time.sleep(0.5); "
+                f"{guard}{writer}({url!r}); {guard}pyautogui.press('enter')")
     if name == "drag_and_drop":
         return (f"{head} pyautogui.moveTo({a.get('x1')}, {a.get('y1')}); "
                 f"pyautogui.dragTo({a.get('x2')}, {a.get('y2')}, duration=1.0)")
     if name == "select":
         # 简化：点开下拉框 → 输入选项 → 回车
         return (f"{head} pyautogui.click({a.get('x')}, {a.get('y')}); time.sleep(0.5); "
-                f"{writer}({str(a.get('option', ''))!r}); pyautogui.press('enter')")
+                f"{guard}{writer}({str(a.get('option', ''))!r}); {guard}pyautogui.press('enter')")
     if name == "wait":
         return f"{head} time.sleep({float(a.get('seconds', 1))})"
     if name == "save":

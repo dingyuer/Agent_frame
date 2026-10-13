@@ -14,6 +14,9 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import math
+import threading
+from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
 from ..env import Environment, Observation, StepResult
@@ -27,7 +30,17 @@ class WindowsEnvironment(Environment):
     evaluation_available = False
 
     def __init__(self, browser_port: int = 9222, width: int = 1920, height: int = 1080,
-                 downloads_dir: Optional[str] = None, workspace_dir: Optional[str] = None):
+                 downloads_dir: Optional[str] = None, workspace_dir: Optional[str] = None,
+                 window_timeout_s: float = 15.0):
+        if type(window_timeout_s) not in (int, float) or not math.isfinite(window_timeout_s) or window_timeout_s <= 0:
+            raise ValueError('window_timeout_s must be finite and positive')
+        self.window_timeout_s = window_timeout_s
+        self._window_wait_emit = None
+        self._window_wait_remaining = None
+        self._window_wait_cancel = threading.Event()
+        self._pending_window = None
+        self._window_launch_inflight = False
+        self._last_window_wait = None
         self.browser_port = browser_port
         self.width = width
         self.height = height
@@ -63,7 +76,39 @@ class WindowsEnvironment(Environment):
         self._observation_surface = "browser"
         self._desktop_capture = {}
         self._last_observation_info = {}
+        self._pending_window = None
+        self._window_launch_inflight = False
+        self._last_window_wait = None
+        self._window_wait_cancel.clear()
         return dict(self.initial_state)
+
+    @contextmanager
+    def framework_wait_context(self, emit, remaining):
+        old = self._window_wait_emit, self._window_wait_remaining
+        self._window_wait_emit, self._window_wait_remaining = emit, remaining
+        try:
+            yield
+        finally:
+            self._window_wait_emit, self._window_wait_remaining = old
+
+    def cancel_pending_wait(self):
+        self._window_wait_cancel.set()
+
+    def _wait_for_desktop_window(self, target, *, dispatched):
+        from ..desktop_readiness import wait_for_window
+        self._pending_window = target
+        report = wait_for_window(target, timeout_s=self.window_timeout_s,
+            emit=self._window_wait_emit, remaining=self._window_wait_remaining,
+            cancelled=self._window_wait_cancel.is_set)
+        self._last_window_wait = report
+        if report['status'] == 'completed':
+            self._pending_window = None
+            self._window_launch_inflight = False
+        return {'status': 'executed' if report['status'] == 'completed' else 'uncertain',
+                'dispatched': dispatched, 'channel': 'desktop', 'framework_wait': report,
+                'reason': report['detail'],
+                **({'window': report['window']} if report.get('window') else {}),
+                **({'error_code': 'desktop_window_' + report['status']} if report['status'] != 'completed' else {})}
 
     # ---- 观察 ----
     def _take_screenshot(self):
@@ -125,6 +170,9 @@ class WindowsEnvironment(Environment):
         from ..model.grounding import screenshot_size
         from ..scene import Scene
 
+        from ..desktop_state import windows_runtime_state
+        from ..desktop_readiness import foreground, window_identity
+        desktop_before = windows_runtime_state() if self._observation_surface == 'desktop' else None
         screenshot, snapshot, metadata = None, None, {}
         error = ""
         if self._observation_surface == "browser":
@@ -193,8 +241,12 @@ class WindowsEnvironment(Environment):
         info["active_surface"] = "browser" if info.get("screenshot_space") == "css_viewport" else "desktop"
         info["requested_surface"] = self._observation_surface
         info['control_mode'] = 'background_browser' if info['active_surface'] == 'browser' else 'desktop_takeover'
-        from ..desktop_state import windows_runtime_state
         info["runtime_state"] = windows_runtime_state()
+        if desktop_before is not None:
+            before, after = foreground(desktop_before), foreground(info['runtime_state'])
+            info['desktop_focus_stable'] = bool(before and after and window_identity(before) == window_identity(after))
+            if self._last_window_wait:
+                info['desktop_window_wait'] = dict(self._last_window_wait)
         self._last_observation_info = dict(info)
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
@@ -393,10 +445,40 @@ class WindowsEnvironment(Environment):
             return StepResult(observation=self.observe(), info={
                 "status": "rejected", "dispatched": False, "channel": "desktop",
                 "error": "请先 observe_desktop 获取桌面截图后再执行 GUI 操作；网页操作使用 DOM 或 observe_browser"})
+        if self._window_wait_cancel.is_set() or (self._window_wait_remaining and self._window_wait_remaining() <= 0):
+            return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
+                'channel': 'desktop', 'error_code': 'desktop_operation_cancelled', 'reason': '操作已取消或任务时间预算已耗尽'})
         if name == 'switch_applications':
-            from ..desktop_state import switch_windows_application
+            from ..desktop_state import switch_windows_application, windows_application_process
+            process = windows_application_process(action.args.get('app_code'))
+            if sys.platform == 'win32' and process:
+                self._pending_window = {'process_name': process + '.exe'}
+                self._window_launch_inflight = False
             result = switch_windows_application(action.args.get('app_code'))
+            if sys.platform == 'win32' and result.get('window') and result.get('status') in {'executed', 'observed', 'uncertain'}:
+                result.update(self._wait_for_desktop_window(result['window'], dispatched=result['dispatched']))
+                if result['framework_wait']['status'] == 'completed':
+                    result.pop('error_code', None)
             return StepResult(observation=self.observe(), info=result)
+        from ..desktop_readiness import launch_target, global_shortcut, check_keyboard_focus, DesktopFocusError
+        from ..desktop_state import windows_runtime_state
+        target = launch_target(action) if sys.platform == 'win32' else None
+        if target and self._window_launch_inflight and self._pending_window and self._pending_window.get('process_name') == target['process_name']:
+            # A previous launch may still be completing. Never create more windows.
+            result = self._wait_for_desktop_window(target, dispatched=False)
+            return StepResult(observation=self.observe(), info=result)
+        keyboard_guard = (sys.platform == 'win32' and name in {'type', 'select', 'press', 'hotkey', 'goto'}
+                          and not global_shortcut(action))
+        observed = self._last_observation_info
+        def guard_input():
+            check_keyboard_focus(observed.get('runtime_state', {}), windows_runtime_state(),
+                pending_target=self._pending_window, capture_stable=observed.get('desktop_focus_stable') is True)
+        if keyboard_guard:
+            try:
+                guard_input()
+            except DesktopFocusError as exc:
+                return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
+                    'channel': 'desktop', 'error_code': 'desktop_focus_unconfirmed', 'reason': str(exc)})
         # 坐标化后执行 pyautogui 命令
         try:
             if sys.platform == 'win32' and not self._desktop_capture and name != 'wait':
@@ -404,9 +486,9 @@ class WindowsEnvironment(Environment):
             if self._desktop_capture:
                 from ..desktop_capture import validate_desktop_action, virtual_geometry
                 mapped, origin = validate_desktop_action(action, self._desktop_capture, virtual_geometry())
-                cmd = to_pyautogui(mapped, desktop_origin=origin)
+                cmd = to_pyautogui(mapped, desktop_origin=origin, keyboard_guard=keyboard_guard)
             else:
-                cmd = to_pyautogui(action)
+                cmd = to_pyautogui(action, keyboard_guard=keyboard_guard)
         except (ValueError, OSError) as exc:
             return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
                 'channel': 'desktop', 'error_code': 'desktop_geometry_changed', 'error': str(exc)})
@@ -414,11 +496,18 @@ class WindowsEnvironment(Environment):
             try:
                 from ..desktop_capture import physical_dpi_context
                 with physical_dpi_context():
-                    exec(cmd, {"__name__": "__main__"})  # noqa: S102  执行基础 GUI 命令
+                    exec(cmd, {"__name__": "__main__", "desktop_input_guard": guard_input})  # noqa: S102
+            except DesktopFocusError as exc:
+                return StepResult(observation=self.observe(), info={'status': 'uncertain', 'dispatched': True,
+                    'channel': 'desktop', 'error_code': 'desktop_focus_changed_during_action', 'reason': str(exc)})
             except Exception as exc:  # noqa: BLE001
                 return StepResult(observation=self._build_observation(),
                                   info={"status": "failed", "dispatched": True,
                                         "channel": "desktop", "error": f"执行异常: {exc}"})
+            if target:
+                self._window_launch_inflight = True
+                result = self._wait_for_desktop_window(target, dispatched=True)
+                return StepResult(observation=self.observe(), info=result)
             return StepResult(observation=self.observe(), info={
                 "status": "executed", "dispatched": True, "channel": "desktop"})
         return StepResult(observation=self.observe(), info={

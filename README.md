@@ -108,36 +108,78 @@ URL 或“完成标准”写入可信合同。引用存在不证明语义正确�
 `agent.progress_config`。它用于触发重规划，不作为成功/失败训练标签；前端和轨迹保存
 `step_progress`，包括当前步骤、连续无进展次数、证据和最近尝试。
 
-### Decision 3.0 远程评估器（可选）
+### Decision 3.0 / Jev 调试与验证模型选择
 
-支持 [Decision 3.0 的 System One 接口](https://huggingface.co/vllm-sr/d3)，可选择
-`vllm-sr/d3`（27B）或 `vllm-sr/d3-flash`（9B）。该接口是 `/v1/systemone`，不是
-`/chat/completions`；部署时使用模型自带服务或官方支持的 Engine。框架只发送 HTTP 请求，
-不在本机加载模型。前端“连接模型 → Decision 3.0 评估器”选择型号并填写远程服务地址即可启用，
-默认关闭。两种型号共用接口，可以对同一组任务分别运行以比较误判率、耗时与任务成功率。
+Jev 使用 `/v1/systemone`，不是生成文字的 `/chat/completions`。框架只调用远程服务，
+不加载本地权重。前端新增 **Jev 调试**：上传截图、填写背景和问题，选择
+`choice`（单选）、`noul`（是否）或 `score`（有序评分），查看原始响应、用量、实际模型与耗时。
+支持一次发送多个问题；每个问题需要一次前向计算。页面允许最多 4 张 PNG/JPEG/WebP，
+每张最多 9 MiB；建议按动作前、动作后的顺序上传，并在背景中描述图片顺序和系统证据。
+调试请求不执行动作，不进入运行轨迹或 SFT 数据。
+
+预填部署地址（均可修改；选择模型不会启动远程服务）：
+
+| 型号 | System One 地址 |
+| --- | --- |
+| `vllm-sr/d3-flash`（9B） | `http://10.44.101.62:8007/v1/systemone` |
+| `vllm-sr/d3`（27B） | `http://10.44.101.62:8006/v1/systemone` |
+
+调试页的“检查服务与能力”读取 `/health` 和 `/v1/models`；实际模型以响应为准，
+请求中的 model 名称不会切换服务端权重。API Key 可在调试页面临时填写，不保存；
+运行任务时在 **框架服务进程** 中设置 `DECISION_JUDGE_API_KEY`。
+这是客户端凭据，需与 Jev 服务端的 `DECISION_API_KEY` 一致。
+
+运行任务时，在“连接模型 → 验证模型”选择：
+
+- **复用决策模型**：使用相同模型服务、独立审查上下文进行语义核查，不调用 Jev。
+- **Jev 9B（前端默认） / 27B（可选）**：代码核查优先，剩余步骤和最终语义要求由 Jev 核查。每次语义核查只问一个
+  `passed / progress / failed / pending / unknown` 选择题，减少前向次数。`progress` 表示动作有进展、
+  子任务未完成，不推进队列。最终验收不提供 progress 选项。提供有效的动作前后截图、AX、
+  文件/系统证据和代码核查结果；没有有效前图时明确标为 after_only。
+
+前端默认地址为 9B 的 `http://10.44.101.62:8007/v1/systemone`；保留原模型和 27B 的手动选择，
+不自动升级模型。Python/CLI 未配置 judge URL 时仍不启用远程 Jev。
+
+证据会按当前子任务、动作目标、变化节点和弹窗排序，每个观察最多 40 个 AX 节点、5 条文件记录。
+通过动作前的 DOM 引用提取目标身份，避免只截 AX 前部而漏掉真正目标。模型输入超过 24000 字符时
+优先删去低相关 AX 节点，保留原任务和验收要求；超过接口硬限制会保留 unknown。
+输入框值和目标 URL 的明确效果先由代码判断，动作生效与子任务完成分开显示。
+
+exclusive 模式默认开启 `recheck_unknown: true`：每个子任务（含最终验收）最多补充一次只读观察；
+重新做代码检查，仅有新证据时再调用同一个 9B。相同证据、接口错误、已确认局部进展不会反复调用。
+补证不消耗操作步数，计入总时限；仍不确定时保留当前步骤，由既有恢复/重规划处理。
+可在前端关闭，或通过 `--judge-no-recheck` / `recheck_unknown: false` 关闭。
+视觉模型认为动作取得进展时只提供有界探索宽限，不能无限推迟卡死检测，也不作为 RL 奖励。
+
+框架保存最近 4 个已通过步骤的观察检查点，最终核查最多选取 2 个相关历史截图，加上当前截图。
+历史证据明确标注时间顺序；旧截图和旧模型结论不能替代当前 URL、文件等确定性验收。
+前端展示动作效果、子任务状态、证据选取数量、补证结果、历史检查点及耗时。
+
+Jev 默认要求最高选项分数 ≥ 0.90 且领先第二名 ≥ 0.15，前端可调整。
+低置信度、pending、超时、缺图和非法响应保留 unknown，不暗中调用另一种模型判成功。
+模型概率不是校准后的成功率；响应中的 confidence 是分布集中度，与最高选项概率分开保存。
+明确的代码失败不能由模型覆盖；下载落盘和文件身份、文件名等条件仍由框架检查。
+模型判 pending 不会凭空启动系统等待。最终语义检查覆盖原始任务的全部要求，
+模型判通过也不会变成确定性成功奖励。
 
 ```python
 agent = Agent(decision_model=model, grounding=grounding, env=env,
-    decision_judge={"url": "http://JUDGE_HOST:8899/v1", "model": "vllm-sr/d3-flash",
-                    "revision": "YOUR_DEPLOYED_REVISION", "threshold": 0.9,
-                    "margin": 0.15, "timeout": 10})
+    decision_judge={"url": "http://10.44.101.62:8007/v1/systemone",
+                    "model": "vllm-sr/d3-flash", "review_mode": "exclusive",
+                    "threshold": 0.9, "margin": 0.15, "timeout": 120,
+                    "revision": "YOUR_DEPLOYED_REVISION"})
 ```
 
-本机/前端 VM runner 支持 `--judge-url`、`--judge-model`、`--judge-revision`、
-`--judge-threshold`、`--judge-margin`、`--judge-timeout`；YAML 对应 `agent.decision_judge`。
-需要认证时设置服务端环境变量 `DECISION_JUDGE_API_KEY`；凭据不进入 manifest 或模型调用记录。
+CLI 支持 `--judge-url`、`--judge-model`、`--judge-revision`、`--judge-threshold`、
+`--judge-margin`、`--judge-timeout`、`--judge-review-mode exclusive`；YAML 对应
+`agent.decision_judge`。旧配置未指定 review_mode 时保留 `assist` 兼容行为：Jev 辅助局部核查，
+不确定时回退原审查模型，最终语义验收用原审查模型。前端选择 Jev 会显式设置 exclusive。
 
-- 规划前分类网页、桌面、混合或未知任务；分类作为提示，实际 DOM 可用性、截图来源与坐标空间仍由环境决定。
-- 每次动作先做代码核查；需要视觉审查时，Decision 接收动作前后截图、当前步骤、预期效果和精简的系统证据，
-  分别输出子任务完成、动作效果、当前操作表面的概率。动作有效不等于子任务完成。
-- 代码明确失败或真实操作仍 pending 时不交给 Decision 覆盖。低分、选项分数接近、超时、缺图、非法返回均保留 unknown，
-  回退原独立视觉核查。模型选择 pending 不会凭空启动框架等待；等待需要真实系统事件。
-- 整项任务的最终语义核查仍检查原始任务和硬性验收条件，局部 Decision 判定不能直接给出任务奖励。
-- 前端显示分类、各选项概率、耗时和版本。请求/结果记录为 `actor_role=verifier, policy_trainable=false`，
-  与操作策略的 SFT/RL 样本分离。服务未返回权重版本时，用 `revision` 记录部署版本。
-
-默认阈值是可调整的初始值，未经过本任务分布校准；模型概率不能解释为真实成功率。
-本仓库测试验证协议、回退和验收边界，不替代远程 27B/9B 的实际准确率及延迟评测。
+运行卡片显示代码、原模型和 Jev 的核查耗时，Jev 调试页还显示请求中的计时。
+耗时包括客户端处理、网络和服务端排队，**不是纯 GPU 推理耗时**。默认 Jev 超时 120 秒，
+可设 1–600 秒，运行时还受剩余任务时间限制。HTTP 422 的 detail 在调试页可见。
+分类和验收调用记录为 `actor_role=verifier, policy_trainable=false`，保存响应与用量，
+凭据不进入 manifest 或调用记录。规划前的环境分类仅作提示，不决定 DOM 是否可用。
 
 ### 例子：下载指定论文
 
@@ -225,6 +267,34 @@ Windows 任务在规划前建立默认操作目录，`begin_episode` 沿用同�
 桌面仍互不干扰；需要全程隔离桌面操作时，应使用独立 VM/桌面会话。`observe_browser` 返回后台网页模式。
 实现依据：[Pillow 全屏截图](https://pillow.readthedocs.io/en/stable/reference/ImageGrab.html)、
 [Windows 线程 DPI 上下文](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddpiawarenesscontext)。
+
+### 桌面窗口就绪与输入焦点
+
+Windows 的 `hotkey keys=["win","e"]` 执行后，框架轮询操作系统窗口状态，
+直到资源管理器窗口在前台、可见、未最小化、未被系统隐藏、有响应且边界连续两次稳定，再获取后图。
+已有资源管理器被激活同样有效；桌面/任务栏虽然也属于 explorer.exe，但不算文件管理器窗口。
+`switch_applications` 定向激活已有窗口后使用同一等待机制。
+
+默认每 250 ms 检查一次，上限 15 秒，可通过 Windows 启动器 `--window-timeout 20`
+或 `WindowsEnvironment(window_timeout_s=20)` 调整。还受任务总时间预算约束；
+`cancel_pending_wait()` 可中断等待，Studio 的停止按钮终止任务进程。
+轮询不会产生额外模型调用、决策步数或停滞计数。`framework_wait` 事件标记为不可训练，
+前端实时显示等待对象、耗时、上限、完成依据或超时原因。
+
+超时返回 `uncertain`，不会声称窗口打开成功；同一尚未确认的启动再次收到 Win+E 时只补查，
+不重复启动窗口。后续 Ctrl+L、输入、确认键等在派发前再次检查截图所对应窗口与当前前台窗口的
+句柄、进程身份和就绪状态；输入动作内部在点击与文字写入之间也再检查一次。
+焦点变化时拒绝继续输入并要求重新观察，不自动抢回用户焦点。系统输入和检查不是原子操作，
+需要完全隔离用户干扰的任务仍应部署到独立桌面会话/虚拟机。
+
+规划核查谓词区分 `app_open(app)`（窗口存在）、`app_foreground(app)`（窗口在前台）和
+`app_ready(app)`（前台窗口有响应）。窗口就绪不证明目录已加载、文件已改名或业务已完成，
+这些仍须后续步骤验收。Jev 9B 获得前台窗口与等待结果作为补充证据，不能替代系统检查。
+目前自动启动等待识别 Win+E 和定向切换应用，任意启动器点击、保存对话框等仍需补充各自触发条件。
+
+CDP 浏览器截图是当前视口，坐标与视口一致；桌面截图才覆盖所有显示器。
+后台浏览器使用虚拟输入，资源管理器等桌面操作会使用真实输入，前端会显示控制模式。
+浏览器任务重置只关闭框架拥有的 context，连接同一 CDP 服务不代表可以关闭其他 context 的页面。
 
 ### 截图、DOM 与弹窗
 

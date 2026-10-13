@@ -19,15 +19,15 @@ def normalize_verification(value):
         return [{"kind": "visual"}]
     if not isinstance(value, list) or not 1 <= len(value) <= 8:
         raise ValueError("verification 必须含 1~8 项核查条件")
-    allowed = {"visual", "url_equals", "url_host", "text_present", "app_open", "element_state", "download_complete", "download_valid"}
-    required = {"url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "element_state": "name", "download_complete": "check_id", "download_valid": "check_id"}
+    allowed = {"visual", "url_equals", "url_host", "text_present", "app_open", "app_foreground", "app_ready", "element_state", "download_complete", "download_valid"}
+    required = {"url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "app_foreground": "app", "app_ready": "app", "element_state": "name", "download_complete": "check_id", "download_valid": "check_id"}
     result = []
     for item in value:
         if not isinstance(item, dict) or item.get("kind") not in allowed:
             raise ValueError("未知的步骤 verification.kind")
         kind = item["kind"]
         key = required.get(kind)
-        if kind in {"url_equals", "url_host", "text_present", "app_open"} and "value" in item:
+        if kind in {"url_equals", "url_host", "text_present", "app_open", "app_foreground", "app_ready"} and "value" in item:
             alias = item["value"]
             if not isinstance(alias, str) or not alias.strip() or len(alias) > 1000:
                 raise ValueError(f"{kind}.value 别名需要非空字符串，对应规范字段 {key}")

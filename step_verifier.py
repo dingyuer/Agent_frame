@@ -39,6 +39,12 @@ def _url(value):
     return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path or "/", p.query, p.fragment))
 
 
+def unresolved_desktop_checks(report):
+    """A screenshot/model cannot supply missing OS input readiness evidence."""
+    return any(c.get('kind') in {'app_foreground', 'app_ready'} and c.get('status') != 'passed'
+               for c in report.get('checks', []))
+
+
 def code_review(step, obs, execution_info, contract):
     """All predicates are conjunctive. Unknown predicates require a visual reviewer."""
     checks = []
@@ -80,7 +86,7 @@ def code_review(step, obs, execution_info, contract):
                 if all(k in states for k in wanted):
                     status = "passed" if all(states[k] == v for k, v in wanted.items()) else "failed"
                     reason, evidence = "核对唯一匹配元素的实际状态", [json.dumps(states, ensure_ascii=False)]
-        elif kind == "app_open":
+        elif kind in {"app_open", "app_foreground", "app_ready"}:
             # Only adapter-supplied OS metadata counts; never page titles or policy text.
             runtime = info.get("runtime_state", {})
             apps = runtime.get("applications", [])
@@ -94,7 +100,17 @@ def code_review(step, obs, execution_info, contract):
             if windows and expected == 'explorer':
                 hits = [a for a in hits if a.get('class_name') in {'CabinetWClass', 'ExploreWClass'}]
             if hits:
-                status, reason, evidence = "passed", "操作系统报告应用窗口存在", [str(a.get("title", a["process_name"])) for a in hits[:3]]
+                evidence = [str(a.get("title", a["process_name"])) for a in hits[:3]]
+                if kind == 'app_open':
+                    status, reason = 'passed', '操作系统报告应用窗口存在'
+                elif kind == 'app_foreground':
+                    status = 'passed' if any(a.get('foreground') is True for a in hits) else 'failed' if all('foreground' in a for a in hits) else 'unknown'
+                    reason = '核对应用是否在前台'
+                elif windows:
+                    from .desktop_readiness import window_ready
+                    known = all(all(k in a and a[k] is not None for k in ('visible', 'foreground', 'minimized', 'cloaked', 'enabled', 'responsive', 'bounds', 'pid', 'hwnd')) for a in hits)
+                    status = 'passed' if any(window_ready(a) for a in hits) else 'failed' if known else 'unknown'
+                    reason = '核对前台窗口可接收输入；不代表窗口内容已加载或业务任务完成'
             elif runtime.get("complete") is True:
                 status, reason = "failed", "操作系统未观察到该应用窗口"
         item = {"kind": kind, "status": status, "reason": reason, "evidence": evidence}
@@ -124,7 +140,7 @@ class StepReviewer:
         self.calls = []
 
     def visual_review(self, task, step, obs, execution_info, code, *, remaining_s=None):
-        result = {"method": "model", "status": "unknown", "reason": "独立视觉核查模型不可用", "evidence": []}
+        result = {"method": "model", "status": "unknown", "reason": "独立视觉核查模型不可用", "evidence": [], "latency_ms": 0}
         if self.model is None:
             return result
         if obs is None or obs.screenshot is None or (obs.info or {}).get("screenshot_stale") or not getattr(self.model, "vision", True):
@@ -165,6 +181,7 @@ class StepReviewer:
             result.update(status=obj["status"], reason=obj["reason"][:1000], evidence=[s[:1000] for s in evidence[:8]])
         except Exception as exc:
             result.update(status="unknown", reason=f"独立核查失败：{type(exc).__name__}", error_type=type(exc).__name__)
+        result['latency_ms'] = round((time.monotonic() - started) * 1000, 2)
         call = copy.deepcopy(getattr(self.model, "last_call", {})) if messages else {}
         call.update(messages=copy.deepcopy(messages), response=raw, actor_role="verifier", policy_trainable=False,
                     provenance="sampled", review_step_id=step.get("id"), review_result=copy.deepcopy(result),

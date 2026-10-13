@@ -723,16 +723,8 @@ class BrowserSession:
         self._watch_contexts(browser)
         page = context.new_page()
         self._watch_page(page)
-        # 关闭 launch 时 --incognito 留下的初始 about:blank 页面（只关页面，不动上下文/浏览器，
-        # 避免出现两个浏览器窗口；之前关上下文会连带破坏 CDP 会话导致 TargetClosedError）
-        for other_context in list(browser.contexts):
-            if other_context is context:
-                continue
-            for other_page in list(other_context.pages):
-                try:
-                    other_page.close()
-                except Exception:  # noqa: BLE001  关闭孤儿窗口失败不影响任务
-                    pass
+        # Other contexts (even about:blank pages) are not ours. A CDP attachment
+        # does not authorize closing them; only _owned_context is cleaned above.
         self._task_page_id = self._target_info(page)["targetId"]
         self._page_target_ids[id(page)] = self._task_page_id
         profile = {"version": "blank-browser-v1", "viewport": size,

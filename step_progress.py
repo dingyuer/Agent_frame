@@ -1,6 +1,7 @@
 """Bounded progress monitoring for a plan step, independent of action spelling.
 
-Screenshots and operator self-reports cannot reset this monitor. This is a
+Screenshots and operator self-reports alone cannot reset this monitor.
+Independent visual-effect judgments receive only bounded exploration credit. This is a
 recovery signal, never a completion verdict or training reward.
 """
 from dataclasses import dataclass
@@ -114,6 +115,13 @@ class StepProgressMonitor:
                 if (novel_page or discovery) and self.explorations < self.config.exploration_allowance:
                     self.explorations += 1
                     evidence.append('发现新页面或滚动后新的结构内容（有界探索宽限）')
+            effect = review.get('action_effect', {})
+            fingerprint = effect.get('evidence_fingerprint')
+            if (successful and effect.get('method') == 'decision_model' and effect.get('status') == 'passed'
+                    and fingerprint and self.explorations < self.config.exploration_allowance
+                    and self._fresh(['judge_effect', fingerprint])):
+                self.explorations += 1
+                evidence.append('独立视觉核查认为动作取得进展（有界宽限，不作为完成证据）')
             self.idle = 0 if evidence else self.idle + 1
             if self.idle >= self.config.no_progress_limit:
                 status = 'stalled'

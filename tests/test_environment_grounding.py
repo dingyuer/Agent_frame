@@ -190,7 +190,7 @@ def test_windows_explicit_screen_coordinates_do_not_use_an_open_browser(monkeypa
     env._browser_session = SimpleNamespace(execute_viewport_action=lambda *a, **kw: pytest.fail("wrong space"))
     monkeypatch.setattr(env, "observe", lambda: Observation())
     monkeypatch.setattr(env, "_focus_is_browser", lambda: pytest.fail("focus probe"))
-    monkeypatch.setattr(windows_env, "to_pyautogui", lambda action: "pass")
+    monkeypatch.setattr(windows_env, "to_pyautogui", lambda action, **kwargs: "pass")
     result = env.step(Action("click", {"x": 10, "y": 20, "coordinate_space": "screen_pixels"}))
     assert result.info["channel"] == "desktop"
     assert result.info["dispatched"] is True
@@ -201,7 +201,7 @@ def test_windows_execution_error_is_reported(monkeypatch):
     env = WindowsEnvironment()
     env._observation_surface = "desktop"
     monkeypatch.setattr(env, "_build_observation", lambda: Observation())
-    monkeypatch.setattr(windows_env, "to_pyautogui", lambda action: "raise ValueError('execution failed')")
+    monkeypatch.setattr(windows_env, "to_pyautogui", lambda action, **kwargs: "raise ValueError('execution failed')")
     result = env.step(Action("click", {"x": 10, "y": 20, "coordinate_space": "screen_pixels"}))
     assert result.info["status"] == "failed"
     assert "execution failed" in result.info["error"]

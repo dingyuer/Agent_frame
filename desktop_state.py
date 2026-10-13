@@ -18,6 +18,11 @@ def windows_runtime_state():
         user.IsWindowVisible.argtypes = [wintypes.HWND]
         user.GetForegroundWindow.restype = wintypes.HWND
         user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        for name in ('IsIconic', 'IsWindowEnabled', 'IsHungAppWindow'):
+            getattr(user, name).argtypes = [wintypes.HWND]
+        dwm = ctypes.WinDLL('dwmapi', use_last_error=True)
+        dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
         foreground = user.GetForegroundWindow()
         user.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -47,8 +52,15 @@ def windows_runtime_state():
                     return True
                 class_name = ctypes.create_unicode_buffer(256)
                 user.GetClassNameW(hwnd, class_name, len(class_name))
+                rect, cloaked = wintypes.RECT(), wintypes.DWORD()
+                bounds = ([rect.left, rect.top, rect.right, rect.bottom]
+                          if user.GetWindowRect(hwnd, ctypes.byref(rect)) else None)
+                cloak_ok = dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0
                 apps.append({"process_name": os.path.basename(path.value), "pid": pid.value, "title": title.value,
-                             "hwnd": int(hwnd), "class_name": class_name.value, "foreground": hwnd == foreground})
+                             "hwnd": int(hwnd), "class_name": class_name.value, "foreground": hwnd == foreground,
+                             "bounds": bounds, "visible": True, "minimized": bool(user.IsIconic(hwnd)),
+                             "enabled": bool(user.IsWindowEnabled(hwnd)), "responsive": not bool(user.IsHungAppWindow(hwnd)),
+                             "cloaked": bool(cloaked.value) if cloak_ok else None})
             except Exception:
                 errors.append(True)
             finally:
@@ -145,6 +157,7 @@ def switch_windows_application(app_code):
     if not focused:
         return {**result, 'status': 'uncertain' if dispatched else 'rejected', 'dispatched': dispatched,
                 'error_code': 'foreground_not_confirmed',
+                'window': target,
                 'reason': '目标窗口未确认进入前台；请用任务栏或系统快捷键选择窗口，不能当成切换成功。'}
     return {**result, 'status': 'executed', 'dispatched': dispatched,
             'reason': '已确认目标应用窗口进入前台。', 'window': target}

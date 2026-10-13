@@ -120,6 +120,7 @@ verification 的 JSON 写法示例（仅示范字段，选择与本步目标相�
 - 打开准确网址：{{"kind":"url_equals","url":"https://arxiv.org/"}}
 - 出现完整可见文字：{{"kind":"text_present","text":"示例完整标题"}}
 - 打开应用：{{"kind":"app_open","app":"notepad"}}
+- 激活应用：{{"kind":"app_foreground","app":"explorer"}}；打开后需继续键盘操作：{{"kind":"app_ready","app":"explorer"}}。app_open 仅证明窗口存在；app_ready 证明前台窗口有响应，不代表目录或业务内容已加载。Win+E 后由框架等待窗口就绪，超时先重新观察/选择窗口，不能盲发 Ctrl+L 或重复启动。
 - 勾选指定控件：{{"kind":"element_state","name":"示例复选框","role":"checkbox","states":{{"checked":true}}}}
 - 需要核对截图语义：{{"kind":"visual"}}
 按示例写 host/url/text/app 等字段，不要统一写成 value；element_state 必须明确 name 与 states。

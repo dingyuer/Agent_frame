@@ -287,6 +287,7 @@
 </style>
 <link rel="stylesheet" href="/static/studio.css">
 <link rel="stylesheet" href="/static/studio-motion.css">
+<link rel="stylesheet" href="/static/jev.css">
 </head>
 <body>
   <svg class="icon-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -313,6 +314,7 @@
     <button class="navbtn" id="nav-history" title="虚拟机轨迹"><svg><use href="#i-folder"/></svg><span>虚拟机轨迹</span></button>
     <button class="navbtn" id="nav-debug" title="模型调试"><svg><use href="#i-sliders"/></svg><span>模型调试</span></button>
     <button class="navbtn" id="nav-chat" title="会话调试"><svg><use href="#i-chat"/></svg><span>会话调试</span></button>
+    <button class="navbtn" id="nav-jev" title="Jev 调试"><svg><use href="#i-sliders"/></svg><span>Jev 调试</span></button>
     <div class="sidebar-foot"><span class="sidebar-status-dot"></span><span>Observe. Act. Improve.<small>浏览器与 GUI Agent 工作空间</small></span></div>
   </aside>
   <header id="studio-header"><div class="breadcrumb">工作空间<span>/</span><strong id="studio-page-title">运行任务</strong></div><div class="header-right"><span class="header-label">Agent Frame Studio</span><span class="conn off" id="conn"><span class="led"></span><span id="conn-text">连接中…</span></span></div></header>
@@ -332,6 +334,41 @@
     <div class="item"><span class="label">最终结果</span><span class="value" id="st-result">—</span></div>
     <div class="item" style="margin-left: auto;"><button id="btn-interrupt" class="run-btn stop" style="margin-top:0;padding:6px 14px;font-size:12px;width:auto;display:none">⏹ 中断运行</button></div>
   </div>
+
+  <section id="view-jev" aria-label="Jev 模型调试">
+    <div class="scroll capture-scroll">
+      <div class="page-intro"><div><div class="eyebrow">SYSTEM ONE · DECISION 3.0</div><h1>让证据，给出答案。</h1><p>上传截图与文字，直接观察 Jev 的选择、评分与请求耗时。</p></div><span class="subtle-pill">JEV LAB</span></div>
+      <div class="jev-grid">
+        <section class="studio-card jev-form">
+          <div class="section-heading"><span class="section-index">01</span><div><h2>连接与问题</h2><p>独立调试，不启动任务或执行操作</p></div></div>
+          <label class="field-label" for="jev-model">部署模型</label><select id="jev-model"><option value="vllm-sr/d3-flash">d3-flash · 9B · 8007</option><option value="vllm-sr/d3">d3 · 27B · 8006</option></select>
+          <label class="field-label" for="jev-url">System One 服务地址</label><input id="jev-url" value="http://10.44.101.62:8007/v1/systemone">
+          <details class="inline-details"><summary>认证与等待</summary><label class="field-label" for="jev-key">API Key（仅本次使用，不保存）</label><input id="jev-key" type="password" autocomplete="off" placeholder="留空使用服务端 DECISION_JUDGE_API_KEY"><label class="field-label" for="jev-timeout">请求超时（秒）</label><input id="jev-timeout" type="number" min="1" max="600" value="120"></details>
+          <label class="field-label" for="jev-state">任务与背景</label><textarea id="jev-state" rows="4" placeholder="描述要判断的任务、动作前后状态，以及 AX / 文件 / 系统证据。"></textarea>
+          <label class="field-label" for="jev-question">要判断的问题</label><textarea id="jev-question" rows="2">根据截图和补充证据，任务完成状态属于哪一种？证据不足时选择 unknown。</textarea>
+          <div class="form-two"><div><label class="field-label" for="jev-type">问题类型</label><select id="jev-type"><option value="choice">choice · 单选</option><option value="noul">noul · 是否</option><option value="score">score · 评分</option></select></div><div><label class="field-label" for="jev-question-id">问题 ID</label><input id="jev-question-id" value="status"></div></div>
+          <div id="jev-criteria-field"><label class="field-label" for="jev-criteria">选项 / 等级（JSON）</label><textarea id="jev-criteria" rows="5" spellcheck="false"></textarea></div>
+          <details class="inline-details"><summary>多个问题（可选）</summary><textarea id="jev-questions" rows="5" spellcheck="false" placeholder="填写完整 questions JSON 时，将替代上面的单个问题。"></textarea><p class="field-tip">每个问题需要一次前向计算，多个问题会增加耗时。</p></details>
+          <div class="jev-actions"><button id="jev-probe" class="studio-btn secondary">检查服务与能力</button><button id="jev-send" class="studio-btn primary">发送给 Jev <svg><use href="#i-arrow"/></svg></button></div>
+        </section>
+        <div class="jev-right">
+          <section class="studio-card jev-media">
+            <div class="section-heading"><span class="section-index">02</span><div><h2>观察截图</h2><p>按上传顺序发送，建议依次提供动作前、动作后截图</p></div></div>
+            <label class="jev-upload" for="jev-images"><svg><use href="#i-capture"/></svg><strong>选择截图</strong><span>PNG / JPEG / WebP · 最多 4 张 · 每张 ≤ 9 MiB</span><input id="jev-images" type="file" accept="image/png,image/jpeg,image/webp" multiple></label>
+            <div id="jev-previews" class="jev-previews"></div><button id="jev-clear" class="studio-btn secondary" hidden>清空截图</button>
+            <p class="field-tip">可以只发送文字；文件下载与改名应附系统证据，过程截图不能证明文件已经落盘。</p>
+          </section>
+          <section class="studio-card jev-output" aria-live="polite">
+            <div class="section-heading"><span class="section-index">03</span><div><h2>评估结果</h2><p id="jev-timing">等待一次请求</p></div><span id="jev-status" class="subtle-pill">READY</span></div>
+            <div id="jev-error" class="capture-error" role="alert" hidden></div>
+            <div id="jev-results"><p class="field-tip">这里显示各选项分数、是否判断或有序评分。</p></div>
+            <details id="jev-raw-panel" class="inline-details" hidden><summary>原始响应与用量</summary><pre id="jev-raw"></pre></details>
+            <p class="field-tip">概率是未校准的模型评分，不代表真实成功率。请求耗时包含网络与服务端排队；模型名以响应为准。</p>
+          </section>
+        </div>
+      </div>
+    </div>
+  </section>
 
   <section id="view-collect" aria-label="SFT 人工示范采集">
     <div class="scroll capture-scroll">
@@ -404,11 +441,12 @@
           <details class="inline-details"><summary>认证与 Provider</summary><div class="run-row"><label>Provider</label><select id="run-model-provider"><option value="openai">OpenAI compatible</option><option value="anthropic">Anthropic</option><option value="vllm" selected>vLLM</option><option value="gemini">Gemini</option><option value="open_router">OpenRouter</option></select></div><div class="run-row"><label>API Key</label><input id="run-model-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
           <div class="model-section"><div class="model-label"><span class="model-dot muted"></span>定位模型<span>视觉回退 · 元素定位</span></div>
           <div class="run-row"><label for="run-ground">模型</label><select id="run-ground"></select></div><div class="run-row"><label for="run-ground-url">服务地址</label><input id="run-ground-url" value="http://7.246.80.189:8001/v1" placeholder="http://模型主机:端口/v1"></div><details class="inline-details"><summary>认证</summary><div class="run-row"><label>API Key</label><input id="run-ground-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
-          <details class="inline-details"><summary>Decision 3.0 评估器（可选）</summary>
-            <div class="run-row"><label for="judge-model">评估模型</label><select id="judge-model"><option value="">关闭</option><option value="vllm-sr/d3-flash">d3-flash · 9B</option><option value="vllm-sr/d3">d3 · 27B</option></select></div>
-            <div class="run-row"><label for="judge-url">服务地址</label><input id="judge-url" placeholder="http://评估模型主机:8899/v1"></div>
+          <details class="inline-details" open><summary>验证模型（代码核查优先）</summary>
+            <div class="run-row"><label for="judge-model">语义验证</label><select id="judge-model"><option value="">复用决策模型</option><option value="vllm-sr/d3-flash" selected>Jev · d3-flash · 9B（推荐）</option><option value="vllm-sr/d3">Jev · d3 · 27B</option></select></div>
+            <div class="run-row"><label for="judge-url">服务地址</label><input id="judge-url" value="http://10.44.101.62:8007/v1/systemone" placeholder="选择 Jev 后自动填入，可修改"></div>
             <div class="run-row"><label for="judge-revision">权重版本（可选）</label><input id="judge-revision" placeholder="部署版本或 commit，便于比较实验"></div>
-            <p class="field-tip">提供操作环境分类与步骤核查；判断不确定时回退独立审查。概率仅表示模型评分。</p>
+            <div class="form-two"><div class="run-row"><label for="judge-threshold">采信阈值</label><input id="judge-threshold" type="number" min="0.5" max="1" step="0.01" value="0.90"></div><div class="run-row"><label for="judge-margin">选项分差</label><input id="judge-margin" type="number" min="0" max="1" step="0.01" value="0.15"></div></div><div class="run-row"><label for="judge-timeout">Jev 超时（秒）</label><input id="judge-timeout" type="number" min="1" max="600" value="120"></div><p class="field-tip">默认使用 Jev 9B 核查步骤与最终语义要求。区分动作进展与子任务完成；代码失败不能被模型覆盖。认证使用服务端 DECISION_JUDGE_API_KEY。</p>
+            <label class="checkbox-row"><input id="judge-recheck" type="checkbox" checked>不确定时补充一次观察，仅在证据变化后复核</label>
           </details>
           <button id="btn-test" class="studio-btn secondary full-width">测试决策模型连接</button><div id="test-result" class="run-note" style="display:none"></div>
         </section>
@@ -592,7 +630,9 @@ function switchView(view) {
   const isLive = view === 'live';
   document.getElementById('view-collect').classList.toggle('active', view === 'collect');
   document.getElementById('nav-collect').classList.toggle('active', view === 'collect');
-  const titles = {run:'运行任务', live:'实时监控', collect:'SFT 采集', history:'虚拟机轨迹', local:'本机轨迹', debug:'模型调试', chat:'会话调试'};
+  document.getElementById('view-jev').classList.toggle('active', view === 'jev');
+  document.getElementById('nav-jev').classList.toggle('active', view === 'jev');
+  const titles = {jev:'Jev 调试', run:'运行任务', live:'实时监控', collect:'SFT 采集', history:'虚拟机轨迹', local:'本机轨迹', debug:'模型调试', chat:'会话调试'};
   document.getElementById('studio-page-title').textContent = titles[view] || '工作空间';
   document.body.dataset.view = view;
   if (view === 'collect' && window.CaptureStudio) window.CaptureStudio.open();
@@ -616,6 +656,7 @@ function switchView(view) {
   if (view === 'chat') initChatView();
   if (isRun) initRunView();
 }
+document.getElementById('nav-jev').addEventListener('click', () => switchView('jev'));
 document.getElementById('nav-collect').addEventListener('click', () => switchView('collect'));
 navLive.addEventListener('click', () => switchView('live'));
 navHistory.addEventListener('click', () => switchView('history'));
@@ -648,11 +689,12 @@ function renderStatus(s) {
     if (s.done) { statusState.done = true; setStatus('ended', '已结束（待评分）'); }
   } else if (s.event === 'step_verification') {
     const method = s.method === 'decision_model' ? 'Decision 3.0 核查' : s.method === 'model' ? '独立模型核查' : '代码核查';
-    setStatus('running', method + ' · ' + ({running:'进行中',passed:'通过',failed:'尚未完成',unknown:'证据不足'}[s.status] || ''));
+    setStatus('running', method + ' · ' + (s.step_outcome === 'progress' ? '动作有进展 · 子任务进行中' : ({running:'进行中',passed:'通过',failed:'尚未完成',unknown:'证据不足'}[s.status] || '')));
   } else if (s.event === 'decision_format_error') {
     setStatus('running', s.status === 'retry' ? '修正候选动作 · 尚未执行' : '候选动作未通过');
   } else if (s.event === 'framework_wait') {
-    setStatus('running', s.status === 'completed' ? '等待结束，正在验收' : s.status === 'timeout' ? '等待超时，交回决策' : s.reason === 'pdf_render' ? '等待 PDF 渲染 · 不消耗步数' : '等待下载 · 不消耗步数');
+    const waitStates = {completed:'等待结束，正在验收',timeout:'等待超时，交回决策',cancelled:'等待已取消',task_timeout:'任务时间预算已耗尽',failed:'等待失败，重新检查'};
+    setStatus('running', waitStates[s.status] || (s.reason === 'desktop_window' ? '等待窗口就绪 · 不消耗步数' : s.reason === 'pdf_render' ? '等待 PDF 渲染 · 不消耗步数' : '等待下载 · 不消耗步数'));
   } else if (s.event === 'framework_recovery') {
     setStatus(s.status === 'exhausted' ? 'failed' : 'running', s.status === 'requested' ? '正在重新规划' : s.status === 'replanned' ? '重新规划完成' : '恢复预算耗尽');
   } else if (s.event === 'executing') {
@@ -828,6 +870,13 @@ function modelCardHtml(payload) {
 // 框架等待：轮询期间只保留一张卡片原地刷新，不叠加多个「等待」框
 let activeWaitCard = null;
 function waitDetail(payload) {
+  if (payload.reason === 'desktop_window') {
+    const labels = {waiting:'等待窗口就绪',completed:'窗口已就绪',timeout:'窗口等待超时',cancelled:'窗口等待已取消',task_timeout:'任务时间预算已耗尽'};
+    return (payload.status === 'waiting' ? '<span class="spinner"></span> ' : '') +
+      '<strong>' + esc(labels[payload.status] || '核对窗口状态') + ' · ' + esc(payload.target || '') + '</strong>' +
+      '<p>已等待 ' + Number(payload.elapsed_s || 0).toFixed(1) + ' 秒 / 上限 ' + Number(payload.timeout_s || 0).toFixed(1) + ' 秒 · 不消耗决策步数</p>' +
+      '<p>' + esc(payload.detail || '') + '</p><small>依据：操作系统窗口及焦点状态</small>';
+  }
   if (payload.reason === 'pdf_render') {
     const labels = {completed:'PDF 内容已稳定显示，继续核查', timeout:'PDF 渲染等待超时，交回决策检查', interrupted:'页面或窗口已变化，重新观察', waiting:'等待 PDF 内容显示 · 不消耗步数'};
     return esc(labels[payload.status] || '检查 PDF 渲染状态') + ' · ' + Math.round(Number(payload.elapsed_s) || 0) + ' 秒';
@@ -851,9 +900,27 @@ function updateWaitCard(tl, payload) {
     if (prompt) prompt.innerHTML = waitDetail(payload);
     if (timeEl) timeEl.textContent = new Date(payload.ts * 1000).toLocaleTimeString();
   }
-  if (['completed', 'failed', 'timeout', 'interrupted'].includes(payload.status)) {
+  if (['completed', 'failed', 'timeout', 'interrupted', 'cancelled', 'task_timeout'].includes(payload.status)) {
     activeWaitCard = null;
   }
+}
+
+function judgeEvidenceDetail(report) {
+  const status = {passed:'动作取得效果',failed:'动作效果未确认或执行失败',pending:'系统仍在处理',unknown:'动作效果证据不足'};
+  let html = '';
+  if (report.action_effect) {
+    const effect = report.action_effect;
+    html += '<p class="review-effect"><strong>动作效果：</strong>' + esc(status[effect.status] || '不确定') +
+      '（' + (effect.method === 'code' ? '代码' : 'Jev') + '） · ' + esc(effect.reason || '') + '</p>';
+  }
+  if (report.step_outcome === 'progress') html += '<p>子任务仍在进行，继续剩余操作。</p>';
+  if (report.recheck) html += '<p class="review-recheck">补证：' + esc(report.recheck.reason || '') + '</p>';
+  const selection = report.evidence_selection?.after;
+  if (selection) html += '<p>本次证据：AX ' + Number(selection.nodes_selected) + ' / ' + Number(selection.nodes_total) +
+    ' 个节点 · 文件 ' + Number(selection.artifacts_selected) + ' / ' + Number(selection.artifacts_total) + '</p>';
+  if (report.checkpoint_ids?.length) html += '<p>历史检查点：' + report.checkpoint_ids.map(x => esc(x)).join('、') + '（历史证据）</p>';
+  if (Number.isFinite(report.model_latency_ms)) html += '<p>模型请求累计 ' + Number(report.model_latency_ms).toFixed(0) + ' ms（总耗时另含补充观察）</p>';
+  return html;
 }
 
 function reviewCardHtml(report) {
@@ -863,10 +930,12 @@ function reviewCardHtml(report) {
   const evidence = (report.evidence || []).map(e => '<li>' + esc(String(e)) + '</li>').join('');
   return '<div class="card review-card review-' + state + '" data-kind="review">' +
     '<div class="card-head"><span class="tag status">' + method + '</span><span class="review-state">' +
-    (state === 'running' ? '<span class="spinner"></span> ' : '') + labels[state] + '</span>' +
+    (state === 'running' ? '<span class="spinner"></span> ' : '') + (report.step_outcome === 'progress' ? '子任务进行中' : labels[state]) + '</span>' +
+    (Number.isFinite(report.latency_ms) ? '<span class="review-duration">耗时 ' + Number(report.latency_ms).toFixed(0) + ' ms</span>' : '') +
     '<span class="step">动作 ' + esc(String(report.decision_step ?? '—')) + ' · ' + esc(report.plan_step_id || '') + '</span></div>' +
     '<div class="card-body"><div class="texts"><strong>' + esc(report.goal || '') + '</strong><p>' + esc(report.reason || '') +
     '</p>' + (evidence ? '<ul class="review-evidence">' + evidence + '</ul>' : '') +
+    judgeEvidenceDetail(report) +
     (report.judgment ? judgmentDetail(report.judgment) : '') +
     '<small class="review-note">步骤状态由框架维护 · 核查不消耗操作步数</small></div></div></div>';
 }
@@ -918,13 +987,13 @@ function updateDiagnosticCard(container, payload) {
 function judgmentDetail(judgment) {
   const questions = {task_type:'任务环境',surface:'当前操作表面',step:'子任务完成',effect:'动作效果'};
   const labels = {browser:'网页任务',desktop:'桌面界面',mixed:'网页与桌面混合',unknown:'不确定',
-    browser_content:'网页内容',browser_chrome:'浏览器工具栏或系统对话框',passed:'达到预期',failed:'尚未达到',pending:'可能仍在进行'};
+    browser_content:'网页内容',browser_chrome:'浏览器工具栏或系统对话框',passed:'达到预期',failed:'尚未达到',progress:'动作有进展，子任务未完成',pending:'可能仍在进行'};
   const answers = Object.entries(judgment.answers || {}).map(([key,value]) => '<li>' + esc(questions[key] || key) + '：' +
     esc(labels[value.label] || value.label || '不确定') + ' · 最高选项 ' + Number((value.confidence || 0)*100).toFixed(1) + '%' +
     '<small> ' + Object.entries(value.probabilities || {}).map(([label,p]) => esc(labels[label] || label) + ' ' + Number(p*100).toFixed(1) + '%').join(' / ') + '</small></li>').join('');
   return '<p>' + esc(judgment.model || '') + ' · ' + Number(judgment.latency_ms || 0).toFixed(0) + ' ms' +
     (judgment.model_version || judgment.revision ? ' · ' + esc(judgment.model_version || judgment.revision) : '') + '</p>' +
-    (answers ? '<ul class="review-evidence">' + answers + '</ul>' : '<p>评估器未给出有效判断，采用现有审查流程。</p>');
+    (answers ? '<ul class="review-evidence">' + answers + '</ul>' : '<p>评估器未给出有效判断，保留不确定。</p>');
 }
 
 function statusCardHtml(payload) {
@@ -943,6 +1012,8 @@ function statusCardHtml(payload) {
   else if (payload.event === 'workspace_ready') detail = '<strong>本次任务默认操作目录</strong><br>' + esc((payload.workspace || {}).workspace_dir || '') + '<br>下载、查找和改名默认使用此目录。';
   else if (payload.event === 'control_mode') detail = payload.mode === 'desktop_takeover' ? '<strong>桌面接管模式</strong><br>观察整个虚拟桌面；操作会使用真实鼠标键盘。' : '<strong>后台浏览器模式</strong><br>CDP 页面截图与虚拟输入，不操作用户鼠标键盘。';
   else if (payload.event === 'operation_feedback') detail = '<strong>系统观察反馈</strong><br>' + (payload.facts || []).map(x => esc(x)).join('<br>');
+  else if (payload.event === 'judge_recheck') detail = '<strong>Jev 补充观察 / 复核</strong><br>' + esc(payload.reason || '') + '<br>' + esc(payload.plan_step_id || '');
+  else if (payload.event === 'judge_checkpoint') detail = '<strong>已保存验收检查点</strong><br>' + esc(payload.checkpoint?.goal || '') + '<br>' + esc(payload.reason || '');
   else if (payload.event === 'decision_judgment') detail = '<strong>Decision 任务环境分类</strong>' + judgmentDetail(payload.judgment || {});
   else if (payload.event === 'decision_format_error') detail = '本次候选动作尚未执行：' + esc(payload.reason || '') + (payload.status === 'retry' ? '；正在修正候选动作。' : '；候选动作重试已结束。');
   else if (payload.event === 'framework_recovery') detail = esc(({requested:'当前路径受阻，正在重新规划',replanned:'重新规划完成，继续执行',exhausted:'恢复预算耗尽，停止执行'})[payload.status] || '恢复执行路径');
@@ -1341,8 +1412,10 @@ function decisionJudgeConfig() {
   const model = document.getElementById('judge-model').value;
   if (!model) return {};
   const url = document.getElementById('judge-url').value.trim();
-  if (!url) { alert('请填写 Decision 评估器服务地址，或选择关闭。'); return null; }
-  return {model, url, revision: document.getElementById('judge-revision').value.trim()};
+  if (!url) { alert('请填写 Jev 服务地址，或选择复用决策模型。'); return null; }
+  return {model, url, review_mode:'exclusive', revision: document.getElementById('judge-revision').value.trim(),
+    threshold:Number(document.getElementById('judge-threshold').value), margin:Number(document.getElementById('judge-margin').value),
+    timeout:Number(document.getElementById('judge-timeout').value), recheck_unknown:document.getElementById('judge-recheck').checked};
 }
 document.getElementById('btn-start').addEventListener('click', () => {
   const judge = decisionJudgeConfig(); if (judge === null) return;
@@ -2304,6 +2377,7 @@ setInterval(poll, 2000);
 // 初始加载时切换到运行配置视图（正确隐藏状态栏 + 加载任务列表）
 switchView('run');
 </script>
+<script src="/static/jev.js"></script>
 <script src="/static/capture.js"></script>
 <script src="/static/studio-motion.js"></script>
 </body>

@@ -44,11 +44,12 @@ from .verifiers import CompletionVerifier
 from .task_specs import task_profile, task_analysis, audit_requirement_proposals, TASK_ANALYSIS_VERSION
 from .step_progress import ProgressConfig, StepProgressMonitor
 from .model.decision_judge import DecisionJudge, DecisionJudgeConfig
+from .judge_evidence import effect_review, evidence_fingerprint, checkpoint, target_identity
 from .paper_workflow import PaperWorkflow, WORKFLOW_VERSION, binding_group_hash
 from .paper_resolver import ADAPTER_VERSION
 from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS, compile_download_milestones
 from .decision_context import action_scope, scoped_system, selected_memory, current_brief
-from .step_verifier import StepReviewer, code_review, make_review_model
+from .step_verifier import StepReviewer, code_review, make_review_model, unresolved_desktop_checks
 from .actions import BASIC_ACTIONS
 from .browser_feedback import active_paper, paper_action_error, operational_facts, exposed_nodes, paper_review_error
 from .visual_readiness import is_pdf_observation, content_thumbnail, stable_content
@@ -167,6 +168,8 @@ class StepState:
     control_mode: str = ''
     consumed_downloads: set = field(default_factory=set)
     operation_facts: List[str] = field(default_factory=list)
+    judge_rechecks: set = field(default_factory=set)
+    judge_checkpoints: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -309,7 +312,7 @@ class Pipeline:
         root = Path(__file__).resolve().parent
         source_hash = hashlib.sha256()
         for name in ("pipeline.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
-                     "execution_queue.py", "step_verifier.py", "step_progress.py", "decision_context.py", "browser_feedback.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py", "desktop_capture.py", "windows_text.py",
+                     "execution_queue.py", "judge_evidence.py", "step_verifier.py", "step_progress.py", "decision_context.py", "browser_feedback.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py", "desktop_readiness.py", "desktop_capture.py", "windows_text.py",
                      "adapters/windows_env.py", "adapters/vmware_env.py", "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
             source_hash.update(name.encode())
             source_hash.update((root / name).read_bytes())
@@ -333,7 +336,7 @@ class Pipeline:
                    "decision_judge": self.decision_judge.config.public() if self.decision_judge else None,
                    "paper_resolver_version": ADAPTER_VERSION, "paper_workflow_version": WORKFLOW_VERSION,
                    "enable_reflection": self.enable_reflection, "verifier_model": model_record(self.verifier_model),
-                   "decision_context_version": "current_step_brief_v2", "max_plan_steps": MAX_PLAN_STEPS, "step_verifier_version": "1.0",
+                   "decision_context_version": "current_step_brief_v2", "max_plan_steps": MAX_PLAN_STEPS, "step_verifier_version": "1.1", "judge_evidence_version": "9b_v1",
                    "decision_model": model_record(self.model), "planner_model": model_record(self.planner_model)}
         manifest["runtime_config"] = runtime
         manifest["runtime_config_hash"] = hashlib.sha256(
@@ -832,7 +835,7 @@ class Pipeline:
             return step_result
         self._emit("grounding", actor_role="grounder", source="frozen_model", observation_id="recovery",
                    resolved_action=self._compact_action(visual), policy_trainable=False)
-        recovered = self.env.step(visual)
+        recovered = self._step_environment(visual)
         self._emit("execution_attempt", action=self._compact_action(visual), execution_info=recovered.info,
                    policy_trainable=False)
         recovered.info = dict(recovered.info or {})
@@ -842,6 +845,13 @@ class Pipeline:
         state.resolved_action = visual
         state.last_grounding_coord = self._coordinate_of(visual)
         return recovered
+
+    def _step_environment(self, action):
+        context = getattr(self.env, 'framework_wait_context', None)
+        if not callable(context):
+            return self.env.step(action)
+        with context(lambda event: self._publish_diagnostic('framework_wait', **event), self._task_time_remaining):
+            return self.env.step(action)
 
     def execute(self, action: Action, state: StepState) -> Execution:
         name = action.action
@@ -897,7 +907,7 @@ class Pipeline:
                 except Exception as exc:
                     return Execution(kind="browser", obs=self._observe(), info={"status": "failed", "error_code": "source_unavailable"},
                                      outcome=f"页面源码读取失败：{type(exc).__name__}")
-            step_result = self.env.step(action)
+            step_result = self._step_environment(action)
             result = json.dumps(step_result.info or {}, ensure_ascii=False)
             state.browser_result = result
             return Execution(kind="browser", executed=f"浏览器: {name}",
@@ -915,7 +925,7 @@ class Pipeline:
 
         # Basic GUI action, after coordinate resolution.
         try:
-            step_result = self.env.step(action)
+            step_result = self._step_environment(action)
         except Exception as exc:  # noqa: BLE001
             return Execution(kind=kind, executed=self._compact_action(action),
                              outcome=f"执行异常: {exc}", obs=self._observe(),
@@ -1375,7 +1385,8 @@ class Pipeline:
         elif state.recovery and execution.info.get("status") == "executed":
             state.recovery["status"] = "reobserve_original_target"
         self._update_plan_progress(state, execution, before_observation=before_observation,
-                                   expected_effect=decision.expected_effect)
+                                   expected_effect=decision.expected_effect, action=decision.action)
+        execution.obs = state.obs
         result.trajectory[-1]["step_verification"] = copy.deepcopy(state.step_review)
         result.trajectory[-1]["execution_queue"] = state.queue.snapshot() if state.queue else {}
         # 6.5) 单步动作有效性校验：env 动作执行后屏幕无变化 → 当场提示换策略
@@ -1413,7 +1424,7 @@ class Pipeline:
                 result.termination_reason = "evaluation_requested"
                 result.final_answer = execution.answer
                 should_break = True
-            elif not self.completion.spec.get("checks") and self.verifier_model is None:
+            elif not self.completion.spec.get("checks") and self.verifier_model is None and self.decision_judge is None:
                 result.termination_reason = "completion_unverifiable"
                 result.final_answer = "执行结束，但系统尚未验证任务完成。模型答复：" + execution.answer
                 should_break = True
@@ -1672,18 +1683,111 @@ class Pipeline:
             self.reviewer.calls.append(call)
             self._record_call(call, 'verifier')
 
+    def _code_step_review(self, state, step, execution_info, allow_contract=True):
+        started = time.monotonic()
+        public = self.completion.public_report(state.verification)
+        public['download_progress'] = self.completion.download_progress()
+        public['download_transfers'] = self.completion.download_transfers(state.consumed_downloads)
+        report = code_review(step, state.obs, execution_info, public)
+        error = paper_review_error(state.obs, self.completion, public, step)
+        if error and report.get('source') != 'download_artifact_milestone':
+            report = {'method': 'code', 'status': 'failed', 'reason': error, 'evidence': [error],
+                      'checks': [*report.get('checks', []), {'kind': 'paper_identity', 'status': 'failed', 'reason': error}]}
+        if allow_contract and state.verification.get('status') == 'passed':
+            report = {'method': 'code', 'status': 'passed', 'reason': '整项任务的全部确定性验收条件已满足',
+                      'evidence': ['completion_contract'], 'checks': report.get('checks', [])}
+        report['latency_ms'] = round((time.monotonic() - started) * 1000, 2)
+        return report, public
+
+    def _recheck_jev(self, state, step, execution_info, code, typed, before, identity):
+        """One observation per subtask, and one additional call only on new evidence."""
+        config = self.decision_judge.config
+        if (not config.recheck_unknown or typed.get('status') != 'unknown'
+                or typed.get('step_outcome') == 'progress'
+                or typed.get('action_effect', {}).get('status') == 'passed'
+                or typed.get('judgment', {}).get('error_type')):
+            return typed
+        key = step.get('id', 'final')
+        if key in state.judge_rechecks:
+            typed['recheck'] = {'status': 'budget_exhausted', 'reason': '本子任务已经补充观察过，继续由执行器恢复或重规划'}
+            return typed
+        if self._task_time_remaining() <= 0 or (getattr(state.obs, 'info', None) or {}).get('pending_downloads'):
+            return typed
+        state.judge_rechecks.add(key)
+        started = time.monotonic()
+        previous = evidence_fingerprint(state.obs, step, execution_info)
+        self._publish_diagnostic('judge_recheck', status='observing', plan_step_id=key,
+                                 reason='Jev 证据不足，框架补充一次观察；不执行操作、不消耗决策步数')
+        fresh = self._observe()
+        state.obs = fresh
+        self.completion.observe(fresh)
+        state.verification = self.completion.evaluate()
+        self._emit('observation', observation_id=f'jev_recheck:{identity["review_id"]}',
+                   observation=self._observation_record(fresh, f'jev_recheck:{identity["review_id"]}'), policy_trainable=False)
+        result = typed
+        retry_status, reason = 'unavailable', '补充观察缺少有效截图，保留不确定'
+        if fresh.screenshot is not None and not (fresh.info or {}).get('screenshot_stale'):
+            if step.get('id') in {'whole_task', 'final'}:
+                public = self.completion.public_report(state.verification)
+                hard_block = not self._model_review_allowed(state.verification)
+                refreshed = {'method': 'code', 'status': state.verification.get('status', 'unknown'),
+                             'reason': public.get('reason', '重新检查当前确定性条件'), 'checks': public.get('checks', []),
+                             'evidence': ['fresh_completion_contract']}
+            else:
+                refreshed, _ = self._code_step_review(state, step, execution_info)
+                hard_block = refreshed['status'] == 'failed' or unresolved_desktop_checks(refreshed) or any(
+                    p.get('kind') in {'download_complete', 'download_valid'} for p in step.get('verification', []))
+            if hard_block or refreshed['status'] == 'passed':
+                result = {**refreshed, 'prior_judgment': typed.get('judgment')}
+                retry_status, reason = 'code_resolved', '补充观察后由代码核查裁定，不再调用 Jev'
+            elif (fresh.info or {}).get('pending_downloads'):
+                retry_status, reason = 'pending', '系统报告真实待处理下载，交回框架等待'
+            elif self._task_time_remaining() <= 0:
+                retry_status, reason = 'deadline', '任务时间已用尽，不再调用 Jev'
+            elif evidence_fingerprint(fresh, step, execution_info) == previous:
+                retry_status, reason = 'unchanged', '没有新的观察证据，跳过重复模型请求'
+            else:
+                result = self.decision_judge.review(state.task, step, before, fresh, execution_info, refreshed,
+                    remaining_s=self._task_time_remaining(), checkpoints=state.judge_checkpoints)
+                self._record_typed_judge()
+                retry_status, reason = 'reviewed', '已根据新证据复核一次；仍不确定时交回执行器恢复'
+        result['recheck'] = {'status': retry_status, 'reason': reason, 'observation_count': 1,
+                             'model_calls': int(retry_status == 'reviewed')}
+        result['model_latency_ms'] = round(typed.get('latency_ms', 0) +
+            (result.get('latency_ms', 0) if retry_status == 'reviewed' else 0), 2)
+        result['latency_ms'] = round(typed.get('latency_ms', 0) + (time.monotonic()-started)*1000, 2)
+        self._publish_diagnostic('judge_recheck', plan_step_id=key, **result['recheck'])
+        return result
+
+    def _remember_judge_checkpoint(self, state, step, report):
+        if not self.decision_judge:
+            return
+        item = checkpoint(state.obs, step, report, state.step_id)
+        if item is None:
+            return
+        state.judge_checkpoints = [c for c in state.judge_checkpoints if c['id'].split(':a')[0] != step['id']]
+        state.judge_checkpoints.append(item)
+        state.judge_checkpoints[:] = state.judge_checkpoints[-4:]
+        self._publish_diagnostic('judge_checkpoint', checkpoint={k: item[k] for k in ('id', 'goal', 'decision_step', 'sha256')},
+                                 reason='保存阶段观察作为最终核查的历史证据；不替代当前系统验收')
+
     def _review_visual(self, state, step, execution_info, code, identity, before=None):
-        # Typed evaluator handles local effects/step checks. Whole-task semantic
-        # review keeps the independent reviewer and all hard completion gates.
+        # Explicit Jev selection covers both step and final semantic review.
+        # Unknown stays unknown; deterministic gates are enforced by callers.
+        if unresolved_desktop_checks(code):
+            return {**identity, **code}
         typed = None
-        if self.decision_judge and step.get('id') not in {'whole_task', 'final'}:
+        exclusive = self.decision_judge and self.decision_judge.config.review_mode == 'exclusive'
+        if self.decision_judge and (exclusive or step.get('id') not in {'whole_task', 'final'}):
             self._publish_review({**identity, 'method': 'decision_model', 'status': 'running', 'reason': 'Decision 评估器正在核查动作前后证据'})
             typed = self.decision_judge.review(state.task, step, before, state.obs, execution_info, code,
-                                               remaining_s=self._task_time_remaining())
+                                               remaining_s=self._task_time_remaining(), checkpoints=state.judge_checkpoints)
             self._record_typed_judge()
+            if exclusive:
+                typed = self._recheck_jev(state, step, execution_info, code, typed, before, identity)
             self._publish_review({**identity, **typed})
             state.routing_hint['surface'] = typed.get('judgment', {}).get('answers', {}).get('surface', {})
-            if typed['status'] in {'passed', 'failed'}:
+            if exclusive or typed['status'] in {'passed', 'failed'}:
                 return {**identity, **typed}
         self._publish_review({**identity, "method": "model", "status": "running", "reason": "独立核查截图与补充证据"})
         previous = len(self.reviewer.calls)
@@ -1694,10 +1798,11 @@ class Pipeline:
         report = {**identity, **report}
         if typed:
             report['decision_judgment'] = typed
+            report['latency_ms'] = round(report.get('latency_ms', 0) + typed.get('latency_ms', 0), 2)
         self._publish_review(report)
         return report
 
-    def _update_plan_progress(self, state: StepState, execution: Execution, before_observation=None, expected_effect='') -> None:
+    def _update_plan_progress(self, state: StepState, execution: Execution, before_observation=None, expected_effect='', action=None) -> None:
         """Review after each action, then advance exactly one queue entry on evidence."""
         state.finish_feedback = ""
         step = state.queue.current if state.queue else None
@@ -1707,39 +1812,37 @@ class Pipeline:
         identity = {"review_id": f"{self.run_id}:a{state.step_id}:{step['id']}",
                     "plan_step_id": step["id"], "goal": step["goal"], "decision_step": state.step_id}
         self._publish_review({**identity, "method": "code", "status": "running", "reason": "检查当前步骤的系统证据"})
-        public_report = self.completion.public_report(state.verification)
-        public_report['download_progress'] = self.completion.download_progress()
-        public_report['download_transfers'] = self.completion.download_transfers(state.consumed_downloads)
-        report = code_review(step, state.obs, execution.info, public_report)
-        identity_error = paper_review_error(state.obs, self.completion, public_report, step)
-        if identity_error and report.get('source') != 'download_artifact_milestone':
-            report = {"method": "code", "status": "failed", "reason": identity_error,
-                      "evidence": [identity_error], "checks": [*report.get("checks", []),
-                      {"kind": "paper_identity", "status": "failed", "reason": identity_error, "evidence": [identity_error]}]}
-        # A complete trusted task contract is stronger than intermediate plan milestones.
-        if state.verification.get("status") == "passed" and execution.kind != "terminal":
-            report = {"method": "code", "status": "passed", "reason": "整项任务的全部确定性验收条件已满足",
-                      "evidence": ["completion_contract"], "checks": report.get("checks", [])}
-        report = {**identity, **report}
+        report, public_report = self._code_step_review(state, step, execution.info, allow_contract=execution.kind != 'terminal')
+        review_execution = {k: execution.info[k] for k in ('status', 'error_code', 'action', 'dispatched') if k in execution.info}
+        if action is not None:
+            review_execution['action'] = action.action
+            review_execution['args'] = {k: copy.deepcopy(action.args[k]) for k in (
+                'target', 'target_ref', 'element_id', 'text', 'url', 'key', 'keys', 'option') if k in action.args}
+        review_execution['target_node'] = target_identity(before_observation, review_execution.get('args') or {})
+        review_execution['expected_effect'] = expected_effect
+        effect = effect_review(before_observation, state.obs, review_execution)
+        report = {**identity, **report, 'action_effect': effect}
         self._publish_review(report)
         code_checks = copy.deepcopy(report.get('checks', []))
         if (report["status"] == "unknown" and execution.kind not in {"terminal", "deadline"}
                 and not (state.obs.info if state.obs else {}).get("pending_downloads")
                 and execution.info.get("status") not in {"pending", "in_progress"}
                 and not any(p.get("kind") in {'download_complete', 'download_valid'} for p in step.get("verification", []))):
-            review_execution = {k: execution.info[k] for k in ('status', 'error_code', 'action') if k in execution.info}
-            review_execution['expected_effect'] = expected_effect
             paper = active_paper(self.completion, step)
             if paper:
                 report['bound_paper'] = {k: paper['binding'][k]
                                                     for k in ('full_title', 'canonical_id', 'pdf_url')}
             report = self._review_visual(state, step, review_execution, report, identity, before=before_observation)
-        report['code_checks'] = code_checks
+        report.setdefault('action_effect', effect)
+        if report['action_effect'].get('method') == 'decision_model' and report['action_effect'].get('status') == 'passed':
+            report['action_effect']['evidence_fingerprint'] = evidence_fingerprint(state.obs, step, review_execution)
+        report['code_checks'] = copy.deepcopy(report.get('checks', code_checks))
         state.step_review = report
         if state.queue:
             advanced = state.queue.accept_review(report)
             state.queue.sync_memory(state.memory)
             if advanced:
+                self._remember_judge_checkpoint(state, step, report)
                 self._clear_stall(state)
                 for check in report.get('checks', []):
                     state.consumed_downloads.update(check.get('artifact_ids', []))
@@ -1989,7 +2092,7 @@ class Pipeline:
                 "checks": self.completion.public_report(report).get("checks", [])}
         self._publish_review(code)
         reviewed = self._review_visual(state, step, {}, code, identity)
-        self._model_final_report = reviewed if reviewed["status"] == "passed" else None
+        self._model_final_report = reviewed if reviewed["status"] == "passed" and reviewed.get("method") != "code" else None
         self._reviewed_state = state
         self._reviewed_observation = self._review_fingerprint(state.obs)
         return reviewed["status"] == "passed", reviewed["reason"]

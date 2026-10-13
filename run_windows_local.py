@@ -304,6 +304,7 @@ def main() -> int:
     parser.add_argument("--operation-timeout", type=float, default=300, help="下载等操作等待上限（秒），自动等待不消耗决策步数")
     parser.add_argument("--download-max-mib", type=int, default=50, help="单个下载的资源上限（MiB），0 表示不限大小；不用于论文身份判断")
     parser.add_argument("--task-timeout", type=float, default=1800, help="任务总时间预算（秒）")
+    parser.add_argument("--window-timeout", type=float, default=15, help="桌面目标窗口就绪等待上限（秒），轮询不消耗决策步数")
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
@@ -355,7 +356,7 @@ def main() -> int:
 
         # 3) 环境
         env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
-                                 downloads_dir=args.download_dir)
+                                 downloads_dir=args.download_dir, window_timeout_s=args.window_timeout)
 
         # 4) 组装 + 跑，保留 1010 的规划流水线
         agent = Agent(decision_model=model, grounding=grounding, env=env,

@@ -96,6 +96,9 @@ def current_brief(state, public_checks=(), operation_facts=()):
             parts.append('当前子任务尚未通过核查：' + short_text(review.get('reason'), 180))
     if parts:
         lines.append('系统反馈：' + '；'.join(parts))
+    effect = review.get('action_effect', {})
+    if review.get('status') != 'passed' and effect.get('status') == 'passed':
+        lines.append('动作反馈：上次动作已取得局部效果，子任务尚未完成；继续剩余操作，勿仅因未通过子任务核查而重复上次动作。')
     if state.finish_feedback:
         lines.append('整项任务尚未通过：' + short_text(state.finish_feedback, 200))
     if state.recovery.get('status') == 'resolve_obstruction':

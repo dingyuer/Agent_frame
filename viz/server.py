@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 app = FastAPI(title="osworld_agent Viz")
+from .jev_debug import router as jev_router
+app.include_router(jev_router)
 
 # ---- 配置（环境变量覆盖）----
 _PKG = Path(__file__).resolve().parent.parent          # osworld_agent 包目录
@@ -574,7 +576,8 @@ def _judge_cli_args(cfg):
     if not value.url:
         return []
     return ['--judge-url', value.url, '--judge-model', value.model, '--judge-revision', value.revision,
-            '--judge-threshold', str(value.threshold), '--judge-margin', str(value.margin), '--judge-timeout', str(value.timeout)]
+            '--judge-threshold', str(value.threshold), '--judge-margin', str(value.margin), '--judge-timeout', str(value.timeout),
+            '--judge-review-mode', value.review_mode] + ([] if value.recheck_unknown else ['--judge-no-recheck'])
 
 
 @app.post("/run/start")
