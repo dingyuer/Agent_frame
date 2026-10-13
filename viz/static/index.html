@@ -288,6 +288,7 @@
 <link rel="stylesheet" href="/static/studio.css">
 <link rel="stylesheet" href="/static/studio-motion.css">
 <link rel="stylesheet" href="/static/jev.css">
+<link rel="stylesheet" href="/static/jev-demo.css">
 </head>
 <body>
   <svg class="icon-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -307,6 +308,7 @@
     <a class="brand" href="#run" aria-label="Agent Frame 工作台"><span class="brand-mark"><svg><use href="#i-grid"/></svg></span><span>Agent Frame<small>STUDIO</small></span></a>
     <div class="nav-section-label">工作空间</div>
     <button class="navbtn active" id="nav-run" title="运行任务"><svg><use href="#i-play"/></svg><span>运行任务</span></button>
+    <button class="navbtn" id="nav-jev-demo" title="Jev 汇报演示"><svg><use href="#i-pulse"/></svg><span>Jev 汇报演示</span><span class="nav-chip">LIVE</span></button>
     <button class="navbtn" id="nav-live" title="实时监控"><svg><use href="#i-pulse"/></svg><span>实时监控</span></button>
     <button class="navbtn" id="nav-collect" title="SFT 采集"><svg><use href="#i-capture"/></svg><span>SFT 采集</span><span class="nav-chip">NEW</span></button>
     <div class="nav-section-label">轨迹与调试</div>
@@ -334,6 +336,20 @@
     <div class="item"><span class="label">最终结果</span><span class="value" id="st-result">—</span></div>
     <div class="item" style="margin-left: auto;"><button id="btn-interrupt" class="run-btn stop" style="margin-top:0;padding:6px 14px;font-size:12px;width:auto;display:none">⏹ 中断运行</button></div>
   </div>
+
+  <section id="view-jev-demo" aria-label="Jev 汇报演示">
+    <div class="jd-wrap">
+      <header class="jd-hero"><div><span class="jd-eyebrow">AGENT FRAME × JEV / SYSTEM ONE</span><h1>每一次行动，<br>都有证据回应。</h1><p>让 9B 评估器看懂动作前后。<br>把判断交给 Jev，把执行与确定性验收留给框架。</p></div><div class="jd-orbit" aria-hidden="true"><div class="jd-orbit-inner"><span>JEV</span><strong>9B</strong><small>OBSERVE → VERIFY</small></div><i></i><b></b></div></header>
+      <div class="jd-controls"><div class="jd-buttons"><button id="jd-live" class="studio-btn">▶ 一键现场演示</button><button id="jd-replay" class="studio-btn secondary">▷ 离线剧本演示</button><button id="jd-stop" class="studio-btn secondary" disabled>停止</button><button id="jd-fullscreen" class="studio-btn secondary">全屏汇报</button><button id="jd-export" class="studio-btn secondary" disabled>导出本场结果</button></div><span id="jd-mode" class="jd-mode">待开始</span></div>
+      <div class="jd-disclosure" id="jd-disclosure">场景与候选动作由失败报告改编，均为合成演示材料。现场模式调用真实 Jev；离线模式仅讲解流程，不提供实测模型耗时。此演示不执行下载，不代表真实任务已跑通。</div>
+      <details class="jd-config"><summary>连接设置 · 默认 d3-flash 9B / 8007</summary><div><label>System One 地址<input id="jd-url" value="http://10.44.101.62:8007/v1/systemone"></label><label>模型<select id="jd-model"><option value="vllm-sr/d3-flash">d3-flash · 9B</option><option value="vllm-sr/d3">d3 · 27B</option></select></label><label>API Key（可选）<input id="jd-key" type="password" autocomplete="off"></label><label>请求超时（秒）<input id="jd-timeout" type="number" value="45" min="1" max="120"></label><label>每幕讲解停留<select id="jd-pace"><option value="2600">2.6 秒</option><option value="5000">5 秒</option><option value="0">不停留</option></select></label></div></details>
+      <div id="jd-error" role="alert" hidden></div>
+      <div class="jd-metrics"><div><span>本场真实 Jev 调用</span><strong id="jd-calls">0</strong><small>单题核查 · 按顺序请求</small></div><div><span>已返回请求平均耗时</span><strong id="jd-mean">—</strong><small>含网络与服务排队，不是纯 GPU 耗时</small></div><div><span>当前请求计时</span><strong id="jd-clock">—</strong><small id="jd-clock-note">现场模式显示真实等待时间</small></div><div><span>代码直接处理的场景</span><strong id="jd-code-count">0 / 2</strong><small>无需额外调用模型</small></div></div>
+      <div class="jd-flow" aria-label="核查过程"><span data-stage="observe">01 观察前后证据</span><i>→</i><span data-stage="code">02 代码先核查</span><i>→</i><span data-stage="judge">03 Jev 语义核查</span><i>→</i><span data-stage="route">04 框架决定后续</span></div>
+      <div class="jd-main"><aside class="jd-timeline"><span class="jd-eyebrow">预设演示轨迹 / 5 幕</span><div id="jd-scenes"></div><p>搜索 RoboClaw → 核实论文 → 下载 → 改名为 data.pdf</p></aside><main class="jd-stage"><div class="jd-stage-heading"><div><span id="jd-kicker" class="jd-eyebrow">READY TO DEMONSTRATE</span><h2 id="jd-title">从一次错误下载，看清核查的价值</h2></div><span class="jd-synthetic">合成页面</span></div><p id="jd-narration">点击“一键现场演示”开始；网络不可用时，可使用离线剧本完整讲解。</p><div class="jd-screens"><figure><figcaption>BEFORE / 动作前</figcaption><canvas id="jd-before" width="1280" height="720" aria-label="动作前合成页面"></canvas></figure><figure><figcaption>AFTER / 动作后</figcaption><canvas id="jd-after" width="1280" height="720" aria-label="动作后合成页面"></canvas><span id="jd-scan" hidden></span></figure></div><div class="jd-candidate"><span>预设候选动作</span><code id="jd-candidate">等待开始</code></div><div class="jd-result-grid"><section class="jd-verdict"><span class="jd-eyebrow" id="jd-result-source">JEV VERDICT</span><h3 id="jd-outcome" aria-live="polite">等待证据</h3><p id="jd-reason">同一套核查接口，前后截图 + AX + 系统证据。</p><div id="jd-probs"></div><small id="jd-score-note">选项概率是未校准模型分数，不是任务成功率。</small></section><section class="jd-next"><span class="jd-eyebrow">FRAMEWORK RESPONSE</span><h3 id="jd-next-title">由框架推进队列</h3><p id="jd-next-detail">通过、继续、等待或纠正，都应有明确依据。</p><p class="jd-takeaway" id="jd-takeaway">动作已派发 ≠ 产生效果 ≠ 子任务完成。</p></section></div><details class="jd-raw"><summary>查看本幕原始结果与证据</summary><pre id="jd-raw">尚无结果</pre></details></main></div>
+      <section class="jd-summary" id="jd-summary" hidden><span class="jd-eyebrow">PRESENTATION RECAP</span><h2>把每一步的判断，变成可观察的过程。</h2><p id="jd-summary-text"></p><div id="jd-chart" aria-label="本场实际请求耗时"></div><p>讲解要点：Jev 判断语义与动作效果；系统确认传输、焦点和文件事实；决策模型专注下一步动作。</p><small>这不是完整 agent 成功率评测，也没有与其他模型做速度对照测试。</small></section>
+    </div>
+  </section>
 
   <section id="view-jev" aria-label="Jev 模型调试">
     <div class="scroll capture-scroll">
@@ -409,6 +425,7 @@
   <div id="view-run" class="active">
     <div id="run-body" class="scroll">
       <div class="page-intro"><div><div class="eyebrow">YOUR AGENT WORKSPACE</div><h1>让任务，从这里开始。</h1><p>配置模型，运行任务，追踪每一次观察与行动。</p></div><button class="studio-btn secondary" onclick="switchView('collect')"><svg><use href="#i-capture"/></svg>采集一段人工示范</button></div>
+      <button class="jd-entry" onclick="switchView('jev-demo'); window.JevDemo.start('live')"><span>JEV / 9B</span><strong>一键展示 Jev 在框架中的作用</strong><small>前后截图 · 实时核查 · 请求计时 →</small></button>
       <div id="run-form">
         <section class="run-panel task-panel">
           <div class="section-heading"><span class="section-index">01</span><div><h2>定义任务</h2><p>告诉 Agent 你想完成什么</p></div></div>
@@ -632,7 +649,9 @@ function switchView(view) {
   document.getElementById('nav-collect').classList.toggle('active', view === 'collect');
   document.getElementById('view-jev').classList.toggle('active', view === 'jev');
   document.getElementById('nav-jev').classList.toggle('active', view === 'jev');
-  const titles = {jev:'Jev 调试', run:'运行任务', live:'实时监控', collect:'SFT 采集', history:'虚拟机轨迹', local:'本机轨迹', debug:'模型调试', chat:'会话调试'};
+  document.getElementById('view-jev-demo').classList.toggle('active', view === 'jev-demo');
+  document.getElementById('nav-jev-demo').classList.toggle('active', view === 'jev-demo');
+  const titles = {'jev-demo':'Jev 汇报演示', jev:'Jev 调试', run:'运行任务', live:'实时监控', collect:'SFT 采集', history:'虚拟机轨迹', local:'本机轨迹', debug:'模型调试', chat:'会话调试'};
   document.getElementById('studio-page-title').textContent = titles[view] || '工作空间';
   document.body.dataset.view = view;
   if (view === 'collect' && window.CaptureStudio) window.CaptureStudio.open();
@@ -657,6 +676,7 @@ function switchView(view) {
   if (isRun) initRunView();
 }
 document.getElementById('nav-jev').addEventListener('click', () => switchView('jev'));
+document.getElementById('nav-jev-demo').addEventListener('click', () => switchView('jev-demo'));
 document.getElementById('nav-collect').addEventListener('click', () => switchView('collect'));
 navLive.addEventListener('click', () => switchView('live'));
 navHistory.addEventListener('click', () => switchView('history'));
@@ -2375,9 +2395,10 @@ loadHistory();
 connect();
 setInterval(poll, 2000);
 // 初始加载时切换到运行配置视图（正确隐藏状态栏 + 加载任务列表）
-switchView('run');
+switchView(location.hash === '#jev-demo' ? 'jev-demo' : 'run');
 </script>
 <script src="/static/jev.js"></script>
+<script src="/static/jev-demo.js"></script>
 <script src="/static/capture.js"></script>
 <script src="/static/studio-motion.js"></script>
 </body>

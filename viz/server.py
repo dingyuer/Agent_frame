@@ -25,6 +25,8 @@ import uvicorn
 app = FastAPI(title="osworld_agent Viz")
 from .jev_debug import router as jev_router
 app.include_router(jev_router)
+from .jev_demo import router as jev_demo_router
+app.include_router(jev_demo_router)
 
 # ---- 配置（环境变量覆盖）----
 _PKG = Path(__file__).resolve().parent.parent          # osworld_agent 包目录
