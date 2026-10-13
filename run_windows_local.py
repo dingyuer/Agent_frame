@@ -308,7 +308,8 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
     parser.add_argument("--chrome", default=CHROME_DEFAULT)
-    parser.add_argument("--download-dir", default=None, help="下载目录（缺省为 osworld_agent/downloads）")
+    parser.add_argument("--workspace-dir", "--download-dir", dest="download_dir", default=None,
+                        help="默认工作目录根路径（兼容 --download-dir）；每次运行创建固定的独立子目录")
     parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省不落盘）")
     parser.add_argument("--completion-spec", help="可信任务验收条件 JSON 文件；模型不能修改")
     parser.add_argument("--private-completion-spec", help="私有评测条件 JSON；不会发送给模型")

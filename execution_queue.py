@@ -19,8 +19,8 @@ def normalize_verification(value):
         return [{"kind": "visual"}]
     if not isinstance(value, list) or not 1 <= len(value) <= 8:
         raise ValueError("verification 必须含 1~8 项核查条件")
-    allowed = {"visual", "url_equals", "url_host", "text_present", "app_open", "element_state", "download_complete"}
-    required = {"url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "element_state": "name", "download_complete": "check_id"}
+    allowed = {"visual", "url_equals", "url_host", "text_present", "app_open", "element_state", "download_complete", "download_valid"}
+    required = {"url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "element_state": "name", "download_complete": "check_id", "download_valid": "check_id"}
     result = []
     for item in value:
         if not isinstance(item, dict) or item.get("kind") not in allowed:
@@ -81,10 +81,15 @@ def compile_download_milestones(steps, goals):
         seen.add(cid)
         goal = by_id[cid]
         step.update(goal='下载目标论文 ' + str(goal.get('query') or goal.get('title')) + ' 的 PDF，等待框架确认文件落盘。',
-                    expected_evidence='目标论文对应的实际 PDF 文件已经下载完成；文件名要求在后续单独核查。',
+                    expected_evidence='浏览器下载事件对应的文件已完整落盘；内容、身份与文件名在后续单独核查。',
                     verification=[{'kind': 'download_complete', 'check_id': cid}], check_ids=[],
                     framework_refinement='download_milestone', planner_goal=original['goal'])
         result.append(step)
+        result.append({'phase': 'inspect_download', 'goal': '核对已收到文件是否为目标论文；若文件错误，按已核实官方链接重新通过界面获取正确文件。',
+                       'expected_evidence': '框架核实 PDF 内容与目标论文身份；文件名暂不作为本步骤条件。',
+                       'check_ids': [], 'verification': [{'kind': 'download_valid', 'check_id': cid}],
+                       'actions': ['goto', 'click', 'press', 'hotkey', 'observe_browser', 'observe_desktop'],
+                       'status': 'pending', 'framework_refinement': 'download_validation'})
         if goal.get('filename'):
             result.append({'phase': 'rename', 'goal': '通过文件管理器将已下载论文改名为 ' + goal['filename'] + '；不要再次下载。',
                            'expected_evidence': '同一已登记文件名称为 ' + goal['filename'] + '，内容及论文身份不变。',

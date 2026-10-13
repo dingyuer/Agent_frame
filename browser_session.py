@@ -148,11 +148,14 @@ class BrowserOptions:
 class BrowserSession:
     """Task-owned CDP session with a dedicated async Playwright owner thread."""
 
-    def __init__(self, options=None, foreground_check=None, downloads_dir=None):
+    def __init__(self, options=None, foreground_check=None, downloads_dir=None, workspace_dir=None):
         self.options = options or BrowserOptions()
         self.foreground_check = foreground_check
-        self.downloads_dir = downloads_dir or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "downloads")
+        if downloads_dir is not None and workspace_dir is not None:
+            raise ValueError('Specify workspace_dir or legacy downloads_dir, not both')
+        workspace_root = workspace_dir or downloads_dir or os.getenv('OSWORLD_WORKSPACE_DIR') or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "workspace")
+        self.downloads_dir = os.path.abspath(os.path.expanduser(os.fspath(workspace_root)))
         self.snapshot = None
         self.nodes = {}
         self._downloaded = {}  # url -> path，本次会话已下载的文件（幂等去重）
@@ -174,6 +177,8 @@ class BrowserSession:
         self._download_events = []
         self._parents = {}
         self._base_downloads_dir = self.downloads_dir
+        self._workspace_prepared = False
+        self._workspace_state = {}
         self.initial_state = {}
         self._last_screenshot = None
         self._last_screenshot_metadata = {}
@@ -660,6 +665,20 @@ class BrowserSession:
             self._download_tasks.clear()
 
     @browser_thread
+    def prepare_workspace(self, task_id=None):
+        """Allocate once before planning; begin_episode adopts the same directory."""
+        if not self._workspace_prepared:
+            episode_id = str(task_id or uuid.uuid4().hex)
+            directory_id = self._filename(episode_id) + '_' + uuid.uuid4().hex[:12]
+            self.downloads_dir = os.path.join(self._base_downloads_dir, directory_id)
+            os.makedirs(self.downloads_dir, exist_ok=False)
+            self._workspace_state = {'episode_id': episode_id, 'workspace_dir': self.downloads_dir,
+                'downloads_dir': self.downloads_dir, 'workspace_root': self._base_downloads_dir,
+                'workspace_scope': 'episode', 'workspace_location': 'controller_host'}
+            self._workspace_prepared = True
+        return copy.deepcopy(self._workspace_state)
+
+    @browser_thread
     def begin_episode(self, task_id=None, isolated=True, viewport=None):
         """Create a fresh context and output directory; never silently reuse on failure."""
         if not isolated:
@@ -695,15 +714,12 @@ class BrowserSession:
         self._last_screenshot = None
         self._last_screenshot_metadata = {}
         size = viewport or {"width": 1280, "height": 720}
-        episode_id = str(task_id or uuid.uuid4().hex)
-        # Random suffix prevents retries/repeated user IDs from sharing files.
-        directory_id = self._filename(episode_id) + "_" + uuid.uuid4().hex[:12]
+        workspace = self.prepare_workspace(task_id)
+        episode_id = workspace['episode_id']
         context = browser.new_context(accept_downloads=True, viewport=size, locale="en-US",
             timezone_id="UTC", color_scheme="light", reduced_motion="reduce", service_workers="block",
             ignore_https_errors=True)
         self._owned_context = context
-        self.downloads_dir = os.path.join(self._base_downloads_dir, directory_id)
-        os.makedirs(self.downloads_dir, exist_ok=False)
         self._watch_contexts(browser)
         page = context.new_page()
         self._watch_page(page)
@@ -727,7 +743,8 @@ class BrowserSession:
         self.initial_state = {"isolated": True, "isolation_scope": "browser_context",
             "initial_state_id": "blank-browser-v1:" + fingerprint,
             "episode_id": episode_id, "context_id": uuid.uuid4().hex,
-            "downloads_dir": os.path.abspath(self.downloads_dir), "profile": profile}
+            **workspace, "profile": profile}
+        self._workspace_prepared = False
         return copy.deepcopy(self.initial_state)
 
     def _tab_records(self, browser):

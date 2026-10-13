@@ -84,6 +84,8 @@ git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
 `Agent(..., verifier_model=review_model)`，本机 CLI 可用 `--verifier-model` 和 `--verifier-url`。
 核查调用保存在 `review_calls` 和事件日志中，标记 `actor_role=verifier, policy_trainable=false`，
 不会混入操作/规划的 SFT 或策略 RL 样本。轨迹新增 `step_verification`、`step_reviews`、`execution_queue`。
+最终语义核查同时接收规划器的 `final_check` 提示和原始未解决要求；提示不是证据，不能覆盖原始任务。
+只有确定性条件全部通过后，剩余语义要求才允许模型保底；模型验收结果单独标记，不冒充确定性 RL 奖励。
 
 
 持续卡住时，框架把实际失败和验收反馈交给规划器修订计划；默认最多重规划一次，
@@ -178,9 +180,11 @@ PDF 页面另有默认 20 秒的渲染等待：框架轮询正文区域，连续
 
 已绑定的论文标题、arXiv ID、官方 PDF 地址，以及下载完成的路径/字节数会进入精简决策上下文；
 传输完成与论文身份、文件名验收分开。明显指向其他 arXiv 论文的链接会在派发前拒绝。
-框架将论文计划的 download 阶段编译为 `download_complete(check_id)`：只在对应目标的实际 PDF
-完成下载并通过身份/文件核验后推进，不依赖视觉核查，也不因尚未改名而停留在下载阶段。
-有文件名要求时自动插入独立的界面改名步骤；最终合同仍检查全部要求。
+框架将论文计划的 download 阶段编译为 `download_complete(check_id)`：登记的非空文件完整落盘且
+内容未变化后，先推进到独立的 `download_valid(check_id)` 核查步骤；不依赖视觉核查，也不等最终验收。
+即使下错文件，传输步骤也会完成，但内容/论文身份核查不会通过；当前子目标变为核对和纠正文件，
+不再留在下载阶段空点。已有正确文件时，这项代码核查自动通过，不额外调用决策模型。
+有文件名要求时再进入独立的界面改名步骤；最终合同仍检查全部要求。
 历史错文件不会覆盖后来正确文件的验收状态。同一 URL 对应文件仍完整存在时，明确的重复下载动作
 在派发前拒绝；无法从动作确定 URL 的点击由浏览器下载事件兜底取消，避免生成重复副本。
 改名后仍按同一产物去重；文件删除或修改后允许重新下载。不将不同签名 URL 擅自视为同一资源。
@@ -200,6 +204,27 @@ VMware 当前没有精确窗口激活实现，会提示改用桌面任务栏或�
 Chromium 响应长度/下载进度超过上限时取消传输，保存完成后再次检查实际大小；超限不代表文件身份错误。
 时间预算独立于决策预算；正在进行的外部模型请求仍受模型传输超时约束。
 框架自动等待只记录事件；模型主动输出一次 `wait` 仍是一次真实采样，不能从训练记录删除。
+
+### 默认操作目录与桌面观察
+
+Windows 任务在规划前建立默认操作目录，`begin_episode` 沿用同一目录，整轮不会改变。
+默认根目录是项目下 `workspace/`；可在前端配置，或传入 `--workspace-dir PATH`
+（兼容 `--download-dir`），也可设置 `OSWORLD_WORKSPACE_DIR`。每次运行创建独立子目录，
+以免把上次运行的文件当成新成果；实际绝对路径写入 `initial_state.workspace_dir`、manifest、
+规划输入、操作反馈和前端。下载文件落在该目录，模型找文件、改名、另存默认使用该路径；
+原始任务明确指定其他文件或路径时才改用指定位置。这是操作默认值，不是文件系统沙箱。
+远程 VM 的控制器产物目录会标注为 `controller_host`，不能假设其在 VM 文件管理器里可见。
+
+后台浏览器继续使用 CDP 视口截图和虚拟输入，不依赖前台焦点，也不会在截图失败时自动截桌面。
+显式 `observe_desktop` 使用 Pillow 的 Windows `all_screens` 截图及 Win32 虚拟屏幕度量，
+保留负原点、实际尺寸与截图 ID。定位器返回图内坐标，执行器验证布局后转换为物理桌面坐标；
+显示器布局发生变化或坐标越界时拒绝执行，要求重新观察。截图与输入均使用线程级 DPI 上下文。
+中文路径与文件名通过 Windows Unicode 键盘输入完成，不借助剪贴板或后台改文件。
+
+前端明确显示“后台浏览器”或“桌面接管”。桌面接管使用真实输入设备，不能承诺用户同时操作
+桌面仍互不干扰；需要全程隔离桌面操作时，应使用独立 VM/桌面会话。`observe_browser` 返回后台网页模式。
+实现依据：[Pillow 全屏截图](https://pillow.readthedocs.io/en/stable/reference/ImageGrab.html)、
+[Windows 线程 DPI 上下文](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddpiawarenesscontext)。
 
 ### 截图、DOM 与弹窗
 

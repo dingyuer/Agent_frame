@@ -16,11 +16,15 @@ from ..env import Environment, Observation, StepResult, run_local_command, run_l
 from .uno_commands import SET_CELL_VALUES_CMD, SAVE_DOC_CMD
 
 
-def to_pyautogui(action: Action) -> str:
+def to_pyautogui(action: Action, *, desktop_origin=None) -> str:
     """把新框架的 Action（env 类，已坐标化）翻译成 OSWorld 的 pyautogui 命令字符串。"""
     name = action.action
-    a = action.args
+    a = dict(action.args)
     head = "import pyautogui; import time; "
+    writer = 'pyautogui.write'
+    if desktop_origin is not None:
+        head += 'from osworld_agent.windows_text import type_unicode; '
+        writer = 'type_unicode'
 
     # grounding 失败：拒绝执行（返回空命令 → step() 空转一步），绝不做坐标钳制。
     if a.get("grounding_failed") or a.get("coordinate_space") == "css_viewport":
@@ -39,9 +43,19 @@ def to_pyautogui(action: Action) -> str:
         except (ValueError, TypeError):
             return ""
 
+    # The Windows adapter validates image bounds and supplies this trusted
+    # physical origin. Model-provided negative image coordinates remain invalid.
+    if desktop_origin is not None:
+        if len(desktop_origin) != 2 or any(type(v) is not int for v in desktop_origin):
+            return ""
+        for x, y in (("x", "y"), ("x1", "y1"), ("x2", "y2")):
+            if x in a and y in a:
+                a[x] = a[x] + desktop_origin[0]
+                a[y] = a[y] + desktop_origin[1]
+
     if name == "click":
         x, y = a.get('x'), a.get('y')
-        if x is not None and y is not None and int(x) >= 0 and int(y) >= 0:
+        if x is not None and y is not None:
             # 对 Calc 单元格：双击确保焦点真正切换（单次 click 可能只是激活表格区，不切选中格）。
             # 判断：target 是单元格引用（如 E3 / Sheet1 的 A5）或描述里含"单元格"。
             t = str(a.get("target", "")).lower()
@@ -52,24 +66,24 @@ def to_pyautogui(action: Action) -> str:
         return ""  # grounding 失败：不执行，空转
     if name == "double_click":
         x, y = a.get('x'), a.get('y')
-        if x is not None and y is not None and int(x) >= 0 and int(y) >= 0:
+        if x is not None and y is not None:
             return f"{head} pyautogui.doubleClick({x}, {y})"
         return ""
     if name == "right_click":
         x, y = a.get('x'), a.get('y')
-        if x is not None and y is not None and int(x) >= 0 and int(y) >= 0:
+        if x is not None and y is not None:
             return f"{head} pyautogui.click({x}, {y}, button='right')"
         return ""
     if name == "type":
         # 原子「聚焦+输入」：先点击目标元素聚焦，再输入文字（对齐 Agent S3 的 type 语义）。
         x, y = a.get('x'), a.get('y')
         cmd = head
-        if x is not None and y is not None and int(x) >= 0 and int(y) >= 0:
+        if x is not None and y is not None:
             cmd += f"pyautogui.click({x}, {y}); "
         if a.get('overwrite'):
             # 覆盖写：全选 + 退格删除旧内容，再输入新文字（对齐 Agent S3 的 type(overwrite=True)）。
             cmd += "pyautogui.hotkey('ctrl', 'a'); pyautogui.press('backspace'); "
-        cmd += f"pyautogui.write({str(a.get('text', ''))!r})"
+        cmd += f"{writer}({str(a.get('text', ''))!r})"
         return cmd
     if name == "scroll":
         amount = int(a.get("amount", 1))
@@ -86,14 +100,14 @@ def to_pyautogui(action: Action) -> str:
     if name == "goto":
         url = str(a.get("url", ""))
         return (f"{head} pyautogui.hotkey('ctrl', 'l'); time.sleep(0.5); "
-                f"pyautogui.write({url!r}); pyautogui.press('enter')")
+                f"{writer}({url!r}); pyautogui.press('enter')")
     if name == "drag_and_drop":
         return (f"{head} pyautogui.moveTo({a.get('x1')}, {a.get('y1')}); "
                 f"pyautogui.dragTo({a.get('x2')}, {a.get('y2')}, duration=1.0)")
     if name == "select":
         # 简化：点开下拉框 → 输入选项 → 回车
         return (f"{head} pyautogui.click({a.get('x')}, {a.get('y')}); time.sleep(0.5); "
-                f"pyautogui.write({str(a.get('option', ''))!r}); pyautogui.press('enter')")
+                f"{writer}({str(a.get('option', ''))!r}); pyautogui.press('enter')")
     if name == "wait":
         return f"{head} time.sleep({float(a.get('seconds', 1))})"
     if name == "save":

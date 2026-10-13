@@ -1,13 +1,13 @@
 """Windows 本机环境：pyautogui 控制桌面 + CDP 控制浏览器。
 
 用于在 Windows 本机（非 VM）上跑 GUI agent 任务，重点支持 browser use：
-- 观察：pyautogui 截图 + browser_ax 快照（焦点在浏览器时经 BrowserSession 抓取）；
+- 观察：后台 CDP 页面截图与 AX；显式桌面观察使用 Win32/Pillow 全虚拟桌面截图；
 - 执行：桌面 GUI 动作（click/type/hotkey 等）走 pyautogui（坐标定位）；
         浏览器 DOM 动作（带 target_ref / 语义兜底命中）走 CDP（DOM 定位，跳过视觉定位）；
 - 焦点检测走 Windows GetForegroundWindow。
 
 与 VMwareEnvironment 的对齐点：browser_ax 快照进 context、target_ref 路由 + 语义兜底、
-execute_routed 走 CDP。差异点：截图用 pyautogui、CDP host 是 localhost、桌面无 AT-SPI。
+execute_routed 走 CDP。差异点：CDP host 是 localhost，桌面使用物理像素坐标，无 AT-SPI。
 """
 from __future__ import annotations
 
@@ -27,18 +27,29 @@ class WindowsEnvironment(Environment):
     evaluation_available = False
 
     def __init__(self, browser_port: int = 9222, width: int = 1920, height: int = 1080,
-                 downloads_dir: Optional[str] = None):
+                 downloads_dir: Optional[str] = None, workspace_dir: Optional[str] = None):
         self.browser_port = browser_port
         self.width = width
         self.height = height
         self.os_name = "windows"
         self.browser_only = True  # 浏览器专用：用精简 system prompt + 强化 DOM 定位
         self.downloads_dir = downloads_dir
+        self.workspace_dir = workspace_dir
+        if downloads_dir is not None and workspace_dir is not None:
+            raise ValueError('workspace_dir 与 downloads_dir 不能同时指定')
         self._browser_session = None
         self._last_observation_info = {}
         self._observation_surface = "browser"
         self._episode_prepared = False
         self.initial_state = {}
+        self._desktop_capture = {}
+
+    def prepare_workspace(self, task_id=None):
+        if self._episode_prepared:
+            return dict(self.initial_state)
+        self.initial_state = self._get_browser_session().prepare_workspace(task_id)
+        self.initial_state['workspace_location'] = 'target_desktop'
+        return dict(self.initial_state)
 
     def begin_episode(self, task_id=None, isolated=True):
         session = self._get_browser_session()
@@ -46,16 +57,21 @@ class WindowsEnvironment(Environment):
             viewport={"width": self.width, "height": self.height})
         if not self.initial_state.get("isolated"):
             raise RuntimeError("Browser episode isolation was not established")
+        self.initial_state['workspace_location'] = 'target_desktop'
+        session.initial_state = dict(self.initial_state)
         self._episode_prepared = True
         self._observation_surface = "browser"
+        self._desktop_capture = {}
         self._last_observation_info = {}
         return dict(self.initial_state)
 
     # ---- 观察 ----
     def _take_screenshot(self):
         """Desktop fallback; browser screenshots are collected atomically with AX."""
-        import pyautogui
-        return pyautogui.screenshot()
+        from ..desktop_capture import capture_virtual_desktop
+        self._desktop_capture = {}
+        shot, self._desktop_capture = capture_virtual_desktop()
+        return shot
 
     def _focus_is_browser(self) -> bool:
         """本机浏览器模式：以「CDP 有可用页面」为准，不依赖前台焦点。
@@ -83,6 +99,7 @@ class WindowsEnvironment(Environment):
                                        require_focus=False),
                 foreground_check=None,
                 downloads_dir=self.downloads_dir,
+                workspace_dir=self.workspace_dir,
             )
         return self._browser_session
 
@@ -101,8 +118,8 @@ class WindowsEnvironment(Environment):
     def _build_observation(self) -> Observation:
         """Collect screenshot and AX on one page, with an explicit coordinate space.
 
-        浏览器模式（后台独立浏览器）只取 CDP 截图，绝不回退到 pyautogui 截取用户整屏；
-        pyautogui 整屏截图仅用于显式 observe_desktop。这样即使用户把浏览器窗口挡在后面，
+        浏览器模式（后台独立浏览器）只取 CDP 截图，绝不回退到截取用户整屏；
+        虚拟桌面截图仅用于显式 observe_desktop。这样即使用户把浏览器窗口挡在后面，
         截图仍是该浏览器页面的完整内容，不受遮挡/前台影响。
         """
         from ..model.grounding import screenshot_size
@@ -156,11 +173,12 @@ class WindowsEnvironment(Environment):
                     info[key] = metadata[key]
             context = [snapshot] if snapshot else []
         else:
-            # 桌面模式：显式 observe_desktop 才用 pyautogui 截取整屏。
+            # 桌面模式：显式 observe_desktop 才截取全部显示器。
             screenshot = self._take_screenshot()
             size = screenshot_size(screenshot)
             info = {"screenshot_space": "screen_pixels",
                     "screenshot_size": list(size) if size else None,
+                    **self._desktop_capture,
                     "scene": Scene(browser_use=0, structure_available=False,
                                    mode="visual", reason="desktop_fallback").to_dict()}
             for key in ("artifacts", "download_events", "pending_downloads", "dialogs", "dialog",
@@ -170,11 +188,14 @@ class WindowsEnvironment(Environment):
             if error or metadata.get("error") or metadata.get("observation_errors"):
                 info["observation_error"] = error or metadata.get("error") or "; ".join(metadata["observation_errors"])
             context = []
-        self._last_observation_info = dict(info)
+        if self.initial_state:
+            info.setdefault('initial_state', dict(self.initial_state))
         info["active_surface"] = "browser" if info.get("screenshot_space") == "css_viewport" else "desktop"
         info["requested_surface"] = self._observation_surface
+        info['control_mode'] = 'background_browser' if info['active_surface'] == 'browser' else 'desktop_takeover'
         from ..desktop_state import windows_runtime_state
         info["runtime_state"] = windows_runtime_state()
+        self._last_observation_info = dict(info)
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
     def _derive_scene(self, snapshot):
@@ -377,10 +398,23 @@ class WindowsEnvironment(Environment):
             result = switch_windows_application(action.args.get('app_code'))
             return StepResult(observation=self.observe(), info=result)
         # 坐标化后执行 pyautogui 命令
-        cmd = to_pyautogui(action)
+        try:
+            if sys.platform == 'win32' and not self._desktop_capture and name != 'wait':
+                raise ValueError('缺少有效虚拟桌面截图，请重新 observe_desktop')
+            if self._desktop_capture:
+                from ..desktop_capture import validate_desktop_action, virtual_geometry
+                mapped, origin = validate_desktop_action(action, self._desktop_capture, virtual_geometry())
+                cmd = to_pyautogui(mapped, desktop_origin=origin)
+            else:
+                cmd = to_pyautogui(action)
+        except (ValueError, OSError) as exc:
+            return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
+                'channel': 'desktop', 'error_code': 'desktop_geometry_changed', 'error': str(exc)})
         if cmd:
             try:
-                exec(cmd, {"__name__": "__main__"})  # noqa: S102  执行 pyautogui 命令字符串
+                from ..desktop_capture import physical_dpi_context
+                with physical_dpi_context():
+                    exec(cmd, {"__name__": "__main__"})  # noqa: S102  执行基础 GUI 命令
             except Exception as exc:  # noqa: BLE001
                 return StepResult(observation=self._build_observation(),
                                   info={"status": "failed", "dispatched": True,

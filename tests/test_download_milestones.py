@@ -56,9 +56,9 @@ def test_correct_download_beats_old_wrong_artifact_and_ignores_only_filename(tmp
     assert progress[0]['status'] == 'passed' and progress[0]['path'] == str(right)
     assert verifier.public_spec == original  # milestone never weakens final contract
     steps = plan(verifier)
-    assert [s['phase'] for s in steps] == ['download', 'rename', 'verify']
+    assert [s['phase'] for s in steps] == ['download', 'inspect_download', 'rename', 'verify']
     assert steps[0]['check_ids'] == [] and steps[0]['verification'] == [{'kind': 'download_complete', 'check_id': 'check_1'}]
-    assert 'data.pdf' in steps[1]['goal'] and steps[1]['check_ids'] == ['check_1']
+    assert 'data.pdf' in steps[2]['goal'] and steps[2]['check_ids'] == ['check_1']
 
 
 def test_download_completion_advances_queue_without_visual_model(tmp_path):
@@ -96,6 +96,44 @@ def test_wrong_or_deleted_artifact_never_completes_download(tmp_path):
     c = {'download_progress': verifier.download_progress()}
     review = code_review(plan(verifier)[0], obs, {}, c)
     assert review['status'] != 'passed'
+
+
+def test_wrong_download_advances_to_validation_then_correct_file_advances_to_rename(tmp_path):
+    verifier, obs, right = downloads(tmp_path)
+    obs.context[0]['url'] = 'https://arxiv.org/abs/' + IDENTIFIER
+    right.unlink()
+    p = pipe()
+    p.completion = verifier
+    p._review_visual = lambda *a, **kw: pytest.fail('Artifact facts cannot use model review')
+    state = StepState(task='下载roboclaw并改名data', obs=obs, memory=StructuredMemory(), step_id=3,
+                      queue=ExecutionQueue({'steps': plan(verifier)}), verification=verifier.evaluate())
+    p._update_plan_progress(state, Execution(kind='env', obs=obs, info={'status': 'executed'}))
+    assert state.queue.current['phase'] == 'inspect_download'  # no repeat in download phase
+    assert state.queue.plan['steps'][0]['status'] == 'done'
+    assert state.verification['status'] != 'passed'
+    p._update_plan_progress(state, Execution(kind='env', obs=obs, info={'status': 'observed'}))
+    assert state.step_review['status'] != 'passed' and not p.model.calls
+    corrected = pdf_file(tmp_path / 'corrected.pdf', TITLE, 'Example Author', 'Abstract')
+    obs.info['artifacts'] = [obs.info['artifacts'][0], official_event(corrected, ident='new-correct')]
+    p.preprocess(state)
+    assert state.queue.current['phase'] == 'rename' and state.step_id == 3, (verifier.download_progress(), state.step_review)
+    assert {'wrong', 'new-correct'} <= state.consumed_downloads
+    assert not p.model.calls and state.verification['status'] != 'passed'
+
+
+def test_transport_completed_does_not_require_pdf_acceptance(tmp_path):
+    verifier = bound()
+    path = tmp_path / 'login.pdf'
+    path.write_bytes(b'<html>Login required</html>')
+    obs = observation()
+    obs.info['artifacts'] = [official_event(path, ident='login')]
+    verifier.observe(obs)
+    assert verifier.download_transfers()[0]['status'] == 'passed'
+    assert verifier.download_progress()[0]['status'] != 'passed'
+    assert verifier.evaluate()['status'] != 'passed'
+    assert verifier.download_transfers({'login'})[0]['status'] != 'passed'
+    path.write_bytes(b'<html>Changed</html>')
+    assert verifier.download_transfers()[0]['status'] != 'passed'
 
 
 def test_nonexistent_artifact_claim_is_not_download_evidence(tmp_path):

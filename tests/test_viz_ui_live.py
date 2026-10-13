@@ -135,6 +135,8 @@ def test_studio_human_demonstration_from_buttons_to_dataset(request, tmp_path):
             # Both sizes share the optional config path; no endpoint is invoked by selection.
             page.locator('#nav-run').click()
             expect(page.locator('#local-download-max-mib')).to_have_value('50')
+            page.locator('#local-workspace-dir').fill('C:\\Agent Workspace')
+            expect(page.locator('#local-workspace-dir')).to_have_value('C:\\Agent Workspace')
             page.locator('#judge-model').locator('xpath=ancestor::details').evaluate('el => el.open = true')
             for model in ('vllm-sr/d3', 'vllm-sr/d3-flash'):
                 page.locator('#judge-model').select_option(model)
@@ -164,9 +166,15 @@ def test_studio_human_demonstration_from_buttons_to_dataset(request, tmp_path):
               addCard({kind:'status',event:'operation_feedback',facts:['下载传输已完成：data.pdf，12345 字节','<script>bad()</script>'],ts:1});
               addCard({kind:'status',event:'framework_wait',reason:'pdf_render',status:'waiting',elapsed_s:3,ts:1});
               addCard({kind:'status',event:'duplicate_download',reason:'目标文件已下载，不再重复派发',path:'<script>bad()</script>',ts:1});
+              addCard({kind:'status',event:'workspace_ready',workspace:{workspace_dir:'/workspace/<script>bad()</script>'},ts:1});
+              addCard({kind:'status',event:'control_mode',mode:'desktop_takeover',ts:1});
             }""")
             assert '下载传输已完成：data.pdf' in page.locator('#timeline').inner_text()
             assert '目标文件已下载，不再重复派发' in page.locator('#timeline').inner_text()
+            assert '/workspace/<script>bad()</script>' in page.locator('#timeline').inner_text()
+            assert page.locator('#st-control').inner_text() == '桌面接管 · 真实输入'
+            page.evaluate("addCard({kind:'status',event:'control_mode',mode:'background_browser',ts:1})")
+            assert page.locator('#st-control').inner_text() == '后台浏览器 · CDP'
             assert '等待 PDF 渲染' in page.locator('#st-status').inner_text()
             page.evaluate("addCard({kind:'status',event:'framework_wait',reason:'pdf_render',status:'timeout',elapsed_s:20,ts:1})")
             assert 'PDF 渲染等待超时' in page.locator('#timeline').inner_text()

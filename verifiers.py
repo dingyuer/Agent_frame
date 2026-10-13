@@ -383,6 +383,41 @@ class CompletionVerifier:
                   for c in self._public_spec['checks'] if c['kind'] in {'download', 'paper_download'}]
         return list(self._download_checks(checks).values())
 
+    def download_transfers(self, consumed=()):
+        """Transport facts only; content, identity and final names are separate.
+
+        A wrong file can complete a transfer, never the following validation.
+        Only episode-registered, unchanged actual files count; no model claims.
+        """
+        valid = []
+        for path, record in self._artifacts.items():
+            ident = record.get('artifact_id')
+            if not ident or ident in consumed or record.get('migration_error'):
+                continue
+            now, initial = _read_artifact(path), record['initial']
+            if (now['status'] != 'passed' or initial['status'] != 'passed'
+                    or (now['identity'], now['sha256']) != (initial['identity'], initial['sha256'])):
+                continue
+            valid.append((record, {'path': path, 'artifact_id': ident, 'bytes': now['bytes'], 'sha256': now['sha256']}))
+        reports = []
+        for check in self._public_spec['checks']:
+            if check['kind'] not in {'download', 'paper_download'}:
+                continue
+            binding = self._bindings.get(check['id'])
+            ordered = sorted(valid, key=lambda pair: not (self._artifact_matches_binding(pair[0], binding)
+                if binding else check.get('url') in pair[0]['urls']))
+            unique = {}
+            for record, artifact in ordered:
+                # A duplicated paper cannot satisfy a multiple-paper count.
+                key = artifact['sha256'] if check['kind'] == 'paper_download' else artifact['artifact_id']
+                unique.setdefault(key, artifact)
+            selected = list(unique.values())[:check.get('count', 1)]
+            complete = len(selected) == check.get('count', 1)
+            reports.append(self._result(check, 'passed' if complete else 'unknown',
+                '文件传输已完成；接下来单独核对内容、身份和文件名' if complete else '等待新的完整下载产物',
+                'artifact_transport', artifacts=selected if complete else []))
+        return reports
+
     def pending_paper_goals(self):
         return [goal for goal in self.paper_goals() if goal['status'] == 'pending']
 

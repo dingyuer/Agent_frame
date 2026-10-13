@@ -491,6 +491,11 @@ def _start_local(cfg: dict):
     ]
     try:
         cmd += _wait_cli_args(cfg)
+        if cfg.get('workspace_dir'):
+            workspace = cfg['workspace_dir']
+            if not isinstance(workspace, str) or any(ord(c) < 32 for c in workspace):
+                raise ValueError('默认工作目录必须是有效路径字符串')
+            cmd += ['--workspace-dir', workspace]
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     if cfg.get("completion_spec") is not None:

@@ -164,6 +164,8 @@ class StepState:
     routing_hint: Dict[str, Any] = field(default_factory=dict)
     finish_feedback: str = ""
     render_waits: Dict[tuple, str] = field(default_factory=dict)
+    control_mode: str = ''
+    consumed_downloads: set = field(default_factory=set)
     operation_facts: List[str] = field(default_factory=list)
 
 
@@ -307,7 +309,7 @@ class Pipeline:
         root = Path(__file__).resolve().parent
         source_hash = hashlib.sha256()
         for name in ("pipeline.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
-                     "execution_queue.py", "step_verifier.py", "step_progress.py", "decision_context.py", "browser_feedback.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py",
+                     "execution_queue.py", "step_verifier.py", "step_progress.py", "decision_context.py", "browser_feedback.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py", "desktop_capture.py", "windows_text.py",
                      "adapters/windows_env.py", "adapters/vmware_env.py", "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
             source_hash.update(name.encode())
             source_hash.update((root / name).read_bytes())
@@ -346,6 +348,10 @@ class Pipeline:
 
     def _run(self, task: str, result: AgentResult) -> AgentResult:
         state = self._init_state(task)
+        if callable(getattr(self.env, 'prepare_workspace', None)):
+            workspace = self.env.prepare_workspace(self.run_id)
+            result.run_manifest['workspace'] = copy.deepcopy(workspace)
+            self._publish_diagnostic('workspace_ready', workspace=workspace)
         state.task_profile = task_profile(task, self.completion.public_spec)
         if self.decision_judge:
             state.routing_hint['task'] = self.decision_judge.classify_task(task, remaining_s=self._task_time_remaining())
@@ -564,9 +570,10 @@ class Pipeline:
         while state.queue and state.queue.current:
             current = state.queue.current
             predicates = current.get('verification', [])
-            if not predicates or any(p.get('kind') != 'download_complete' for p in predicates):
+            if not predicates or any(p.get('kind') not in {'download_complete', 'download_valid'} for p in predicates):
                 break
-            progress = {'download_progress': self.completion.download_progress()}
+            progress = {'download_progress': self.completion.download_progress(),
+                        'download_transfers': self.completion.download_transfers(state.consumed_downloads)}
             if code_review(current, state.obs, {}, progress)['status'] != 'passed':
                 break
             self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
@@ -606,6 +613,10 @@ class Pipeline:
                                             bool(getattr(self.env, "browser_only", False)))
         system = scoped_system(self._active_actions, state.obs, getattr(self.env, "os_name", "linux"))
         current = state.queue.current if state.queue else None
+        mode = (state.obs.info or {}).get('control_mode', '') if state.obs else ''
+        if mode and mode != state.control_mode:
+            state.control_mode = mode
+            self._publish_diagnostic('control_mode', mode=mode)
         facts = operational_facts(state.obs, self.completion,
                                   self.completion.public_report(state.verification) if self.completion else {}, current,
                                   os_name=getattr(self.env, "os_name", ""))
@@ -779,7 +790,7 @@ class Pipeline:
             action.args["observation_metadata"] = {
                 k: copy.deepcopy(info[k]) for k in (
                     "screenshot_space", "screenshot_size", "page_id", "document_id", "snapshot_id",
-                    "captured_at", "url", "scroll_offset")
+                    "captured_at", "url", "scroll_offset", "screen_origin", "virtual_desktop", "desktop_capture_id")
                 if k in info}
 
     def _observe(self):
@@ -1515,6 +1526,10 @@ class Pipeline:
         trusted completion contract. Only existing check IDs may be attached.
         """
         prompt = build_planner_prompt(task, self.completion.public_spec, state.task_profile)
+        from .browser_feedback import workspace_facts
+        workspace_obs = state.obs or Observation(info={'initial_state': getattr(self.env, 'initial_state', {})})
+        if workspace := workspace_facts(workspace_obs):
+            prompt += '\n框架操作目录（本轮固定）：\n' + '\n'.join(workspace)
         if repair:
             prompt += "\n当前计划受阻，请保留原目标，按以下已发生事实修订剩余步骤：\n" + json.dumps({
                 "previous_plan": state.memory.plan, "recovery": state.recovery,
@@ -1554,8 +1569,8 @@ class Pipeline:
                     except ValueError as exc:
                         raise ValueError(f"第 {i} 个子目标 verification：{exc}") from exc
                     for predicate in verification:
-                        if predicate['kind'] == 'download_complete' and predicate['check_id'] not in check_ids:
-                            raise ValueError('download_complete.check_id 必须引用已有系统条件')
+                        if predicate['kind'] in {'download_complete', 'download_valid'} and predicate['check_id'] not in check_ids:
+                            raise ValueError('下载谓词 check_id 必须引用已有系统条件')
                     normalized.append({"idx": i, "goal": step["goal"].strip(),
                                        "expected_evidence": str(step.get("expected_evidence") or ""),
                                        "check_ids": ids, "phase": str(step.get("phase") or ""), "status": "pending",
@@ -1694,6 +1709,7 @@ class Pipeline:
         self._publish_review({**identity, "method": "code", "status": "running", "reason": "检查当前步骤的系统证据"})
         public_report = self.completion.public_report(state.verification)
         public_report['download_progress'] = self.completion.download_progress()
+        public_report['download_transfers'] = self.completion.download_transfers(state.consumed_downloads)
         report = code_review(step, state.obs, execution.info, public_report)
         identity_error = paper_review_error(state.obs, self.completion, public_report, step)
         if identity_error and report.get('source') != 'download_artifact_milestone':
@@ -1710,7 +1726,7 @@ class Pipeline:
         if (report["status"] == "unknown" and execution.kind not in {"terminal", "deadline"}
                 and not (state.obs.info if state.obs else {}).get("pending_downloads")
                 and execution.info.get("status") not in {"pending", "in_progress"}
-                and not any(p.get("kind") == "download_complete" for p in step.get("verification", []))):
+                and not any(p.get("kind") in {'download_complete', 'download_valid'} for p in step.get("verification", []))):
             review_execution = {k: execution.info[k] for k in ('status', 'error_code', 'action') if k in execution.info}
             review_execution['expected_effect'] = expected_effect
             paper = active_paper(self.completion, step)
@@ -1725,8 +1741,21 @@ class Pipeline:
             state.queue.sync_memory(state.memory)
             if advanced:
                 self._clear_stall(state)
+                for check in report.get('checks', []):
+                    state.consumed_downloads.update(check.get('artifact_ids', []))
+                if any(p.get('kind') == 'download_valid' for p in step.get('verification', [])):
+                    state.consumed_downloads.update(a.get('artifact_id') or a.get('download_id')
+                        for a in (state.obs.info or {}).get('artifacts', [])
+                        if a.get('completed') and (a.get('artifact_id') or a.get('download_id')))
             self._publish_queue(state)
         state.memory.add_event(f"系统步骤核查[{report['method']}]: {report['status']}，{report['reason']}")
+        # No extra policy call is needed for content already proven by code.
+        current = state.queue.current if state.queue else None
+        predicates = (current or {}).get('verification', [])
+        if current is not step and predicates and all(p.get('kind') == 'download_valid' for p in predicates):
+            if code_review(current, state.obs, {}, public_report)['status'] == 'passed':
+                self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
+                    info={'status': 'observed', 'dispatched': False}))
 
     def _programmatic_done(self, state: StepState, execution: Execution) -> str:
         return "contract" if state.verification.get("status") == "passed" else ""
@@ -1950,6 +1979,9 @@ class Pipeline:
             return False, public.get("reason") or "确定性验收条件尚未满足，模型不能覆盖"
         step = {"id": "whole_task", "goal": state.task,
                 "expected_evidence": "核对原始任务的所有要求（包含数量、对象身份、保存或提交结果）；不能只核对当前步骤或规划摘要。",
+                "planner_review_hint": str((getattr(state.memory, 'plan', None) or {}).get('final_check') or '')[:2000],
+                "unresolved_requirements": [c['text'] for c in self.completion.public_spec.get('checks', [])
+                                            if c.get('kind') == 'unresolved_requirement'],
                 "verification": [{"kind": "visual"}]}
         identity = {"review_id": f"{self.run_id}:a{state.step_id}:whole_task",
                     "plan_step_id": "whole_task", "goal": state.task, "decision_step": state.step_id}

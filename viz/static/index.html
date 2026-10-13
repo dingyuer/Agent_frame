@@ -326,6 +326,7 @@
     <div class="item instruction"><span class="label">任务指令</span><span class="value" id="st-instruction">—</span></div>
     <div class="item"><span class="label">任务ID</span><span class="value" id="st-example">—</span></div>
     <div class="item"><span class="label">当前步</span><span class="value" id="st-step">—</span></div>
+    <div class="item"><span class="label">控制方式</span><span class="value" id="st-control">—</span></div>
     <div class="item"><span class="label">状态</span><span class="value" id="st-status"><span class="badge running">等待中</span></span></div>
     <div class="item"><span class="label">累计 Reward</span><span class="value" id="st-reward">—</span></div>
     <div class="item"><span class="label">最终结果</span><span class="value" id="st-result">—</span></div>
@@ -382,6 +383,7 @@
             <div class="run-row compact"><label for="local-maxsteps">最大决策步数</label><input id="local-maxsteps" type="number" value="15" min="1" max="200"></div>
             <div class="form-two"><div class="run-row"><label for="local-operation-timeout">下载等待上限（秒）</label><input id="local-operation-timeout" type="number" value="300" min="1"></div><div class="run-row"><label for="local-task-timeout">任务时限（秒）</label><input id="local-task-timeout" type="number" value="1800" min="1"></div></div>
             <div class="run-row compact"><label for="local-download-max-mib">单个下载上限（MiB，0 不限）</label><input id="local-download-max-mib" type="number" value="50" min="0" step="1"></div>
+            <div class="run-row"><label for="local-workspace-dir">默认工作目录</label><input id="local-workspace-dir" type="text" placeholder="留空使用项目 workspace；每次运行建立独立子目录"></div>
             <div class="field-tip">框架等待下载时暂停决策，不消耗步数；任务时限仍然计时。</div>
             <button id="btn-local-start" class="run-btn primary-launch">启动任务<svg><use href="#i-arrow"/></svg></button>
             <p class="form-footnote">本机任务使用 Windows 浏览器环境。启动后可在实时监控中查看进度。</p>
@@ -632,8 +634,11 @@ function renderStatus(s) {
     setText('st-instruction', s.instruction);
     setText('st-example', s.example_id);
     setText('st-step', '0 / ' + s.max_steps);
+    setText('st-control', '—');
     setStatus('running', '运行中');
     setText('st-reward', '—'); setText('st-result', '—');
+  } else if (s.event === 'control_mode') {
+    setText('st-control', s.mode === 'desktop_takeover' ? '桌面接管 · 真实输入' : '后台浏览器 · CDP');
   } else if (s.event === 'step') {
     statusState.step = s.step;
     setText('st-step', s.step + ' / ' + (statusState.max_steps || '?'));
@@ -935,6 +940,8 @@ function statusCardHtml(payload) {
   else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
   else if (payload.event === 'framework_wait') detail = waitDetail(payload);
   else if (payload.event === 'duplicate_download') detail = '<strong>已拦截重复下载</strong><br>' + esc(payload.reason || '') + '<br>' + esc(payload.path || '');
+  else if (payload.event === 'workspace_ready') detail = '<strong>本次任务默认操作目录</strong><br>' + esc((payload.workspace || {}).workspace_dir || '') + '<br>下载、查找和改名默认使用此目录。';
+  else if (payload.event === 'control_mode') detail = payload.mode === 'desktop_takeover' ? '<strong>桌面接管模式</strong><br>观察整个虚拟桌面；操作会使用真实鼠标键盘。' : '<strong>后台浏览器模式</strong><br>CDP 页面截图与虚拟输入，不操作用户鼠标键盘。';
   else if (payload.event === 'operation_feedback') detail = '<strong>系统观察反馈</strong><br>' + (payload.facts || []).map(x => esc(x)).join('<br>');
   else if (payload.event === 'decision_judgment') detail = '<strong>Decision 任务环境分类</strong>' + judgmentDetail(payload.judgment || {});
   else if (payload.event === 'decision_format_error') detail = '本次候选动作尚未执行：' + esc(payload.reason || '') + (payload.status === 'retry' ? '；正在修正候选动作。' : '；候选动作重试已结束。');
@@ -1397,6 +1404,7 @@ document.getElementById('btn-local-start').addEventListener('click', () => {
     max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
     operation_timeout_s: Number(document.getElementById('local-operation-timeout').value),
     download_max_mib: Number(document.getElementById('local-download-max-mib').value),
+    workspace_dir: document.getElementById('local-workspace-dir').value.trim(),
     task_timeout_s: Number(document.getElementById('local-task-timeout').value),
     model: document.getElementById('run-model').value,
     model_url: document.getElementById('run-model-url').value,

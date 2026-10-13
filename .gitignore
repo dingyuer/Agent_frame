@@ -20,6 +20,8 @@ venv/
 logs/
 runs/
 outputs/
+workspace/
+downloads/
 human_runs/
 
 # Editor and operating system files

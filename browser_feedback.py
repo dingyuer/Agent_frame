@@ -20,7 +20,7 @@ def active_paper(completion, step=None):
     goals = completion.paper_goals()
     ids = set((step or {}).get('check_ids', []))
     ids.update(p.get('check_id') for p in (step or {}).get('verification', [])
-               if p.get('kind') == 'download_complete')
+               if p.get('kind') in {'download_complete', 'download_valid'})
     selected = [g for g in goals if g['check_id'] in ids]
     goals = selected or goals
     # Do not pick an arbitrary paper for a multi-paper task.
@@ -69,7 +69,10 @@ def paper_action_error(action, obs, goal, route=None):
 
 def operational_facts(obs, completion, report, step=None, *, os_name=""):
     """Only public binding + browser event evidence, never model-written facts."""
-    lines = []
+    lines = workspace_facts(obs)
+    inspecting = (step or {}).get('phase') == 'inspect_download'
+    if inspecting and completion:
+        report = {'checks': completion.download_progress()}
     goal = active_paper(completion, step)
     if goal:
         binding = goal['binding']
@@ -82,6 +85,7 @@ def operational_facts(obs, completion, report, step=None, *, os_name=""):
             lines.append('当前打开的是其他论文，请回到上述已核实地址。')
     info = (obs.info or {}) if obs else {}
     if info.get('active_surface') == 'desktop':
+        lines.append('当前为桌面接管：截图覆盖虚拟桌面，界面输入会使用真实鼠标键盘。返回后台网页操作用 observe_browser。')
         foreground = next((a for a in info.get('runtime_state', {}).get('applications', []) if a.get('foreground')), None)
         if foreground:
             lines.append('系统观察到的前台窗口：' + str(foreground.get('process_name', '')) + ' / '
@@ -113,7 +117,8 @@ def operational_facts(obs, completion, report, step=None, *, os_name=""):
     rendering = info.get('render_wait', {})
     if rendering.get('status') == 'timeout':
         lines.append('PDF 渲染等待已超时，当前画面尚未确认就绪；请检查页面或切换观察，不要在空白画面反复保存。')
-    lines.extend(rename_ui_guidance(obs, completion, report, os_name))
+    if not inspecting:
+        lines.extend(rename_ui_guidance(obs, completion, report, os_name))
     return list(dict.fromkeys(lines))
 
 
@@ -178,6 +183,22 @@ def rename_ui_guidance(obs, completion, report, os_name):
     lines.append('按新截图逐步操作：资源管理器地址栏 Ctrl+L，输入下载目录 '
                  + json.dumps(str(path.parent), ensure_ascii=False) + ' 并 Enter；选中上述原文件后按 F2，编辑名称并 Enter 确认。')
     lines.append('注意扩展名：若重命名框只显示名称主体，保留系统隐藏的扩展名，避免生成双重 .pdf；显示完整文件名时填写完整目标名。最终仍以框架文件验收为准。')
+    return lines
+
+
+def workspace_facts(obs):
+    """Paths are framework-owned episode metadata, never planner guesses."""
+    state = (obs.info or {}).get('initial_state', {}) if obs else {}
+    path = state.get('workspace_dir') or state.get('downloads_dir')
+    if not isinstance(path, str) or not path or any(ord(c) < 32 for c in path):
+        return []
+    import json
+    remote = state.get('workspace_location') == 'controller_host'
+    lines = [('框架产物目录（控制器本机）' if remote else '本次任务默认操作目录') + '：' + json.dumps(path, ensure_ascii=False)]
+    if remote:
+        lines.append('此目录不保证在远程桌面可见；未配置共享目录时不要把控制器路径输入远程文件管理器。')
+    else:
+        lines.append('下载、查找、改名和另存默认在此目录；只有原始任务明确指定其他文件或路径时才改用指定位置。')
     return lines
 
 
