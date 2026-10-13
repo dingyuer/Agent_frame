@@ -241,6 +241,8 @@ select { cursor: pointer; border-radius: 8px; }
 .review-running .review-state { color: #48765b; }
 .review-passed .review-state { color: #298056; }
 .review-unknown .review-state { color: #99743c; }
+.review-evidence { overflow-wrap: anywhere; }
+.review-evidence small { display: block; color: #68806d; line-height: 1.8; }
 
 /* Short entrances; visible content never waits behind a long stagger. */
 [id^="view-"].active > .scroll { animation: studio-view-in 320ms var(--ease-out); }

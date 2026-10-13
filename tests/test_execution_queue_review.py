@@ -78,7 +78,7 @@ def test_policy_cannot_rewrite_task_queue_or_completed_list():
     assert memory.known_facts["hint"] == "unverified"
 
 
-def test_code_check_advances_queue_and_next_input_has_only_window():
+def test_code_check_advances_queue_and_next_input_has_only_current_goal():
     steps = [step(f"步骤{i}", [{"kind": "url_equals", "url": f"https://example.test/{i}"}]) for i in range(7)]
     p, policy, _ = pipeline([{"type": "goto", "url": "https://example.test/0"},
                             {"type": "goto", "url": "https://example.test/1"}], steps)
@@ -86,7 +86,8 @@ def test_code_check_advances_queue_and_next_input_has_only_window():
     assert result.plan["steps"][0]["status"] == result.plan["steps"][1]["status"] == "done"
     assert result.plan["steps"][2]["status"] == "doing"
     user = policy.calls[2][-1]["content"]
-    assert "步骤0" in user and "步骤1" in user and "步骤2" in user
+    assert "步骤1" in user and "步骤0" not in user and "步骤2" not in user
+    assert 'execution_queue' not in user and 'current_checks' not in user and 'review_id' not in user
     assert "步骤6" not in user and "legacy bloated prompt" not in json.dumps(policy.calls[2])
     assert result.trajectory[0]["step_verification"]["method"] == "code"
     assert len(policy.calls) == 3 and not result.review_calls

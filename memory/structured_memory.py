@@ -35,6 +35,7 @@ class StructuredMemory:
     known_facts: Dict[str, Any] = field(default_factory=dict)   # 关键事实（key -> value）
     failure_memory: List[str] = field(default_factory=list)     # 最近 1~3 个重要失败
     action_history: List[str] = field(default_factory=list)     # 完整动作历史：每步做了什么 + 结果
+    decision_notes: List[str] = field(default_factory=list)     # 操作员一句话摘要；不是成功证据
 
     # ---- 控制状态（程序维护）----
     expected_effect: str = ""          # 上一步动作的预期效果
@@ -87,6 +88,17 @@ class StructuredMemory:
         if outcome:
             line += f" → {outcome}"
         self.action_history.append(line)
+
+    def add_decision_note(self, step: int, summary: str, action: str, status: str) -> None:
+        text = ' '.join(str(summary or '').split())[:160]
+        if not text:
+            text = '尝试执行 ' + ' '.join(action.split())[:140]
+        # Keep dispatch failures attached to the intention so later summaries
+        # cannot turn an attempted action into an accomplished fact.
+        outcome = {'executed': '已派发', 'rejected': '被拒绝，未执行', 'failed': '执行失败',
+                   'error': '执行出错', 'uncertain': '结果不确定', 'pending': '处理中',
+                   'in_progress': '处理中'}.get(status, '结果待核实')
+        self.decision_notes.append(f'{step}. {text}〔{outcome}〕')
 
     # ---- 渲染给模型 ----
     def to_text(self, include_plan: bool = True) -> str:

@@ -536,7 +536,7 @@ def _start_local(cfg: dict):
 
 def _wait_cli_args(cfg):
     import math
-    result = []
+    result = _judge_cli_args(cfg)
     for field, flag, default in (("operation_timeout_s", "--operation-timeout", 300),
                                   ("task_timeout_s", "--task-timeout", 1800)):
         try:
@@ -547,6 +547,24 @@ def _wait_cli_args(cfg):
             raise ValueError("等待时限必须是大于零的秒数")
         result += [flag, str(value)]
     return result
+
+
+def _judge_cli_args(cfg):
+    """Both runners use the same validated optional System One configuration."""
+    from osworld_agent.model.decision_judge import DecisionJudgeConfig
+    data = cfg.get('decision_judge') or {}
+    if not isinstance(data, dict):
+        raise ValueError('Decision 评估器配置必须是对象')
+    if data.get('api_key'):
+        raise ValueError('Decision 认证请在服务端设置 DECISION_JUDGE_API_KEY')
+    try:
+        value = DecisionJudgeConfig(**data)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('Decision 评估器配置无效') from exc
+    if not value.url:
+        return []
+    return ['--judge-url', value.url, '--judge-model', value.model, '--judge-revision', value.revision,
+            '--judge-threshold', str(value.threshold), '--judge-margin', str(value.margin), '--judge-timeout', str(value.timeout)]
 
 
 @app.post("/run/start")

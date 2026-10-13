@@ -4,6 +4,9 @@ from __future__ import annotations
 import copy
 from urllib.parse import urlsplit
 
+# Resource guard for pathological model output, not a requested plan length.
+MAX_PLAN_STEPS = 32
+
 
 def normalize_verification(value):
     """Planner predicates describe a step, never replace the task contract."""

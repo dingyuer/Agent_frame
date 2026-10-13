@@ -1,15 +1,15 @@
 """主循环流水线：观察 → 决策（证据先行）→ 定位 → 执行 → 控制状态更新。
 
 闭环设计（核心）：
-- 执行前，模型在 next_action 的同时说明 expected_effect（预期观察到什么）；
-- 执行后，模型先客观描述 observed_effect，再给 action_status（成功/失败）；
-- 程序对比 expected vs observed + 确定性卡死检测，得出 control_state；
-- Planner 只能 request_finish，程序验证后才真正结束。
+- 操作员输出 next_action 和一句话 summary；
+- 执行后由框架代码或独立核查员检查结果，维护执行队列；
+- 完整计划、验收证据与控制状态由框架保存，操作员只接收当前子目标；
+- request_finish 只是请求，框架验证后才真正结束。
 
 阶段（run() 里按序调用）：
   ① preprocess   预处理：确保观察 + 记录截图 + 构建记忆文本
-  ② build_input  构造输入：结构化记忆（含控制状态）+ 3 张截图
-  ③ decide       决策：observed_effect + action_status + state_update + next_action + expected_effect
+  ② build_input  构造输入：当前子目标 + 近期摘要 + 按预算选择的结构和截图
+  ③ decide       决策：next_action + summary（兼容旧字段）
   ④ ground       grounding：描述→坐标，记录坐标供下一步标记
   ⑤ execute      执行：skill / shell / subagent / terminal(request_finish|fail) / env
   ⑥ postprocess  后处理：记录 expected/observed + 控制状态 + 卡死检测 + Finish 验证
@@ -41,11 +41,13 @@ from .skills import SkillContext
 from .prompts import build_format_feedback, build_planner_prompt
 from .context import PromptCompiler, ContextBudgetError, ObservationIncompleteError
 from .verifiers import CompletionVerifier
-from .task_specs import task_profile
+from .task_specs import task_profile, task_analysis, audit_requirement_proposals, TASK_ANALYSIS_VERSION
+from .step_progress import ProgressConfig, StepProgressMonitor
+from .model.decision_judge import DecisionJudge, DecisionJudgeConfig
 from .paper_workflow import PaperWorkflow, WORKFLOW_VERSION, binding_group_hash
 from .paper_resolver import ADAPTER_VERSION
-from .execution_queue import ExecutionQueue, normalize_verification
-from .decision_context import action_scope, scoped_system, selected_memory
+from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS
+from .decision_context import action_scope, scoped_system, selected_memory, current_brief
 from .step_verifier import StepReviewer, code_review, make_review_model
 from .actions import BASIC_ACTIONS
 
@@ -151,6 +153,10 @@ class StepState:
     last_browser_page: Dict[str, Any] = field(default_factory=dict)
     queue: Optional[ExecutionQueue] = None
     step_review: Dict[str, Any] = field(default_factory=dict)
+    progress_monitor: Optional[StepProgressMonitor] = None
+    step_progress: Dict[str, Any] = field(default_factory=dict)
+    routing_hint: Dict[str, Any] = field(default_factory=dict)
+    finish_feedback: str = ""
 
 
 @dataclass
@@ -158,6 +164,7 @@ class Decision:
     """③ 决策阶段的产出（先分析当前屏幕 → 证据先行 → 预期效果）。"""
     raw: str = ""
     action: Optional[Action] = None
+    summary: str = ""                    # 一句话观察与行动计划；非完成证据
     screen_analysis: str = ""            # 当前屏幕状态描述（含打开的应用）
     observed_effect: str = ""            # 上一步动作的实际观察（先客观描述）
     action_status: str = ""              # success / failure / uncertain
@@ -192,7 +199,7 @@ class Pipeline:
                  early_stop_repeat: int = 3, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
                  planner_model=None, event_path=None, run_id=None, run_manifest=None, max_replans=1,
-                 wait_config=None, verifier_model=None):
+                 wait_config=None, verifier_model=None, progress_config=None, decision_judge=None):
         self.model = model
         self.grounding = grounding
         self.env = env
@@ -219,6 +226,9 @@ class Pipeline:
         self.planning_calls = []
         self._verification = None         # 最近一次 finish 验证的调用记录
         self.wait_config = wait_config if isinstance(wait_config, WaitConfig) else WaitConfig(**(wait_config or {}))
+        self.progress_config = progress_config if isinstance(progress_config, ProgressConfig) else ProgressConfig(**(progress_config or {}))
+        judge_config = decision_judge if isinstance(decision_judge, DecisionJudgeConfig) else DecisionJudgeConfig(**(decision_judge or {}))
+        self.decision_judge = DecisionJudge(judge_config) if judge_config.url else None
         self._task_deadline = None
         self.verifier_model = verifier_model if verifier_model is not None else make_review_model(model)
         self.reviewer = StepReviewer(self.verifier_model, self.compiler)
@@ -289,8 +299,8 @@ class Pipeline:
         root = Path(__file__).resolve().parent
         source_hash = hashlib.sha256()
         for name in ("pipeline.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
-                     "execution_queue.py", "step_verifier.py", "decision_context.py", "desktop_state.py",
-                     "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py"):
+                     "execution_queue.py", "step_verifier.py", "step_progress.py", "decision_context.py", "memory/structured_memory.py", "desktop_state.py",
+                     "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
             source_hash.update(name.encode())
             source_hash.update((root / name).read_bytes())
         manifest = {"run_id": self.run_id, "task": task, "framework_source_hash": source_hash.hexdigest(),
@@ -301,6 +311,7 @@ class Pipeline:
                     "grounder_trainable": False, "verifier_trainable": False,
                     "verifier_model": model_record(self.verifier_model), "max_steps": self.max_steps,
                     "public_completion": self.completion.public_spec,
+                    "task_analysis": task_analysis(task, self.completion.public_spec),
                     "completion_hash": hashlib.sha256(json.dumps(self.completion.spec, sort_keys=True).encode()).hexdigest(),
                     **self.run_manifest}
         manifest["run_id"] = self.run_id
@@ -308,9 +319,11 @@ class Pipeline:
                    "max_retries": self.max_retries, "max_replans": self.max_replans,
                    "early_stop_repeat": self.early_stop_repeat,
                    "failure_repeat_limit": _FAILURE_REPEAT_LIMIT, "wait_config": asdict(self.wait_config),
+                   "progress_config": asdict(self.progress_config), "task_analysis_version": TASK_ANALYSIS_VERSION,
+                   "decision_judge": self.decision_judge.config.public() if self.decision_judge else None,
                    "paper_resolver_version": ADAPTER_VERSION, "paper_workflow_version": WORKFLOW_VERSION,
                    "enable_reflection": self.enable_reflection, "verifier_model": model_record(self.verifier_model),
-                   "decision_context_version": "step_scoped_v1", "step_verifier_version": "1.0",
+                   "decision_context_version": "current_step_brief_v2", "max_plan_steps": MAX_PLAN_STEPS, "step_verifier_version": "1.0",
                    "decision_model": model_record(self.model), "planner_model": model_record(self.planner_model)}
         manifest["runtime_config"] = runtime
         manifest["runtime_config_hash"] = hashlib.sha256(
@@ -326,6 +339,13 @@ class Pipeline:
     def _run(self, task: str, result: AgentResult) -> AgentResult:
         state = self._init_state(task)
         state.task_profile = task_profile(task, self.completion.public_spec)
+        if self.decision_judge:
+            state.routing_hint['task'] = self.decision_judge.classify_task(task, remaining_s=self._task_time_remaining())
+            self._record_typed_judge()
+            state.task_profile['execution_hint'] = state.routing_hint['task']
+            result.run_manifest['task_routing_hint'] = copy.deepcopy(state.routing_hint['task'])
+            self._publish_diagnostic('decision_judgment', judgment=state.routing_hint['task'])
+        self._publish_diagnostic('task_analysis', analysis=task_analysis(task, self.completion.public_spec))
         unresolved = [c["text"] for c in self.completion.public_spec.get("checks", [])
                       if c.get("kind") == "unresolved_requirement"]
         if unresolved:
@@ -387,9 +407,14 @@ class Pipeline:
                 state.verification = self.completion.evaluate()
                 failure = "model_transport" if decision.calls and decision.calls[-1].get("error_type") else "parse_failure"
                 state.execution_status = "rejected"
+                validation_error = decision.calls[-1].get('validation_error', '') if decision.calls else ''
                 state.execution_feedback = {"status": "rejected", "dispatched": False,
-                                            "error_code": failure, "reason": "未获得合法动作，未执行环境操作"}
+                                            "error_code": failure, "reason": "未获得合法动作，未执行环境操作"
+                                            + ("：" + validation_error[:200] if validation_error else "")}
                 self._count_failure(state, failure, None, state.obs)
+                self._track_step_progress(state, None, state.execution_feedback, state.obs,
+                                          review={"plan_step_id": state.queue.current['id'] if state.queue and state.queue.current else 'final',
+                                                  "status": "unknown"})
                 result.trajectory.append({
                     "step": step_no, "error": "动作解析失败",
                     "raw": (decision.raw or "")[-500:],
@@ -404,6 +429,7 @@ class Pipeline:
                     "next_observation": self._observation_record(state.obs, f"o_{step_no+1}"),
                     "execution_info": copy.deepcopy(state.execution_feedback),
                     "execution_status": "rejected", "verification": copy.deepcopy(state.verification),
+                    "step_progress": copy.deepcopy(state.step_progress),
                 })
                 self._emit("transition", transition=result.trajectory[-1])
                 state.memory.add_event("⚠️ 上一步动作解析失败，请重新输出合法的 next_action JSON")
@@ -414,7 +440,7 @@ class Pipeline:
                 if self._task_time_remaining() <= 0:
                     result.termination_reason = "task_timeout"
                     break
-                if state.memory.stall_count >= _FAILURE_REPEAT_LIMIT:
+                if state.memory.stall_count >= _FAILURE_REPEAT_LIMIT or state.step_progress.get('status') == 'stalled':
                     if self._recover_plan(state, result, step_no):
                         break
                 continue
@@ -543,7 +569,7 @@ class Pipeline:
         browser_events = {k: observation_info[k] for k in (
             "dialog", "dialogs", "tabs", "active_modals", "browser_events", "artifacts",
             "pending_downloads", "download_events", "download_candidates", "document_kind", "content_type", "screenshot_stale")
-            if k in observation_info}
+            if observation_info.get(k)}
         if browser_events:
             blocks.insert(0, {"kind": "browser_events", "text": json.dumps(browser_events, ensure_ascii=False)})
         if state.obs and state.obs.text:
@@ -551,16 +577,13 @@ class Pipeline:
         # 显式场景状态：让模型明确知道「有结构走 DOM / 无结构走视觉」
         hint = scene_hint(state.obs)
         blocks.insert(0, {"kind": "scene", "text": "当前场景: " + json.dumps(hint, ensure_ascii=False)})
-        auxiliary = json.dumps({"page_source": page_source, "browser_result": browser_result}, ensure_ascii=False)
+        tool_results = {k: v for k, v in {"page_source": page_source, "browser_result": browser_result}.items() if v}
+        auxiliary = json.dumps(tool_results, ensure_ascii=False) if tool_results else ""
         self._active_actions = action_scope(state.queue.current if state.queue else None, state.obs,
                                             bool(getattr(self.env, "browser_only", False)))
         system = scoped_system(self._active_actions, state.obs, getattr(self.env, "os_name", "linux"))
         current = state.queue.current if state.queue else None
-        linked_ids = set((current or {}).get("check_ids", []))
-        required = {"execution_queue": state.queue.window() if state.queue else {},
-                    "recovery": state.recovery, "execution_feedback": state.execution_feedback,
-                    "step_review": state.step_review,
-                    "current_checks": [c for c in self.completion.public_spec.get("checks", []) if c.get("id") in linked_ids]}
+        required = current_brief(state, self.completion.public_spec.get('checks', []) if self.completion else [])
         images = self._build_images(state) if getattr(self.model, "vision", True) else []
         if observation_info.get("dialog"):
             # Native JS dialogs may block a new screenshot. Their fresh event
@@ -569,11 +592,11 @@ class Pipeline:
         user_text, images, metadata = self.compiler.compile(
             system=system, task=state.task, memory=state.memory_text,
             blocks=blocks, auxiliary=auxiliary, focus=(current or {}).get("goal", ""),
-            required=json.dumps(required, ensure_ascii=False),
+            required=required, required_title="当前子任务", memory_title="近期行动摘要（当时的观察与计划，非完成证据）", recent_memory=True,
             images=images,
             require_image=bool(getattr(self.model, "vision", True)) and not bool(observation_info.get("dialog")))
         metadata.update(selected_actions=self._active_actions, plan_window=state.queue.window() if state.queue else {},
-                        system_estimate=self.compiler.count(system), context_mode="step_scoped_v1")
+                        system_estimate=self.compiler.count(system), context_mode="current_step_brief_v2")
         state.prompt_metadata = metadata
         state.prompt_text = user_text
         if state.obs:
@@ -585,10 +608,11 @@ class Pipeline:
 
     def decide(self, messages: List[dict]) -> Decision:
         raw, action = "", None
-        screen_analysis = observed_effect = action_status = expected_effect = ""
-        state_update: Dict[str, Any] = {}
         calls: List[dict] = []
-        for _ in range(max(1, self.max_retries)):
+        base_messages = copy.deepcopy(messages)
+        messages = copy.deepcopy(base_messages)
+        attempts = max(1, self.max_retries)
+        for attempt in range(attempts):
             if self._task_time_remaining() <= 0:
                 break
             try:
@@ -601,42 +625,53 @@ class Pipeline:
                 self._record_call(call)
                 return Decision(raw="", action=None, calls=calls)
             call = copy.deepcopy(getattr(self.model, "last_call", {}))
-            call.update({"messages": copy.deepcopy(messages), "response": raw, "valid_action": False})
+            call.update({"messages": copy.deepcopy(messages), "response": raw, "valid_action": False,
+                         "format_attempt": attempt + 1})
             calls.append(call)
             obj = parse_decision(raw)
             action = action_from_decision(obj or {})
             if action is not None:
                 err = self._validate_action(action)
+                error_type = 'invalid_action'
                 patch = (obj or {}).get("state_update") or {}
-                if err is None and (not isinstance(patch, dict)
-                        or not isinstance(patch.get("known_fact_add", {}), dict)
-                        or not isinstance(patch.get("completed_add", []), list)
-                        or not isinstance(patch.get("pending_add", []), list)):
-                    err = "state_update 必须是对象，known_fact_add 是对象，completed_add/pending_add 是列表"
+                # Legacy auxiliary memory is optional. An invalid patch must
+                # not prevent an otherwise valid primitive from executing.
+                if not isinstance(patch, dict) or not isinstance(patch.get('known_fact_add', {}), dict):
+                    call['ignored_fields'] = ['state_update']
+                    patch = {}
                 if err is None:
                     call["valid_action"] = True
-                    screen_analysis = str((obj or {}).get("screen_analysis") or "")
-                    observed_effect = str((obj or {}).get("observed_effect") or "")
-                    action_status = str((obj or {}).get("action_status") or "")
-                    state_update = (obj or {}).get("state_update") or {}
-                    expected_effect = str((obj or {}).get("expected_effect") or "")
+                    def field(name):
+                        value = obj.get(name)
+                        return value if isinstance(value, str) else ''
+                    summary = field('summary') or field('screen_analysis')
+                    expected_effect = field('expected_effect') or summary
                     self._record_call(call)
-                    return Decision(raw=raw, action=action, screen_analysis=screen_analysis,
-                                    observed_effect=observed_effect, action_status=action_status,
-                                    state_update=state_update, expected_effect=expected_effect,
+                    return Decision(raw=raw, action=action, summary=summary,
+                                    screen_analysis=field('screen_analysis') or summary,
+                                    observed_effect=field('observed_effect'), action_status=field('action_status'),
+                                    state_update=patch, expected_effect=expected_effect,
                                     calls=calls)
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": build_format_feedback(err)})
             else:
-                messages.append({"role": "assistant", "content": raw})
-                if obj and "next_action" not in obj:
-                    feedback = "你的 JSON 里漏了 next_action 字段（screen_analysis/observed_effect/state_update 都写了，就缺 next_action）。请补上 next_action，里面有 type 和对应参数。"
-                elif obj and "next_action" in obj and not isinstance(obj["next_action"], dict):
-                    feedback = "next_action 必须是一个对象（含 type 字段），现在不是合法对象。请改成 {\"type\": \"动作名\", ...}。"
+                if obj is None:
+                    err, error_type = '输出不是合法 JSON 对象', 'invalid_json'
+                elif 'next_action' not in obj:
+                    err, error_type = '缺少 next_action 对象，需要 type 和本轮列出的必填参数', 'missing_action'
                 else:
-                    feedback = "没有找到合法的 JSON 动作（需含 next_action）。"
-                messages.append({"role": "user", "content": build_format_feedback(feedback)})
+                    err, error_type = 'next_action 必须为包含 type 的对象', 'invalid_action'
+            call.update(validation_error=err, validation_error_type=error_type)
             self._record_call(call)
+            retry = attempt + 1 < attempts
+            self._publish_diagnostic('decision_format_error', status='retry' if retry else 'exhausted',
+                                     reason=err, error_type=error_type, attempt=attempt + 1, dispatched=False)
+            if retry:
+                # One bounded repair pair; do not append every malformed answer
+                # to the next attempt or carry it into the next decision step.
+                feedback = build_format_feedback(self.compiler.clip(err, 300))
+                budget = max(0, 1280 - self.compiler.count(feedback) - 128)
+                messages = [*copy.deepcopy(base_messages),
+                            {'role': 'assistant', 'content': self.compiler.clip(raw, budget)},
+                            {'role': 'user', 'content': feedback}]
         return Decision(raw=raw, action=None, calls=calls)
 
     def ground(self, action: Action, state: StepState) -> Action:
@@ -1142,6 +1177,7 @@ class Pipeline:
             "action_id": f"a_{step_no}",
             "observation_id": f"o_{step_no}",
             "screen_analysis": decision.screen_analysis,
+            "summary": decision.summary,
             "state_update": decision.state_update,
             "page_info": state.obs.text if state.obs else "",  # 决策时的页面信息（可交互元素+selector 或空）
             "action": self._compact_action(decision.action),
@@ -1173,6 +1209,8 @@ class Pipeline:
             adesc = self._action_desc(a.action, self._target_of(a))
             aoutcome = self._brief_outcome(execution)
             state.memory.add_action(step_no, adesc, aoutcome)
+            state.memory.add_decision_note(step_no, decision.summary or decision.screen_analysis, adesc,
+                                           str(execution.info.get('status') or ''))
         # 6) env 动作更新观察
         before_observation = state.obs
         before_screenshot = state.screenshot_history[-1] if state.screenshot_history else None
@@ -1188,7 +1226,8 @@ class Pipeline:
                               "instruction": "先根据当前截图和AX处理障碍，再重新定位原目标；不要直接重复原点击。"}
         elif state.recovery and execution.info.get("status") == "executed":
             state.recovery["status"] = "reobserve_original_target"
-        self._update_plan_progress(state, execution)
+        self._update_plan_progress(state, execution, before_observation=before_observation,
+                                   expected_effect=decision.expected_effect)
         result.trajectory[-1]["step_verification"] = copy.deepcopy(state.step_review)
         result.trajectory[-1]["execution_queue"] = state.queue.snapshot() if state.queue else {}
         # 6.5) 单步动作有效性校验：env 动作执行后屏幕无变化 → 当场提示换策略
@@ -1200,6 +1239,7 @@ class Pipeline:
                     "下一步请换一种方式（键盘快捷键 / 不同菜单路径 / 重新定位目标），不要重复同样的点击。")
         # 7) 控制状态 + 确定性卡死检测
         self._compute_control_state(state, decision, execution, before_screenshot, before_observation)
+        result.trajectory[-1]["step_progress"] = copy.deepcopy(state.step_progress)
         if state.step_review.get("status") == "passed":
             self._clear_stall(state)
             state.memory.control_state = "ADVANCE"
@@ -1230,6 +1270,7 @@ class Pipeline:
                 result.final_answer = "执行结束，但系统尚未验证任务完成。模型答复：" + execution.answer
                 should_break = True
             else:
+                state.finish_feedback = reason
                 state.memory.add_event(f"request_finish 未通过系统验证：{reason}")
         if execution.done:
             if execution.kind == "terminal":
@@ -1254,9 +1295,10 @@ class Pipeline:
     def _recover_plan(self, state: StepState, result: AgentResult, step_no: int) -> bool:
         if step_no >= self.max_steps:
             return False
-        self._emit("framework_recovery", status="requested", failure_class=state.failure_class,
+        self._publish_diagnostic("framework_recovery", status="requested", failure_class=state.failure_class,
                    failure_count=state.memory.stall_count, failure_key=state.failure_key,
-                   remaining_decisions=self.max_steps - step_no, policy_trainable=False)
+                   step_progress=state.step_progress,
+                   remaining_decisions=self.max_steps - step_no)
         repaired = False
         if self._replans < self.max_replans and self._task_time_remaining() > 0:
             self._replans += 1
@@ -1269,8 +1311,8 @@ class Pipeline:
         else:
             result.trajectory.append({"step": step_no, "early_stop": "持续失败且恢复预算耗尽"})
             result.termination_reason = "task_timeout" if self._task_time_remaining() <= 0 else "stalled"
-        self._emit("framework_recovery", status="replanned" if repaired else "exhausted",
-                   remaining_replans=max(0, self.max_replans - self._replans), policy_trainable=False)
+        self._publish_diagnostic("framework_recovery", status="replanned" if repaired else "exhausted",
+                   remaining_replans=max(0, self.max_replans - self._replans))
         return not repaired
 
     def _fill_prev_assessment(self, result: AgentResult, decision: Decision) -> None:
@@ -1321,6 +1363,10 @@ class Pipeline:
 
     @staticmethod
     def _plan_actions(names):
+        aliases = {"open_url": "goto", "navigate": "goto", "key_press": "press", "press_key": "press",
+                   "input_text": "type", "type_text": "type"}
+        if isinstance(names, list):
+            names = [aliases.get(n, n) if isinstance(n, str) else n for n in names]
         if not isinstance(names, list) or any(not isinstance(n, str) or n not in BASIC_ACTIONS for n in names):
             raise ValueError("actions 只能包含基础 GUI/DOM 动作")
         return list(dict.fromkeys(names))
@@ -1335,6 +1381,7 @@ class Pipeline:
         if repair:
             prompt += "\n当前计划受阻，请保留原目标，按以下已发生事实修订剩余步骤：\n" + json.dumps({
                 "previous_plan": state.memory.plan, "recovery": state.recovery,
+                "step_review": state.step_review, "step_progress": state.step_progress,
                 "phase_events": state.phase_events, "feedback": self.completion.public_report(state.verification),
                 "recent_actions": state.memory.action_history[-5:]}, ensure_ascii=False)
         messages = [{"role": "user", "content": prompt}]
@@ -1354,8 +1401,8 @@ class Pipeline:
                 self.planning_calls.append(call)
                 obj = parse_decision(raw)
                 steps = obj.get("steps") if isinstance(obj, dict) else None
-                if not isinstance(steps, list) or not 1 <= len(steps) <= 12:
-                    raise ValueError("steps 必须含 1~12 个具体步骤")
+                if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_PLAN_STEPS:
+                    raise ValueError(f"steps 必须是非空子目标列表；资源上限为 {MAX_PLAN_STEPS} 项，请合并同一目标的零碎动作")
                 normalized = []
                 for i, step in enumerate(steps, 1):
                     if not isinstance(step, dict) or not isinstance(step.get("goal"), str) or not step["goal"].strip():
@@ -1386,13 +1433,18 @@ class Pipeline:
                     if not isinstance(obj.get("keywords"), list) or not any(isinstance(k, str) and k.strip() for k in obj["keywords"]):
                         raise ValueError("论文搜索必须提供非空 keywords")
                 state.memory.plan = {"steps": normalized,
+                    "requirements": audit_requirement_proposals(task, obj.get("requirements")),
                     "keywords": obj.get("keywords") if isinstance(obj.get("keywords"), list) else [],
                     "final_check": str(obj.get("final_check") or ""),
                     "completion_spec": copy.deepcopy(self.completion.public_spec)}
                 state.memory.task_state["goal"] = task
                 state.memory.task_state["current_subgoal"] = normalized[0]["goal"]
                 state.queue = ExecutionQueue(state.memory.plan, revision=self._replans)
+                state.progress_monitor = StepProgressMonitor(self.progress_config)
+                state.step_progress = {}
                 state.queue.sync_memory(state.memory)
+                self._publish_diagnostic('task_analysis', analysis={**task_analysis(task, self.completion.public_spec),
+                    'requirement_proposals': state.memory.plan['requirements']})
                 self._publish_queue(state)
                 state.memory.add_event(f"已制定任务计划：{len(normalized)} 步。只有系统证据可核实步骤完成。")
                 call["valid_plan"] = True
@@ -1419,6 +1471,29 @@ class Pipeline:
             except Exception:
                 pass
 
+    def _publish_diagnostic(self, event, **payload):
+        self._emit(event, **payload, policy_trainable=False)
+        if _viz_log_status:
+            try:
+                _viz_log_status({'event': event, 'step': self._current_step, **payload})
+            except Exception:
+                pass
+
+    def _track_step_progress(self, state, action, info, before, review=None):
+        if state.queue is None:
+            return
+        if state.progress_monitor is None:
+            state.progress_monitor = StepProgressMonitor(self.progress_config)
+        report = state.step_review if review is None else review
+        step = next((s for s in state.queue.plan['steps'] if s['id'] == report.get('plan_step_id')), state.queue.current)
+        state.step_progress = state.progress_monitor.observe(step, report, before, state.obs, action, info)
+        self._publish_diagnostic('step_progress', report=state.step_progress)
+        if state.step_progress['status'] == 'stalled':
+            state.failure_class = 'step_no_progress'
+            state.failure_key = state.step_progress['plan_step_id']
+            state.memory.stall_count = state.step_progress['idle_decisions']
+            state.memory.add_event(state.step_progress['reason'])
+
     def _publish_queue(self, state):
         if not state.queue:
             return
@@ -1430,7 +1505,25 @@ class Pipeline:
             except Exception:
                 pass
 
-    def _review_visual(self, state, step, execution_info, code, identity):
+    def _record_typed_judge(self):
+        if self.decision_judge and self.decision_judge.last_call:
+            call = copy.deepcopy(self.decision_judge.last_call)
+            self.reviewer.calls.append(call)
+            self._record_call(call, 'verifier')
+
+    def _review_visual(self, state, step, execution_info, code, identity, before=None):
+        # Typed evaluator handles local effects/step checks. Whole-task semantic
+        # review keeps the independent reviewer and all hard completion gates.
+        typed = None
+        if self.decision_judge and step.get('id') not in {'whole_task', 'final'}:
+            self._publish_review({**identity, 'method': 'decision_model', 'status': 'running', 'reason': 'Decision 评估器正在核查动作前后证据'})
+            typed = self.decision_judge.review(state.task, step, before, state.obs, execution_info, code,
+                                               remaining_s=self._task_time_remaining())
+            self._record_typed_judge()
+            self._publish_review({**identity, **typed})
+            state.routing_hint['surface'] = typed.get('judgment', {}).get('answers', {}).get('surface', {})
+            if typed['status'] in {'passed', 'failed'}:
+                return {**identity, **typed}
         self._publish_review({**identity, "method": "model", "status": "running", "reason": "独立核查截图与补充证据"})
         previous = len(self.reviewer.calls)
         report = self.reviewer.visual_review(state.task, step, state.obs, execution_info, code,
@@ -1438,11 +1531,14 @@ class Pipeline:
         for call in self.reviewer.calls[previous:]:
             self._record_call(call, "verifier")
         report = {**identity, **report}
+        if typed:
+            report['decision_judgment'] = typed
         self._publish_review(report)
         return report
 
-    def _update_plan_progress(self, state: StepState, execution: Execution) -> None:
+    def _update_plan_progress(self, state: StepState, execution: Execution, before_observation=None, expected_effect='') -> None:
         """Review after each action, then advance exactly one queue entry on evidence."""
+        state.finish_feedback = ""
         step = state.queue.current if state.queue else None
         if step is None:
             step = {"id": "final", "goal": state.task, "expected_evidence": "原始任务的全部要求得到满足",
@@ -1457,10 +1553,14 @@ class Pipeline:
                       "evidence": ["completion_contract"], "checks": report.get("checks", [])}
         report = {**identity, **report}
         self._publish_review(report)
+        code_checks = copy.deepcopy(report.get('checks', []))
         if (report["status"] == "unknown" and execution.kind not in {"terminal", "deadline"}
                 and not (state.obs.info if state.obs else {}).get("pending_downloads")
                 and execution.info.get("status") not in {"pending", "in_progress"}):
-            report = self._review_visual(state, step, execution.info, report, identity)
+            review_execution = {k: execution.info[k] for k in ('status', 'error_code', 'action') if k in execution.info}
+            review_execution['expected_effect'] = expected_effect
+            report = self._review_visual(state, step, review_execution, report, identity, before=before_observation)
+        report['code_checks'] = code_checks
         state.step_review = report
         if state.queue:
             advanced = state.queue.accept_review(report)
@@ -1509,6 +1609,9 @@ class Pipeline:
     def _compute_control_state(self, state: StepState, decision: Decision,
                                execution: Execution, before_screenshot, before_observation=None) -> str:
         stall_reason = self._detect_stall(state, decision, execution, before_screenshot, before_observation)
+        self._track_step_progress(state, decision.action, execution.info, before_observation or state.obs)
+        if state.step_progress.get('status') == 'stalled':
+            stall_reason = state.step_progress['reason']
         if stall_reason:
             state.memory.control_state = "STALL"
             sig = self._stable_action_key(decision.action)

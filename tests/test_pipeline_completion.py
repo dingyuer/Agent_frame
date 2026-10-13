@@ -121,10 +121,11 @@ def test_compound_task_does_not_end_after_navigation_or_model_claim():
 
 
 def test_two_downloads_require_two_real_artifacts(tmp_path):
+    from test_pipeline_training import paper_plan
     urls = ["https://example.test/a.pdf", "https://example.test/b.pdf"]
     spec = {"checks": [{"id": name, "kind": "download", "url": url}
                        for name, url in zip(["a", "b"], urls)]}
-    model = Model([{"type": "click", "target": u} for u in urls])
+    model = Model([{"type": "click", "target": u} for u in urls], paper_plan())
     result = pipeline(model, Env(tmp_path), spec).run("下载两篇论文")
     assert result.success and result.steps == 2
     assert result.trajectory[0]["verification"]["status"] != "passed"
@@ -280,7 +281,8 @@ def test_current_step_and_exact_criteria_survive_without_entire_plan():
     pipeline(model, Env(), {"checks": checks}, steps=1).run("填写全部字段")
     decision_prompt = model.calls[1][-1]["content"]
     assert "步骤0：" in decision_prompt and "precise_value_0" in decision_prompt
-    assert "步骤1：" in decision_prompt  # nearby step
+    assert "步骤1：" not in decision_prompt  # only current goal and its actual operands
+    assert 'check_ids' not in decision_prompt and 'current_checks' not in decision_prompt
     assert "步骤11：" not in decision_prompt and "precise_value_11" not in decision_prompt
 
 

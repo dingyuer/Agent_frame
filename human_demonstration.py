@@ -177,12 +177,13 @@ class HumanDemonstrationSession:
         blocks.insert(0, {'kind': 'scene', 'text': '当前场景: ' + json.dumps(scene_hint(before), ensure_ascii=False)})
         if before.text:
             blocks.append({'kind': 'desktop_a11y', 'text': before.text})
-        earlier_actions = [copy.deepcopy(step['history_entry']) for step in self.steps]
+        earlier_actions = [copy.deepcopy(step['history_entry']) for step in self.steps[-8:]]
+        history = '\n'.join(json.dumps(entry, ensure_ascii=False, separators=(',', ':')) for entry in earlier_actions)
         user_text, images, prompt_metadata = self.compiler.compile(
             system=self.system_prompt, task=self.task,
-            memory=json.dumps({'earlier_actions': earlier_actions}, ensure_ascii=False),
+            memory=history, memory_title='近期人工操作（实际记录，非完成证据）', recent_memory=True,
             blocks=blocks, auxiliary='',
-            required=json.dumps({'plan': None, 'completion_spec': self.verifier.public_spec}, ensure_ascii=False),
+            required='按总任务继续操作；人工示范未提供子任务计划。', required_title='当前子任务',
             images=[('【当前截图 S(t)，原图】', observation['screenshot'])] if observation['screenshot'] else [],
             require_image=bool(observation['screenshot']))
         # Non-AX blocks also have a budget. Conservatively require the complete

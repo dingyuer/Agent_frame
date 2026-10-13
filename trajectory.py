@@ -89,6 +89,7 @@ def build_trajectory(
             "page_info": s.get("page_info", ""),
             "prompt_text": s.get("prompt_text", ""),
             "reasoning": {
+                "summary": s.get("summary", ""),
                 "screen_analysis": s.get("screen_analysis", ""),
                 "expected_effect": s.get("expected_effect", ""),
                 "state_update": s.get("state_update") or {},
@@ -118,6 +119,7 @@ def build_trajectory(
             "framework_operations": copy.deepcopy(s.get("framework_operations", [])),
             "verification": s.get("verification"),
             "step_verification": copy.deepcopy(s.get("step_verification", {})),
+            "step_progress": copy.deepcopy(s.get("step_progress", {})),
             "step_reviews": copy.deepcopy(s.get("step_reviews", [])),
             "execution_queue": copy.deepcopy(s.get("execution_queue", {})),
             "timing_ms": s.get("timing_ms", {}),

@@ -31,6 +31,8 @@ def main() -> None:
         early_stop_repeat=cfg.agent.early_stop_repeat,
         max_replans=cfg.agent.max_replans,
         wait_config=cfg.agent.wait_config,
+        progress_config=cfg.agent.progress_config,
+        decision_judge=cfg.agent.decision_judge,
         completion_spec=cfg.completion,
         context_config=cfg.context,
         private_completion_spec=cfg.private_completion,

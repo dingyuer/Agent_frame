@@ -283,6 +283,8 @@ def main() -> int:
         pass
 
     parser = argparse.ArgumentParser(description="Windows 本地手动任务运行器")
+    from osworld_agent.model.decision_judge import add_judge_arguments, judge_config_from_args
+    add_judge_arguments(parser)
     parser.add_argument("--task", required=True, help="自由文本任务描述")
     parser.add_argument("--model", default="Qwen3.6-27B")
     parser.add_argument("--model-url", default="http://10.44.101.62:8094/v1")
@@ -360,6 +362,7 @@ def main() -> int:
                       step_callback=_live_step, completion_spec=completion_spec,
                       private_completion_spec=private_completion_spec, planner_model=planner,
                       verifier_model=verifier,
+                      decision_judge=judge_config_from_args(args),
                       event_path=os.path.join(args.result_dir, "events.jsonl") if args.result_dir else None)
         if args.result_dir:
             set_results_dir(args.result_dir)

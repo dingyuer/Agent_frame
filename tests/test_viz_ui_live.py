@@ -105,6 +105,14 @@ def test_studio_human_demonstration_from_buttons_to_dataset(request, tmp_path):
             page.evaluate("""() => {
               addCard({kind:'status',event:'task_start',instruction:'核查测试',max_steps:8,ts:1});
               addCard({kind:'status',event:'step',step:1,ts:1});
+              addCard({kind:'status',event:'task_analysis',analysis:{kind:'paper_download',contract_status:'partial',check_count:1,
+                unresolved_requirements:['<script>bad()</script>']},ts:1});
+              for (const count of [1,4]) addCard({kind:'status',event:'step_progress',report:{plan_step_id:'p0_1',
+                goal:'搜索目标论文',status:count===4?'stalled':'watching',idle_decisions:count,limit:4,
+                reason:'当前子任务没有新的可核实进展'},ts:1});
+              addCard({kind:'status',event:'framework_recovery',status:'requested',ts:1});
+              addCard({kind:'status',event:'decision_judgment',judgment:{model:'vllm-sr/d3',model_version:'fixture-version',latency_ms:123,
+                answers:{task_type:{label:'mixed',confidence:.96,probabilities:{browser:.02,desktop:.01,mixed:.96,unknown:.01}}}},ts:1});
               addCard({kind:'status',event:'execution_queue',queue:{cursor:0,total:2,steps:[
                 {id:'p0_1',goal:'搜索目标论文',status:'doing'}, {id:'p0_2',goal:'下载 PDF',status:'pending'}]},ts:1});
               for (const status of ['running','unknown']) addCard({kind:'status',event:'step_verification',
@@ -116,13 +124,38 @@ def test_studio_human_demonstration_from_buttons_to_dataset(request, tmp_path):
             }""")
             assert page.locator('[data-kind="review"]').count() == 2  # pending cards update in place
             assert page.locator('[data-kind="execution-queue"]').count() == 1
+            assert page.locator('[data-diagnostic-id="task_analysis:task"]').count() == 1
+            assert '代码核查 + 语义审查' in page.locator('[data-diagnostic-id="task_analysis:task"]').inner_text()
+            assert '<script>bad()</script>' in page.locator('[data-diagnostic-id="task_analysis:task"]').inner_text()
+            assert page.locator('[data-diagnostic-id="step_progress:p0_1"]').count() == 1
+            assert '4 / 4' in page.locator('[data-diagnostic-id="step_progress:p0_1"]').inner_text()
+            assert '网页与桌面混合' in page.locator('#timeline').inner_text()
+            assert '96.0%' in page.locator('#timeline').inner_text()
+            assert 'fixture-version' in page.locator('#timeline').inner_text()
+            # Both sizes share the optional config path; no endpoint is invoked by selection.
+            page.locator('#nav-run').click()
+            page.locator('#judge-model').locator('xpath=ancestor::details').evaluate('el => el.open = true')
+            for model in ('vllm-sr/d3', 'vllm-sr/d3-flash'):
+                page.locator('#judge-model').select_option(model)
+                page.locator('#judge-url').fill('http://fixture.invalid:8899/v1')
+                assert page.evaluate('decisionJudgeConfig().model') == model
+            page.screenshot(path=str(tmp_path / 'studio-judge-settings.png'), full_page=True)
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            page.set_viewport_size({"width": 1440, "height": 1050})
+            page.locator('#judge-model').select_option('')
+            assert page.evaluate('decisionJudgeConfig()') == {}
             assert page.locator('.review-passed').inner_text().find('独立模型核查') >= 0
-            assert page.locator('.review-evidence').inner_text() == '<script>bad()</script>'
+            assert page.locator('.review-passed .review-evidence').inner_text() == '<script>bad()</script>'
             assert page.locator('#st-step').inner_text() == '1 / 8'
             page.locator('#nav-live').click()
             expect(page.locator('.review-passed')).to_be_visible()
             expect(page.locator('[data-kind="execution-queue"]')).to_be_visible()
             assert 'undefined' not in page.locator('#timeline').inner_text()
+            page.evaluate("renderStatus({event:'framework_recovery',status:'exhausted'})")
+            expect(page.locator('#st-status .failed')).to_have_text('恢复预算耗尽')
+            page.evaluate("renderStatus({event:'step_verification',method:'decision_model',status:'running'})")
+            expect(page.locator('#st-status')).to_have_text('Decision 3.0 核查 · 进行中')
             page.screenshot(path=str(tmp_path / 'studio-step-review.png'), full_page=True)
             page.set_viewport_size({"width": 390, "height": 844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

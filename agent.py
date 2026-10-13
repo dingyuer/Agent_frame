@@ -23,7 +23,7 @@ class Agent:
                  code_agent_budget: int = 20, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
                  planner_model=None, event_path=None, run_manifest=None, max_replans=1,
-                 wait_config=None, verifier_model=None):
+                 wait_config=None, verifier_model=None, progress_config=None, decision_judge=None):
         self.model = decision_model
         self.grounding = grounding
         self.env = env
@@ -33,6 +33,8 @@ class Agent:
         self.early_stop_repeat = early_stop_repeat
         self.max_replans = max_replans
         self.wait_config = wait_config
+        self.progress_config = progress_config
+        self.decision_judge = decision_judge
         self.verifier_model = verifier_model
         self.step_callback = step_callback
         self.completion_spec = completion_spec
@@ -65,6 +67,8 @@ class Agent:
             early_stop_repeat=self.early_stop_repeat,
             max_replans=self.max_replans,
             wait_config=self.wait_config,
+            progress_config=self.progress_config,
+            decision_judge=self.decision_judge,
             step_callback=self.step_callback,
             completion_spec=self.completion_spec if completion_spec is None else completion_spec,
             context_config=self.context_config,

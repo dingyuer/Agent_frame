@@ -401,6 +401,12 @@
           <details class="inline-details"><summary>认证与 Provider</summary><div class="run-row"><label>Provider</label><select id="run-model-provider"><option value="openai">OpenAI compatible</option><option value="anthropic">Anthropic</option><option value="vllm" selected>vLLM</option><option value="gemini">Gemini</option><option value="open_router">OpenRouter</option></select></div><div class="run-row"><label>API Key</label><input id="run-model-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
           <div class="model-section"><div class="model-label"><span class="model-dot muted"></span>定位模型<span>视觉回退 · 元素定位</span></div>
           <div class="run-row"><label for="run-ground">模型</label><select id="run-ground"></select></div><div class="run-row"><label for="run-ground-url">服务地址</label><input id="run-ground-url" value="http://7.246.80.189:8001/v1" placeholder="http://模型主机:端口/v1"></div><details class="inline-details"><summary>认证</summary><div class="run-row"><label>API Key</label><input id="run-ground-apikey" type="password" value="EMPTY" autocomplete="off"></div></details></div>
+          <details class="inline-details"><summary>Decision 3.0 评估器（可选）</summary>
+            <div class="run-row"><label for="judge-model">评估模型</label><select id="judge-model"><option value="">关闭</option><option value="vllm-sr/d3-flash">d3-flash · 9B</option><option value="vllm-sr/d3">d3 · 27B</option></select></div>
+            <div class="run-row"><label for="judge-url">服务地址</label><input id="judge-url" placeholder="http://评估模型主机:8899/v1"></div>
+            <div class="run-row"><label for="judge-revision">权重版本（可选）</label><input id="judge-revision" placeholder="部署版本或 commit，便于比较实验"></div>
+            <p class="field-tip">提供操作环境分类与步骤核查；判断不确定时回退独立审查。概率仅表示模型评分。</p>
+          </details>
           <button id="btn-test" class="studio-btn secondary full-width">测试决策模型连接</button><div id="test-result" class="run-note" style="display:none"></div>
         </section>
         <details class="advanced-settings"><summary><svg><use href="#i-sliders"/></svg><div>高级实验设置<small>记忆、视觉策略与提示词预设</small></div><span class="subtle-pill">预览 · 尚未接入</span></summary><div class="advanced-notice">这些实验控件为配置预览；当前运行后端尚未完整接入，修改不保证影响任务执行。</div><div class="advanced-grid">        <div class="run-panel">
@@ -635,9 +641,14 @@ function renderStatus(s) {
     // 真正成功/失败要等 task_end 的 result，故用中性态"已结束（待评分）"。
     if (s.done) { statusState.done = true; setStatus('ended', '已结束（待评分）'); }
   } else if (s.event === 'step_verification') {
-    setStatus('running', (s.method === 'model' ? '独立模型核查' : '代码核查') + ' · ' + ({running:'进行中',passed:'通过',failed:'尚未完成',unknown:'证据不足'}[s.status] || ''));
+    const method = s.method === 'decision_model' ? 'Decision 3.0 核查' : s.method === 'model' ? '独立模型核查' : '代码核查';
+    setStatus('running', method + ' · ' + ({running:'进行中',passed:'通过',failed:'尚未完成',unknown:'证据不足'}[s.status] || ''));
+  } else if (s.event === 'decision_format_error') {
+    setStatus('running', s.status === 'retry' ? '修正动作格式 · 尚未执行' : '动作格式未通过');
   } else if (s.event === 'framework_wait') {
     setStatus('running', s.status === 'completed' ? '等待结束，正在验收' : '等待下载 · 不消耗步数');
+  } else if (s.event === 'framework_recovery') {
+    setStatus(s.status === 'exhausted' ? 'failed' : 'running', s.status === 'requested' ? '正在重新规划' : s.status === 'replanned' ? '重新规划完成' : '恢复预算耗尽');
   } else if (s.event === 'executing') {
     setStatus('running', '正在执行');
   } else if (s.event === 'task_end') {
@@ -838,7 +849,7 @@ function updateWaitCard(tl, payload) {
 function reviewCardHtml(report) {
   const labels = {running:'正在核查', passed:'核查通过', failed:'尚未完成', unknown:'证据不足'};
   const state = ['running','passed','failed','unknown'].includes(report.status) ? report.status : 'unknown';
-  const method = report.method === 'model' ? '独立模型核查' : '代码核查';
+  const method = report.method === 'decision_model' ? 'Decision 3.0 核查' : report.method === 'model' ? '独立模型核查' : '代码核查';
   const evidence = (report.evidence || []).map(e => '<li>' + esc(String(e)) + '</li>').join('');
   return '<div class="card review-card review-' + state + '" data-kind="review">' +
     '<div class="card-head"><span class="tag status">' + method + '</span><span class="review-state">' +
@@ -846,6 +857,7 @@ function reviewCardHtml(report) {
     '<span class="step">动作 ' + esc(String(report.decision_step ?? '—')) + ' · ' + esc(report.plan_step_id || '') + '</span></div>' +
     '<div class="card-body"><div class="texts"><strong>' + esc(report.goal || '') + '</strong><p>' + esc(report.reason || '') +
     '</p>' + (evidence ? '<ul class="review-evidence">' + evidence + '</ul>' : '') +
+    (report.judgment ? judgmentDetail(report.judgment) : '') +
     '<small class="review-note">步骤状态由框架维护 · 核查不消耗操作步数</small></div></div></div>';
 }
 function updateReviewCard(container, report) {
@@ -865,6 +877,46 @@ function updateQueueCard(container, queue) {
       esc(labels[s.status] || '待执行') + '</span>' + esc(s.goal || '') + '</li>').join('') + '</ol>';
 }
 
+function diagnosticCardHtml(payload) {
+  const analysis = payload.analysis || {};
+  const progress = payload.report || {};
+  const isTask = payload.event === 'task_analysis';
+  const labels = {deterministic:'代码核查',partial:'代码核查 + 语义审查',semantic:'需要语义审查'};
+  const states = {watching:'观察进展',waiting:'等待中 · 暂停计数',advanced:'步骤已通过',stalled:'需要重新规划'};
+  const title = isTask ? '任务理解与验收' : '子任务进展';
+  const pending = (analysis.unresolved_requirements || []).map(s => '<li>' + esc(String(s)) + '</li>').join('');
+  const proposals = (analysis.requirement_proposals?.accepted || []).map(r => '<li>' + esc(r.source_text) + '</li>').join('');
+  const evidence = (progress.evidence || []).map(s => '<li>' + esc(String(s)) + '</li>').join('');
+  const detail = isTask ? '<strong>' + (analysis.kind === 'paper_download' ? '论文下载' : '通用任务') +
+    ' · ' + esc(labels[analysis.contract_status] || '等待分析') + '</strong><p>可代码核查的条件：' + Number(analysis.check_count || 0) +
+    '</p>' + (pending ? '<p>待进一步核查的原始要求：</p><ul>' + pending + '</ul>' : '') +
+    (proposals ? '<p>规划器提取的候选要求（不作为完成证据）：</p><ul>' + proposals + '</ul>' : '') :
+    '<strong>' + esc(progress.goal || '') + '</strong><p>' + esc(states[progress.status] || '') +
+    ' · 连续未发现进展 ' + Number(progress.idle_decisions || 0) + ' / ' + Number(progress.limit || 0) +
+    '</p><p>' + esc(progress.reason || '') + '</p>' + (evidence ? '<ul>' + evidence + '</ul>' : '');
+  return '<div class="card review-card" data-kind="diagnostic"><div class="card-head"><span class="tag status">' +
+    title + '</span></div><div class="card-body"><div class="texts">' + detail + '</div></div></div>';
+}
+function updateDiagnosticCard(container, payload) {
+  const key = payload.event + ':' + (payload.report?.plan_step_id || 'task');
+  const previous = Array.from(container.querySelectorAll('[data-diagnostic-id]')).find(c => c.dataset.diagnosticId === key);
+  const temp = document.createElement('div'); temp.innerHTML = diagnosticCardHtml(payload);
+  const card = temp.firstElementChild; card.dataset.diagnosticId = key;
+  if (previous) previous.replaceWith(card); else container.appendChild(card);
+}
+
+function judgmentDetail(judgment) {
+  const questions = {task_type:'任务环境',surface:'当前操作表面',step:'子任务完成',effect:'动作效果'};
+  const labels = {browser:'网页任务',desktop:'桌面界面',mixed:'网页与桌面混合',unknown:'不确定',
+    browser_content:'网页内容',browser_chrome:'浏览器工具栏或系统对话框',passed:'达到预期',failed:'尚未达到',pending:'可能仍在进行'};
+  const answers = Object.entries(judgment.answers || {}).map(([key,value]) => '<li>' + esc(questions[key] || key) + '：' +
+    esc(labels[value.label] || value.label || '不确定') + ' · 最高选项 ' + Number((value.confidence || 0)*100).toFixed(1) + '%' +
+    '<small> ' + Object.entries(value.probabilities || {}).map(([label,p]) => esc(labels[label] || label) + ' ' + Number(p*100).toFixed(1) + '%').join(' / ') + '</small></li>').join('');
+  return '<p>' + esc(judgment.model || '') + ' · ' + Number(judgment.latency_ms || 0).toFixed(0) + ' ms' +
+    (judgment.model_version || judgment.revision ? ' · ' + esc(judgment.model_version || judgment.revision) : '') + '</p>' +
+    (answers ? '<ul class="review-evidence">' + answers + '</ul>' : '<p>评估器未给出有效判断，采用现有审查流程。</p>');
+}
+
 function statusCardHtml(payload) {
   const time = new Date(payload.ts * 1000).toLocaleTimeString();
   let detail = '';
@@ -877,6 +929,9 @@ function statusCardHtml(payload) {
   else if (payload.event === 'task_end') detail = (payload.success === true) ? '✅ 任务结束，成功' : ('任务结束，最终 result=' + payload.result);
   else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
   else if (payload.event === 'framework_wait') detail = waitDetail(payload);
+  else if (payload.event === 'decision_judgment') detail = '<strong>Decision 任务环境分类</strong>' + judgmentDetail(payload.judgment || {});
+  else if (payload.event === 'decision_format_error') detail = '本次候选动作尚未执行：' + esc(payload.reason || '') + (payload.status === 'retry' ? '；正在修正输出格式。' : '；格式重试已结束。');
+  else if (payload.event === 'framework_recovery') detail = esc(({requested:'当前路径受阻，正在重新规划',replanned:'重新规划完成，继续执行',exhausted:'恢复预算耗尽，停止执行'})[payload.status] || '恢复执行路径');
   else if (payload.event === 'executed') detail = '执行结果：' + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '');
   else detail = esc(payload.event || '');
   return '<div class="card status" data-kind="status">' +
@@ -976,7 +1031,9 @@ function addCard(payload) {
   } else if (payload.kind === 'status') {
     renderStatus(payload);
     if (payload.event === 'task_end') group.result = payload.result;
-    if (payload.event === 'step_verification') {
+    if (payload.event === 'task_analysis' || payload.event === 'step_progress') {
+      updateDiagnosticCard(tl, payload);
+    } else if (payload.event === 'step_verification') {
       updateReviewCard(tl, payload);
     } else if (payload.event === 'execution_queue') {
       updateQueueCard(tl, payload.queue || {});
@@ -1266,8 +1323,17 @@ document.getElementById('btn-test').addEventListener('click', () => {
   });
 });
 
+function decisionJudgeConfig() {
+  const model = document.getElementById('judge-model').value;
+  if (!model) return {};
+  const url = document.getElementById('judge-url').value.trim();
+  if (!url) { alert('请填写 Decision 评估器服务地址，或选择关闭。'); return null; }
+  return {model, url, revision: document.getElementById('judge-revision').value.trim()};
+}
 document.getElementById('btn-start').addEventListener('click', () => {
+  const judge = decisionJudgeConfig(); if (judge === null) return;
   const cfg = {
+    decision_judge: judge,
     test_all_meta_path: document.getElementById('run-testset').value,
     domain: document.getElementById('run-domain').value,
     task_id: document.getElementById('run-task').value || null,
@@ -1314,10 +1380,12 @@ document.getElementById('btn-start').addEventListener('click', () => {
 });
 
 document.getElementById('btn-local-start').addEventListener('click', () => {
+  const judge = decisionJudgeConfig(); if (judge === null) return;
   const task = document.getElementById('local-task').value.trim();
   if (!task) { alert('请输入任务描述'); return; }
   const cfg = {
     mode: 'local',
+    decision_judge: judge,
     task: task,
     max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
     operation_timeout_s: Number(document.getElementById('local-operation-timeout').value),
@@ -1635,7 +1703,7 @@ function localStepCard(runId, t) {
       (t.subagent.result ? '<div class="prompt">' + esc(t.subagent.result) + '</div>' : '');
   }
   return '<div class="card"><div class="card-head"><span class="step">Step ' + stepNum + '</span>' + channelHtml + elapsedHtml + statusHtml + '</div>' +
-    '<div class="card-body">' + shotHtml + '<div class="texts">' + promptHtml + actionHtml + planHtml + expectHtml + gHtml + subHtml + outcomeHtml + observeHtml + (t.step_reviews?.length ? t.step_reviews.map(reviewCardHtml).join('') : (t.step_verification ? reviewCardHtml(t.step_verification) : '')) + '</div></div></div>';
+    '<div class="card-body">' + shotHtml + '<div class="texts">' + promptHtml + actionHtml + planHtml + expectHtml + gHtml + subHtml + outcomeHtml + observeHtml + (t.step_reviews?.length ? t.step_reviews.map(reviewCardHtml).join('') : (t.step_verification ? reviewCardHtml(t.step_verification) : '')) + (t.step_progress ? diagnosticCardHtml({event:'step_progress',report:t.step_progress}) : '') + '</div></div></div>';
 }
 
 function loadRunDetail(model, domain, task) {

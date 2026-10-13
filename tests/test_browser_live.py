@@ -230,5 +230,5 @@ def test_real_pipeline_recovers_modal_and_verifies_paper(live_browser, tmp_path,
     assert len(calls) >= 4
     assert all(any(isinstance(m["content"], list) and any(p["type"] == "image_url" for p in m["content"])
                    for m in c["messages"]) for c in calls)
-    assert "resolve_obstruction" in str(calls[2]["messages"])
+    assert "先处理当前截图/AX中的遮挡" in str(calls[2]["messages"])
     assert events[-1]["event_type"] == "episode_end"

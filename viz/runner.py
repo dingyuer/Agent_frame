@@ -32,6 +32,8 @@ from osworld_agent.viz.logging import (  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    from osworld_agent.model.decision_judge import add_judge_arguments, judge_config_from_args
+    add_judge_arguments(parser)
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--examples-dir", required=True)
     parser.add_argument("--domain", default="all")
@@ -105,6 +107,7 @@ def main() -> None:
     agent = Agent(decision_model=model, grounding=grounding, env=env,
                   max_steps=args.max_steps, enable_reflection=False,
                   wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout},
+                  decision_judge=judge_config_from_args(args),
                   completion_spec=task_config.get("completion"),
                   private_completion_spec=task_config.get("private_completion"),
                   event_path=os.path.join(results_dir, "events.jsonl"))
