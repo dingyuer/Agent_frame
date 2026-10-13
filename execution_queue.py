@@ -9,7 +9,12 @@ MAX_PLAN_STEPS = 32
 
 
 def normalize_verification(value):
-    """Planner predicates describe a step, never replace the task contract."""
+    """Normalize unambiguous planner aliases without weakening predicates.
+
+    Scalar predicates may use ``value`` for their one operand. Element states
+    have multiple operands, so guessing what ``value`` means is not allowed.
+    The original sampled plan stays untouched for training and diagnosis.
+    """
     if value is None:
         return [{"kind": "visual"}]
     if not isinstance(value, list) or not 1 <= len(value) <= 8:
@@ -22,6 +27,15 @@ def normalize_verification(value):
             raise ValueError("未知的步骤 verification.kind")
         kind = item["kind"]
         key = required.get(kind)
+        if kind in {"url_equals", "url_host", "text_present", "app_open"} and "value" in item:
+            alias = item["value"]
+            if not isinstance(alias, str) or not alias.strip() or len(alias) > 1000:
+                raise ValueError(f"{kind}.value 别名需要非空字符串，对应规范字段 {key}")
+            if key in item and (not isinstance(item[key], str) or item[key].strip() != alias.strip()):
+                raise ValueError(f"{kind} 的 {key} 与 value 冲突，请只保留表达原意的 {key} 字段")
+            item = {**item, key: alias}
+        elif kind == "element_state" and "value" in item:
+            raise ValueError("element_state 不支持通用 value；请明确 name 和 states，文本输入值不属于 states")
         if key and (not isinstance(item.get(key), str) or not item[key].strip() or len(item[key]) > 1000):
             raise ValueError(f"{kind} 需要非空 {key}")
         clean = {"kind": kind}

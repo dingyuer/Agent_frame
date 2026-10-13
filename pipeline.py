@@ -1412,10 +1412,14 @@ class Pipeline:
                     ids = step.get("check_ids", [])
                     if not isinstance(ids, list) or any(not isinstance(x, str) or x not in check_ids for x in ids):
                         raise ValueError("check_ids 只能引用给定的系统验收条件；没有时用 []")
+                    try:
+                        verification = [] if ids and "verification" not in step else normalize_verification(step.get("verification"))
+                    except ValueError as exc:
+                        raise ValueError(f"第 {i} 个子目标 verification：{exc}") from exc
                     normalized.append({"idx": i, "goal": step["goal"].strip(),
                                        "expected_evidence": str(step.get("expected_evidence") or ""),
                                        "check_ids": ids, "phase": str(step.get("phase") or ""), "status": "pending",
-                                       "verification": [] if ids and "verification" not in step else normalize_verification(step.get("verification")),
+                                       "verification": verification,
                                        "actions": self._plan_actions(step.get("actions", []))})
                 if state.task_profile.get("kind") == "paper_download":
                     phases = {step["phase"] for step in normalized}

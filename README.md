@@ -71,6 +71,11 @@ git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
 一个规划步骤可以需要多次基础动作，只有核查通过才移到下一个步骤。队列全部核查通过后，还要
 检查整项原始任务，防止初始规划遗漏要求。
 
+规划谓词兼容单参数 `value` 别名：`url_host → host`、`url_equals → url`、
+`text_present → text`、`app_open → app`。原始模型回复保留，执行队列使用规范字段。
+别名仍经过类型、长度与原有语义校验；同时给出规范字段和 `value` 时必须一致。
+`element_state.value` 有歧义，不会猜成元素名或自动降级为视觉检查；错误反馈会指出具体子目标。
+
 前端实时监控显示执行队列、代码核查和独立模型核查的进行中/通过/未通过/证据不足状态，历史
 步骤保留两种核查的理由与证据。核查和自动等待不增加操作步数。
 

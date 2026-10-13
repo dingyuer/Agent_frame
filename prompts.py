@@ -115,6 +115,16 @@ def build_planner_prompt(task: str, completion_spec=None, profile=None) -> str:
 12. 同时输出 requirements 数组，逐项保留原始任务要求。每项 kind 为 paper_download/rename/other，source_text 必须逐字引用任务中的连续原文；paper_download.value 为原文查询词，rename.value 为原文文件名，不能补造扩展名或论文ID。这些是候选解释，不是可信验收条件；框架会检查引用，最终仍核对完整原始任务。无法拆分的要求用 other 保留原文，不得省略否定、数量、目录或附加要求。
 13. actions 使用以下精确动作名：{menu}。不要编造动作或调用后台下载/改名。类型提示与验收契约独立：即使系统 checks 为空，也必须保留用户目标与对应流程。
 
+verification 的 JSON 写法示例（仅示范字段，选择与本步目标相符的条件，不要整组照抄）：
+- 打开某域名：{{"kind":"url_host","host":"scholar.google.com"}}
+- 打开准确网址：{{"kind":"url_equals","url":"https://arxiv.org/"}}
+- 出现完整可见文字：{{"kind":"text_present","text":"示例完整标题"}}
+- 打开应用：{{"kind":"app_open","app":"notepad"}}
+- 勾选指定控件：{{"kind":"element_state","name":"示例复选框","role":"checkbox","states":{{"checked":true}}}}
+- 需要核对截图语义：{{"kind":"visual"}}
+按示例写 host/url/text/app 等字段，不要统一写成 value；element_state 必须明确 name 与 states。
+text_present 是完整可见文字匹配，不是关键词子串匹配；搜索短名不能证明论文身份，身份和全文结果需进一步核查。
+
 系统验收条件：{contract}
 任务流程模板：{workflow}
 
