@@ -546,6 +546,11 @@ def _wait_cli_args(cfg):
         if isinstance(cfg.get(field), bool) or not math.isfinite(value) or value <= 0:
             raise ValueError("等待时限必须是大于零的秒数")
         result += [flag, str(value)]
+    if 'download_max_mib' in cfg:
+        value = cfg['download_max_mib']
+        if type(value) is not int or value < 0:
+            raise ValueError('下载大小上限必须为非负整数 MiB，0 表示不限')
+        result += ['--download-max-mib', str(value)]
     return result
 
 

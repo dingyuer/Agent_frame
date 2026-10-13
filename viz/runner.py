@@ -52,6 +52,8 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--operation-timeout", type=float, default=300)
     parser.add_argument("--task-timeout", type=float, default=1800)
+    parser.add_argument("--download-max-mib", type=int, default=50,
+                        help="单文件下载资源上限 MiB，0 表示不限")
     parser.add_argument("--screen-width", type=int, default=1920)
     parser.add_argument("--screen-height", type=int, default=1080)
     args = parser.parse_args()
@@ -106,7 +108,8 @@ def main() -> None:
     # 5) 组装 + 跑
     agent = Agent(decision_model=model, grounding=grounding, env=env,
                   max_steps=args.max_steps, enable_reflection=False,
-                  wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout},
+                  wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout,
+                               "download_max_bytes": args.download_max_mib * 1024 * 1024},
                   decision_judge=judge_config_from_args(args),
                   completion_spec=task_config.get("completion"),
                   private_completion_spec=task_config.get("private_completion"),

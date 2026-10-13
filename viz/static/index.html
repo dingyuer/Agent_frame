@@ -381,6 +381,7 @@
             <div class="field-tip">描述明确的目标、限制和期望结果。</div>
             <div class="run-row compact"><label for="local-maxsteps">最大决策步数</label><input id="local-maxsteps" type="number" value="15" min="1" max="200"></div>
             <div class="form-two"><div class="run-row"><label for="local-operation-timeout">下载等待上限（秒）</label><input id="local-operation-timeout" type="number" value="300" min="1"></div><div class="run-row"><label for="local-task-timeout">任务时限（秒）</label><input id="local-task-timeout" type="number" value="1800" min="1"></div></div>
+            <div class="run-row compact"><label for="local-download-max-mib">单个下载上限（MiB，0 不限）</label><input id="local-download-max-mib" type="number" value="50" min="0" step="1"></div>
             <div class="field-tip">框架等待下载时暂停决策，不消耗步数；任务时限仍然计时。</div>
             <button id="btn-local-start" class="run-btn primary-launch">启动任务<svg><use href="#i-arrow"/></svg></button>
             <p class="form-footnote">本机任务使用 Windows 浏览器环境。启动后可在实时监控中查看进度。</p>
@@ -933,6 +934,7 @@ function statusCardHtml(payload) {
   else if (payload.event === 'task_end') detail = (payload.success === true) ? '✅ 任务结束，成功' : ('任务结束，最终 result=' + payload.result);
   else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
   else if (payload.event === 'framework_wait') detail = waitDetail(payload);
+  else if (payload.event === 'duplicate_download') detail = '<strong>已拦截重复下载</strong><br>' + esc(payload.reason || '') + '<br>' + esc(payload.path || '');
   else if (payload.event === 'operation_feedback') detail = '<strong>系统观察反馈</strong><br>' + (payload.facts || []).map(x => esc(x)).join('<br>');
   else if (payload.event === 'decision_judgment') detail = '<strong>Decision 任务环境分类</strong>' + judgmentDetail(payload.judgment || {});
   else if (payload.event === 'decision_format_error') detail = '本次候选动作尚未执行：' + esc(payload.reason || '') + (payload.status === 'retry' ? '；正在修正候选动作。' : '；候选动作重试已结束。');
@@ -1394,6 +1396,7 @@ document.getElementById('btn-local-start').addEventListener('click', () => {
     task: task,
     max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
     operation_timeout_s: Number(document.getElementById('local-operation-timeout').value),
+    download_max_mib: Number(document.getElementById('local-download-max-mib').value),
     task_timeout_s: Number(document.getElementById('local-task-timeout').value),
     model: document.getElementById('run-model').value,
     model_url: document.getElementById('run-model-url').value,

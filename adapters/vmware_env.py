@@ -250,6 +250,12 @@ class VMwareEnvironment(Environment):
         # 有 ref 但无效 → reobserve；无 ref → None（走 GUI grounding）
         return route
 
+    def prevent_duplicate_download(self, action, observation, route=None):
+        session = self._get_browser_session()
+        if session is None:
+            return None
+        return session.prevent_duplicate_download(action, observation, route)
+
     def execute_routed(self, action, route):
         """执行已路由的 browser_dom 动作（DOM 定位 + actionability check）。"""
         if action.action in {"download", "rename_artifact", "run_in_terminal", "call_code_agent", "set_cell_values", "save"}:

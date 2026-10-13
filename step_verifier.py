@@ -52,7 +52,12 @@ def code_review(step, obs, execution_info, contract):
     for predicate in step.get("verification", [{"kind": "visual"}]):
         kind = predicate["kind"]
         status, reason, evidence = "unknown", "此条件需要独立模型核查", []
-        if kind in {"url_equals", "url_host"} and blocks and blocks[0].get("url"):
+        if kind == 'download_complete':
+            progress = next((c for c in contract.get('download_progress', []) if c.get('id') == predicate['check_id']), {})
+            status = progress.get('status', 'unknown')
+            reason = progress.get('reason', '尚无框架确认的目标下载产物')
+            evidence = [str(progress['path'])] if progress.get('path') else [str(a.get('path', '')) for a in progress.get('artifacts', [])]
+        elif kind in {"url_equals", "url_host"} and blocks and blocks[0].get("url"):
             actual = blocks[0]["url"]
             ok = (_url(actual) == _url(predicate["url"]) if kind == "url_equals" else
                   (urlsplit(actual).hostname or "").lower() == predicate["host"].lower())
@@ -91,6 +96,10 @@ def code_review(step, obs, execution_info, contract):
             elif runtime.get("complete") is True:
                 status, reason = "failed", "操作系统未观察到该应用窗口"
         checks.append({"kind": kind, "status": status, "reason": reason, "evidence": evidence})
+    if (checks and all(c['kind'] == 'download_complete' and c['status'] == 'passed' for c in checks)):
+        return {'method': 'code', 'status': 'passed', 'reason': '框架已核实目标下载产物；推进到后续命名/最终验收。',
+                'evidence': [e for c in checks for e in c['evidence']], 'checks': checks,
+                'source': 'download_artifact_milestone'}
     if execution_info.get("error_code") or execution_info.get("status") in {"rejected", "failed", "uncertain"}:
         # A failed action cannot advance the queue merely because a prior state resembles success.
         return {"method": "code", "status": "failed", "reason": "动作未确认执行成功，保留当前步骤",

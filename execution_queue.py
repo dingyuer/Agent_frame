@@ -19,8 +19,8 @@ def normalize_verification(value):
         return [{"kind": "visual"}]
     if not isinstance(value, list) or not 1 <= len(value) <= 8:
         raise ValueError("verification 必须含 1~8 项核查条件")
-    allowed = {"visual", "url_equals", "url_host", "text_present", "app_open", "element_state"}
-    required = {"url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "element_state": "name"}
+    allowed = {"visual", "url_equals", "url_host", "text_present", "app_open", "element_state", "download_complete"}
+    required = {"url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "element_state": "name", "download_complete": "check_id"}
     result = []
     for item in value:
         if not isinstance(item, dict) or item.get("kind") not in allowed:
@@ -55,6 +55,45 @@ def normalize_verification(value):
             if item.get("role"):
                 clean["role"] = str(item["role"])[:80]
         result.append(clean)
+    return result
+
+
+def compile_download_milestones(steps, goals):
+    """Separate durable download evidence from later filename acceptance.
+
+    The sampled planner JSON remains in planning_calls; these are explicit
+    framework-owned refinements of public paper requirements.
+    """
+    result, seen = [], set()
+    by_id = {g['check_id']: g for g in goals}
+    for original in steps:
+        step = copy.deepcopy(original)
+        if step.get('phase') != 'download':
+            result.append(step)
+            continue
+        linked = [cid for cid in step.get('check_ids', []) if cid in by_id]
+        selected = linked or list(by_id)
+        if len(selected) != 1:
+            raise ValueError('每个 download 子目标必须通过 check_ids 明确关联一个论文目标')
+        cid = selected[0]
+        if cid in seen:
+            continue  # Multiple UI primitives for this transfer share one milestone.
+        seen.add(cid)
+        goal = by_id[cid]
+        step.update(goal='下载目标论文 ' + str(goal.get('query') or goal.get('title')) + ' 的 PDF，等待框架确认文件落盘。',
+                    expected_evidence='目标论文对应的实际 PDF 文件已经下载完成；文件名要求在后续单独核查。',
+                    verification=[{'kind': 'download_complete', 'check_id': cid}], check_ids=[],
+                    framework_refinement='download_milestone', planner_goal=original['goal'])
+        result.append(step)
+        if goal.get('filename'):
+            result.append({'phase': 'rename', 'goal': '通过文件管理器将已下载论文改名为 ' + goal['filename'] + '；不要再次下载。',
+                           'expected_evidence': '同一已登记文件名称为 ' + goal['filename'] + '，内容及论文身份不变。',
+                           'check_ids': [cid], 'verification': [], 'actions': ['observe_desktop', 'hotkey', 'click', 'type', 'press'],
+                           'status': 'pending', 'framework_refinement': 'filename_acceptance'})
+    if len(result) > MAX_PLAN_STEPS:
+        raise ValueError('下载与改名拆分后超出计划资源上限，请合并其他子目标')
+    for index, step in enumerate(result, 1):
+        step['idx'] = index
     return result
 
 

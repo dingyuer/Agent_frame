@@ -109,9 +109,9 @@ def build_planner_prompt(task: str, completion_spec=None, profile=None) -> str:
 6. 每步写 expected_evidence，说明执行后应观察到的具体变化。goal 中写清本步所需的查询词、目标值、文件名等操作参数，不能只写“按要求填写”然后依赖 check_ids 代替指令；执行模型只看当前子目标。多对象任务逐个列出，不漏数量、筛选条件和保存要求。
 7. 系统验收条件由调用方提供或由严格任务规则提取，你不能修改、删除或自行增加可信验收条件。check_ids 只引用下面已有 id；没有对应条件就填 []。
 8. final_check 只是你的建议，不会作为任务完成的证据。任务结束由框架逐项核实。
-9. 每个步骤增加 verification 数组：简单结果写明确谓词 url_equals(url)/url_host(host)/text_present(text)/app_open(app，真实进程名，不带路径)/element_state(name,role,states)；难以用这些条件完整核实的步骤用 {{"kind":"visual"}}。全部条件须同时满足，不能只检查最终目标的一小部分。例如“提交搜索且显示结果”不能仅验证在搜索网站域名。predicate 的期望值必须来自原始任务和计划目标，不允许使用“当前URL”等动态值。可选 actions 数组只列此步骤需要的基础交互动作。
+9. 每个步骤增加 verification 数组：简单结果写明确谓词 url_equals(url)/url_host(host)/text_present(text)/app_open(app，真实进程名，不带路径)/element_state(name,role,states)；下载落盘使用 download_complete(check_id)，由框架核对对应产物；改名/最终验收另列步骤，不能用截图猜下载成功。难以用这些条件完整核实的步骤用 {{"kind":"visual"}}。全部条件须同时满足，不能只检查最终目标的一小部分。例如“提交搜索且显示结果”不能仅验证在搜索网站域名。predicate 的期望值必须来自原始任务和计划目标，不允许使用“当前URL”等动态值。可选 actions 数组只列此步骤需要的基础交互动作。
 10. 所有操作都通过 GUI/DOM：下载点链接或查看器工具栏；改名用另存为/文件管理器；打开应用用系统启动器或快捷键。禁止 download、rename_artifact、run_in_terminal、call_code_agent、UNO 写文件等代码捷径。
-11. 若给出类型化任务流程，steps 必须覆盖 workflow 中每个 phase（用相同英文值），每步 expected_evidence 不能为空。论文搜索先核对身份，再下载；不要提前编造下载URL。
+11. 若给出类型化任务流程，steps 必须覆盖 workflow 中每个 phase（用相同英文值），每步 expected_evidence 不能为空。论文搜索先核对身份，再下载；不要提前编造下载URL。文件名要求放在 verify 阶段；框架会在 download 后自动插入独立的界面改名步骤，不必编造新的 phase。
 12. 同时输出 requirements 数组，逐项保留原始任务要求。每项 kind 为 paper_download/rename/other，source_text 必须逐字引用任务中的连续原文；paper_download.value 为原文查询词，rename.value 为原文文件名，不能补造扩展名或论文ID。这些是候选解释，不是可信验收条件；框架会检查引用，最终仍核对完整原始任务。无法拆分的要求用 other 保留原文，不得省略否定、数量、目录或附加要求。
 13. actions 使用以下精确动作名：{menu}。不要编造动作或调用后台下载/改名。类型提示与验收契约独立：即使系统 checks 为空，也必须保留用户目标与对应流程。
 

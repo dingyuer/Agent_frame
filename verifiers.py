@@ -373,6 +373,16 @@ class CompletionVerifier:
                     'binding': self._bindings[check['id']].to_dict() if check['id'] in self._bindings else None})
         return goals
 
+    def download_progress(self):
+        """Public download milestones: same artifact integrity/identity, no final name.
+
+        Never relax the stored contract or private evaluator. Model observations
+        and image reviewers cannot manufacture this report.
+        """
+        checks = [{k: copy.deepcopy(v) for k, v in c.items() if k != 'filename'}
+                  for c in self._public_spec['checks'] if c['kind'] in {'download', 'paper_download'}]
+        return list(self._download_checks(checks).values())
+
     def pending_paper_goals(self):
         return [goal for goal in self.paper_goals() if goal['status'] == 'pending']
 
@@ -628,6 +638,7 @@ class CompletionVerifier:
             return {}
         current = {path: _read_artifact(path) for path in self._artifacts}
         parsed_pdfs, candidates, results, resources = {}, {}, {}, {}
+        failure_priority = {}
         paper_task = any(c["kind"] == "paper_download" for c in checks)
         for check in checks:
             cid = check["id"]
@@ -678,8 +689,14 @@ class CompletionVerifier:
                     identity = evidence["identity"]
                     resources[identity] = ("sha256", evidence["sha256"]) if paper_task else ("inode", identity)
                     candidates[cid][identity] = item
-                elif results[cid]["status"] != "failed":
-                    results[cid] = item
+                else:
+                    # Report the closest relevant artifact, not the first failure
+                    # in arrival order (e.g. an unrelated book downloaded earlier).
+                    priority = (int(binding is None or self._artifact_matches_binding(record, binding)),
+                                int(reason == 'downloaded filename does not match'), int(status == 'failed'))
+                    if cid not in failure_priority or priority > failure_priority[cid]:
+                        failure_priority[cid] = priority
+                        results[cid] = item
         # A private refinement must hold for the *same physical artifact*. Two
         # files satisfying the public title and private golden hash separately
         # cannot be joined into a false positive. Multiple bindings are ANDed.

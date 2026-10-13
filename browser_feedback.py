@@ -19,6 +19,8 @@ def active_paper(completion, step=None):
         return None
     goals = completion.paper_goals()
     ids = set((step or {}).get('check_ids', []))
+    ids.update(p.get('check_id') for p in (step or {}).get('verification', [])
+               if p.get('kind') == 'download_complete')
     selected = [g for g in goals if g['check_id'] in ids]
     goals = selected or goals
     # Do not pick an arbitrary paper for a multi-paper task.
@@ -177,3 +179,25 @@ def rename_ui_guidance(obs, completion, report, os_name):
                  + json.dumps(str(path.parent), ensure_ascii=False) + ' 并 Enter；选中上述原文件后按 F2，编辑名称并 Enter 确认。')
     lines.append('注意扩展名：若重命名框只显示名称主体，保留系统隐藏的扩展名，避免生成双重 .pdf；显示完整文件名时填写完整目标名。最终仍以框架文件验收为准。')
     return lines
+
+
+def download_action_url(action, obs, route=None):
+    """Only an identifiable download/save intent, never arbitrary GUI coordinates."""
+    if action.action not in {'click', 'double_click', 'hotkey', 'press'} or obs is None:
+        return ''
+    info = obs.info or {}
+    keys = {str(k).lower() for k in (action.args.get('keys') or [])} if action.action == 'hotkey' else set()
+    intent = (bool(keys & {'ctrl', 'control', 'cmd', 'command'}) and 's' in keys
+              or bool(re.search(r'\bdownload\b|\bsave\b|下载|保存', str(action.args.get('target', '')), re.I)))
+    if not intent:
+        return ''
+    if info.get('active_surface') == 'desktop':
+        foreground = next((a for a in info.get('runtime_state', {}).get('applications', []) if a.get('foreground')), {})
+        if str(foreground.get('process_name', '')).casefold() not in {'chrome.exe', 'msedge.exe', 'firefox.exe'}:
+            return ''  # A file-manager rename confirmation is not a browser download.
+    ref = (route or {}).get('target_ref') or action.args.get('target_ref')
+    eid = action.args.get('element_id')
+    nodes = [n for n in exposed_nodes(obs) if (ref and n.get('ref') == ref) or (eid and n.get('id') == eid)]
+    if len(nodes) == 1 and nodes[0].get('href'):
+        return urljoin(observation_url(obs), nodes[0]['href'])
+    return observation_url(obs) or next((t.get('url', '') for t in info.get('tabs', []) if t.get('active')), '')

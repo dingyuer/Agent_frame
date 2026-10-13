@@ -138,6 +138,11 @@ class BrowserOptions:
     max_snapshot_age: float = 180.0
     require_focus: bool = True   # True=要求浏览器前台聚焦；Windows 本地模式设 False（虚拟鼠标，用户可同时用电脑）
     download_timeout_s: float = 300.0
+    download_max_bytes: int = 50 * 1024 * 1024  # Resource cap, not paper identity; 0 disables.
+
+    def __post_init__(self):
+        if type(self.download_max_bytes) is not int or self.download_max_bytes < 0:
+            raise ValueError('download_max_bytes must be a nonnegative integer')
 
 
 class BrowserSession:
@@ -178,10 +183,14 @@ class BrowserSession:
         self._background_downloads = set()
         self._active_downloads = {}
         self._download_tasks = {}
+        self._download_objects = {}
         self._reserved_artifact_paths = set()
         self._main_responses = {}
         self._page_target_ids = {}
         self._artifact_events = []
+        self._download_sizes = {}
+        self._download_guids = {}
+        self._download_monitors = []
 
     # ---- 临时连接的 attach 帮助 ----
     def _resolve_cdp_endpoint(self):
@@ -284,6 +293,56 @@ class BrowserSession:
         page.on("dialog", lambda dialog: self._record_dialog(page, dialog))
         page.on("download", lambda download: self._queue_download(page, download))
         page.on("response", lambda response: self._record_response(page, response))
+        self._install_download_monitor(page)
+
+    def _install_download_monitor(self, page):
+        """Observe Chromium headers/progress without changing download destinations."""
+        if self._loop is None:
+            return
+        async def install():
+            try:
+                raw = self._unwrap_async(page)
+                cdp = await raw.context.new_cdp_session(raw)
+                self._download_monitors.append(cdp)
+                cdp.on('Network.responseReceived', lambda e: self._record_download_headers(e.get('response', {})))
+                cdp.on('Page.downloadWillBegin', lambda e: self._download_guids.update({e['guid']: e.get('url', '')}))
+                cdp.on('Page.downloadProgress', self._record_download_progress)
+                await cdp.send('Network.enable')
+                await cdp.send('Page.enable')
+            except Exception:
+                pass  # Final saved-size validation and operation deadline remain enforced.
+        task = self._loop.create_task(install())
+        self._background_downloads.add(task)
+        task.add_done_callback(self._background_downloads.discard)
+
+    def _record_download_headers(self, response):
+        headers = {str(k).lower(): str(v) for k, v in response.get('headers', {}).items()}
+        size = headers.get('content-length', '')
+        if size.isdigit():
+            self._track_download_size(response.get('url', ''), int(size))
+
+    def _record_download_progress(self, event):
+        url = self._download_guids.get(event.get('guid'))
+        if url:
+            sizes = [x for x in (event.get('totalBytes'), event.get('receivedBytes')) if type(x) in (int, float)]
+            if sizes:
+                self._track_download_size(url, max(sizes))
+        if event.get('state') in {'completed', 'canceled'}:
+            self._download_guids.pop(event.get('guid'), None)
+
+    def _track_download_size(self, url, size):
+        if not url:
+            return
+        key = self._url_key(url)
+        self._download_sizes[key] = max(size, self._download_sizes.get(key, 0))
+        if len(self._download_sizes) > 2048:
+            self._download_sizes.pop(next(iter(self._download_sizes)))
+        limit = self.options.download_max_bytes
+        if limit and size > limit:
+            for ident, item in list(self._active_downloads.items()):
+                if self._url_key(item['url']) == key and ident in self._download_objects and not item.get('error_code'):
+                    item['error_code'] = 'download_size_limit'
+                    self._cancel_observed_download(self._download_objects[ident])
 
     def _record_response(self, page, response):
         """Keep headers of the current main resource, never its body."""
@@ -311,17 +370,21 @@ class BrowserSession:
             return
         # Browser-generated signed URLs are kept intact. Only exact URL aliases
         # actually observed in a completed transfer are considered equivalent.
-        duplicate = self._find_pending_download(download.url)
+        self._observe_artifact_renames()
+        duplicate = self._find_pending_download(download.url) or self._cached_artifact(download.url)
         if duplicate is not None:
-            if self._loop is not None:
-                async def cancel_duplicate():
-                    try:
-                        await self._unwrap_async(download).cancel()
-                    except Exception:
-                        pass
-                task = self._loop.create_task(cancel_duplicate())
-                self._background_downloads.add(task)
-                task.add_done_callback(self._background_downloads.discard)
+            self._cancel_observed_download(download)
+            self._download_events.append({'status': 'deduplicated', 'completed': bool(duplicate.get('completed')),
+                'url': download.url, 'download_id': duplicate.get('download_id'),
+                'artifact_id': duplicate.get('artifact_id'), 'path': duplicate.get('path'),
+                'reason': 'same URL already pending or downloaded', 'finished_at': time.time()})
+            return
+        if (self.options.download_max_bytes and
+                self._download_sizes.get(self._url_key(download.url), 0) > self.options.download_max_bytes):
+            self._cancel_observed_download(download)
+            self._download_events.append({'download_id': uuid.uuid4().hex, 'url': download.url,
+                'page_url': page.url, 'status': 'failed', 'completed': False, 'finished_at': time.time(),
+                'error_code': 'download_size_limit', 'error': '下载超过配置的字节上限；请核对链接或调整资源上限。'})
             return
         download_id = uuid.uuid4().hex
         source_page_url = page.url
@@ -341,6 +404,7 @@ class BrowserSession:
                 "status": "failed", "completed": False, "url": download.url,
                 "finished_at": time.time(), "error": str(exc)[:300]})
             return
+        self._download_objects[download_id] = download
         raw = self._unwrap_async(download)
         deadline = time.monotonic() + self.options.download_timeout_s
         async def save():
@@ -354,10 +418,13 @@ class BrowserSession:
                 except BaseException:
                     pass
                 self._download_events.append({"download_id": download_id, "artifact_id": download_id,
-                    "status": "canceled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                    "status": "failed" if self._active_downloads.get(download_id, {}).get('error_code') else "canceled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                    "error_code": self._active_downloads.get(download_id, {}).get('error_code') or getattr(exc, 'code', ''),
                     "completed": False, "url": download.url,
                     "finished_at": time.time(),
-                    "error": "download deadline exceeded" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__})
+                    "error": ('下载超过配置的字节上限；请核对链接或调整资源上限。'
+                              if self._active_downloads.get(download_id, {}).get('error_code') == 'download_size_limit'
+                              else "download deadline exceeded" if isinstance(exc, asyncio.TimeoutError) else str(exc)[:200] or type(exc).__name__)})
                 try:
                     if os.path.isfile(path):
                         os.remove(path)
@@ -366,11 +433,42 @@ class BrowserSession:
             finally:
                 self._active_downloads.pop(download_id, None)
                 self._download_tasks.pop(download_id, None)
+                self._download_objects.pop(download_id, None)
                 self._reserved_artifact_paths.discard(path)
         task = self._loop.create_task(save())
         self._download_tasks[download_id] = task
         self._background_downloads.add(task)
         task.add_done_callback(self._background_downloads.discard)
+
+    def _cancel_observed_download(self, download):
+        if self._loop is None:
+            try:
+                download.cancel()
+            except Exception:
+                pass
+            return
+        async def cancel():
+            try:
+                await asyncio.wait_for(self._unwrap_async(download).cancel(), 5)
+            except Exception:
+                pass
+        task = self._loop.create_task(cancel())
+        self._background_downloads.add(task)
+        task.add_done_callback(self._background_downloads.discard)
+
+    @browser_thread
+    def prevent_duplicate_download(self, action, observation, route=None):
+        from .browser_feedback import download_action_url
+        url = download_action_url(action, observation, route)
+        if not url:
+            return None
+        self._observe_artifact_renames()
+        artifact = self._cached_artifact(url)
+        if artifact:
+            return {'status': 'rejected', 'dispatched': False, 'error_code': 'already_downloaded',
+                    'reason': '此 URL 的已登记文件仍有效，已拦截重复下载；请处理改名或后续验收。',
+                    'artifact_id': artifact['artifact_id'], 'path': artifact['path'], 'url': url}
+        return None
 
     @staticmethod
     def _url_key(url):
@@ -388,7 +486,10 @@ class BrowserSession:
             if not any(self._url_key(artifact.get(k, "")) == key for k in ("url", "final_url")):
                 continue
             try:
-                if os.path.isfile(artifact["path"]) and self._file_hash(artifact["path"]) == artifact["sha256"]:
+                stat = os.stat(artifact['path'], follow_symlinks=False)
+                if (os.path.isfile(artifact['path']) and not os.path.islink(artifact['path'])
+                        and [stat.st_dev, stat.st_ino] == artifact.get('file_identity')
+                        and stat.st_size == artifact.get('bytes') and self._file_hash(artifact['path']) == artifact['sha256']):
                     return artifact
             except OSError:
                 pass
@@ -438,6 +539,8 @@ class BrowserSession:
     def _record_artifact(self, *, path, url, final_url, download_id, page_url="", content_type="", transport="browser"):
         if not os.path.isfile(path) or os.path.getsize(path) <= 0:
             raise ValueError("download did not produce a nonempty regular file")
+        if self.options.download_max_bytes and os.path.getsize(path) > self.options.download_max_bytes:
+            raise BrowserActionError('下载超过配置的字节上限；请核对链接或调整资源上限。', code='download_size_limit')
         artifact = {"source_url": url, "url": url, "final_url": final_url,
             "path": os.path.abspath(path), "status": "completed", "completed": True,
             "download_id": download_id, "artifact_id": download_id, "version": 1, "rename_history": [],
@@ -513,8 +616,16 @@ class BrowserSession:
                 self._record_artifact(path=path, url=download.url, final_url=download.url,
                                       download_id=download_id, page_url=source_page_url)
             except Exception as exc:
+                self._cancel_observed_download(download)
                 self._download_events.append({"download_id": download_id, "status": "failed",
-                    "completed": False, "url": download.url, "error": str(exc)[:300]})
+                    "completed": False, "url": download.url, "error": str(exc)[:300],
+                    "error_code": getattr(exc, 'code', '')})
+                if path:
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                    except OSError:
+                        pass
             finally:
                 self._active_downloads.pop(download_id, None)
                 self._reserved_artifact_paths.discard(path)
@@ -577,6 +688,10 @@ class BrowserSession:
         self._main_responses.clear()
         self._page_target_ids.clear()
         self._artifact_events.clear()
+        self._download_objects.clear()
+        self._download_sizes.clear()
+        self._download_guids.clear()
+        self._download_monitors.clear()
         self._last_screenshot = None
         self._last_screenshot_metadata = {}
         size = viewport or {"width": 1280, "height": 720}

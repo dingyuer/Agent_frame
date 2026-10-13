@@ -17,6 +17,7 @@ PAGE = b"""<!doctype html><meta charset=utf-8><title>Paper fixture</title>
 <h1>AAA</h1>
 <a id=pdf href=/paper.pdf download>Download AAA PDF</a>
 <a id=slow href=/slow.pdf download>Slow download</a>
+<a id=stream href=/stream.pdf download>Streaming download</a>
 <a id=private href=/private.pdf download>Private PDF</a>
 <a id=fake href=/fake.pdf download>Fake PDF</a>
 <button id=alert onclick="alert('Fixture dialog')">Show dialog</button>
@@ -40,7 +41,7 @@ def live_browser(request, tmp_path, monkeypatch):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = urlsplit(self.path).path
-            if path in {"/paper.pdf", "/private.pdf", "/slow.pdf", "/fake.pdf"}:
+            if path in {"/paper.pdf", "/private.pdf", "/slow.pdf", "/stream.pdf", "/fake.pdf"}:
                 if path == "/fake.pdf" or (path == "/private.pdf" and "session=test-session" not in self.headers.get("Cookie", "")):
                     body, mime = b"<html>Login required</html>", "text/html"
                 else:
@@ -48,13 +49,19 @@ def live_browser(request, tmp_path, monkeypatch):
                 self.send_response(200)
                 self.send_header("Content-Type", mime)
                 self.send_header("Content-Disposition", 'attachment; filename="AAA.pdf"')
-                self.send_header("Content-Length", str(len(body)))
+                if path != '/stream.pdf':
+                    self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 if path == "/slow.pdf":
                     self.wfile.write(body[:10])
                     self.wfile.flush()
                     time.sleep(3)
                     body = body[10:]
+                if path == '/stream.pdf':
+                    self.wfile.write(body[:1000])
+                    self.wfile.flush()
+                    time.sleep(3)
+                    body = body[1000:]
                 try:
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
@@ -264,3 +271,34 @@ def test_real_browser_delayed_pdf_content_wait_and_semantic_dom(live_browser, mo
     assert result.obs.info['render_wait']['status'] == 'completed'
     assert content_thumbnail(result.obs.screenshot) is not None
     assert state.step_id == 1 and not pipe.model.calls
+
+
+def test_real_slow_download_size_limit_cancels_before_body_finishes(live_browser):
+    session, _ = live_browser
+    session.options.download_max_bytes = 100
+    started = time.monotonic()
+    click(session, 'slow')
+    obs = wait_for(session, lambda o: any(e.get('error_code') == 'download_size_limit' for e in o.info.get('download_events', [])))
+    assert time.monotonic() - started < 2.5  # fixture delays its body for 3 seconds
+    assert not obs.info.get('artifacts')
+
+
+def test_real_sequential_same_url_download_is_canceled(live_browser):
+    session, _ = live_browser
+    assert click(session, 'pdf')['status'] == 'executed'
+    first = wait_for(session, lambda o: bool(o.info.get('artifacts')))
+    assert len(first.info['artifacts']) == 1
+    # Direct session call intentionally bypasses policy pre-dispatch guard.
+    click(session, 'pdf')
+    after = wait_for(session, lambda o: any(e.get('status') == 'deduplicated' for e in o.info.get('download_events', [])))
+    assert len(after.info['artifacts']) == 1 and not after.info['pending_downloads']
+
+
+def test_real_stream_without_content_length_is_canceled_by_progress(live_browser):
+    session, _ = live_browser
+    session.options.download_max_bytes = 100
+    started = time.monotonic()
+    click(session, 'stream')
+    obs = wait_for(session, lambda o: any(e.get('error_code') == 'download_size_limit' for e in o.info.get('download_events', [])))
+    assert time.monotonic() - started < 2.5
+    assert not obs.info.get('artifacts')

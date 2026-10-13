@@ -46,7 +46,7 @@ from .step_progress import ProgressConfig, StepProgressMonitor
 from .model.decision_judge import DecisionJudge, DecisionJudgeConfig
 from .paper_workflow import PaperWorkflow, WORKFLOW_VERSION, binding_group_hash
 from .paper_resolver import ADAPTER_VERSION
-from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS
+from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS, compile_download_milestones
 from .decision_context import action_scope, scoped_system, selected_memory, current_brief
 from .step_verifier import StepReviewer, code_review, make_review_model
 from .actions import BASIC_ACTIONS
@@ -75,10 +75,13 @@ class WaitConfig:
     poll_interval_s: float = 0.25
     download_start_timeout_s: float = 2.0
     render_timeout_s: float = 20.0
+    download_max_bytes: int = 50 * 1024 * 1024
     operation_timeout_s: float = 300.0
     task_timeout_s: float = 1800.0
 
     def __post_init__(self):
+        if type(self.download_max_bytes) is not int or self.download_max_bytes < 0:
+            raise ValueError('wait_config.download_max_bytes must be a nonnegative integer')
         if type(self.enabled) is not bool:
             raise ValueError("wait_config.enabled must be boolean")
         for name in ("poll_interval_s", "download_start_timeout_s", "operation_timeout_s", "task_timeout_s", "render_timeout_s"):
@@ -557,6 +560,19 @@ class Pipeline:
         state.obs = self._settle_rendering(Execution(kind="env", obs=state.obs), state).obs
         self.completion.observe(state.obs)
         state.verification = self.completion.evaluate()
+        # Late events or a previously completed download need no extra policy action.
+        while state.queue and state.queue.current:
+            current = state.queue.current
+            predicates = current.get('verification', [])
+            if not predicates or any(p.get('kind') != 'download_complete' for p in predicates):
+                break
+            progress = {'download_progress': self.completion.download_progress()}
+            if code_review(current, state.obs, {}, progress)['status'] != 'passed':
+                break
+            self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
+                                                       info={'status': 'observed', 'dispatched': False}))
+            if state.queue.current is current:
+                break
         state.screenshot_history.append(state.obs.screenshot)
         if len(state.screenshot_history) > 3:
             state.screenshot_history = state.screenshot_history[-3:]
@@ -821,6 +837,16 @@ class Pipeline:
         if name not in BASIC_ACTIONS:
             return Execution(kind="rejected", executed="rejected", obs=state.obs,
                 info={"status": "rejected", "dispatched": False, "error_code": "non_basic_action"})
+        guard = getattr(self.env, 'prevent_duplicate_download', None)
+        if callable(guard) and name in {'click', 'double_click', 'hotkey', 'press'}:
+            try:
+                duplicate = guard(action, state.obs, state.route)
+            except Exception as exc:
+                return Execution(kind='rejected', obs=self._observe(), info={'status': 'rejected', 'dispatched': False,
+                    'error_code': 'download_guard_unavailable', 'reason': f'重复下载检查暂不可用：{type(exc).__name__}'})
+            if duplicate:
+                self._publish_diagnostic('duplicate_download', **duplicate)
+                return Execution(kind='rejected', outcome=duplicate['reason'], obs=self._observe(), info=duplicate)
         # browser_dom 通道：路由成功后走 DOM 定位执行（跳过 grounding）
         if state.route and state.route.get("channel") == "browser_dom":
             try:
@@ -955,6 +981,8 @@ class Pipeline:
         # Do not create a browser session for desktop-only tasks.
         session = getattr(self.env, "_browser_session", None)
         options = getattr(session, "options", None)
+        if options is not None and hasattr(options, 'download_max_bytes'):
+            options.download_max_bytes = self.wait_config.download_max_bytes
         if options is not None and hasattr(options, "download_timeout_s"):
             options.download_timeout_s = max(0.001, min(self.wait_config.operation_timeout_s,
                                                        self._task_time_remaining()))
@@ -1160,7 +1188,7 @@ class Pipeline:
                 state.recovery = {"status": "resolve_dialog", "instruction": "先处理浏览器原生对话框，再检查下载状态；不要重复触发下载。"}
                 break
             if failed and not pending:
-                outcome, failure = "failed", "download_failed"
+                outcome, failure = "failed", next((item['error_code'] for item in failed if item.get('error_code')), 'download_failed')
                 break
             if (tracked and tracked.issubset(completed)) or (completed - prior_ids and not pending):
                 outcome = "completed"
@@ -1525,6 +1553,9 @@ class Pipeline:
                         verification = [] if ids and "verification" not in step else normalize_verification(step.get("verification"))
                     except ValueError as exc:
                         raise ValueError(f"第 {i} 个子目标 verification：{exc}") from exc
+                    for predicate in verification:
+                        if predicate['kind'] == 'download_complete' and predicate['check_id'] not in check_ids:
+                            raise ValueError('download_complete.check_id 必须引用已有系统条件')
                     normalized.append({"idx": i, "goal": step["goal"].strip(),
                                        "expected_evidence": str(step.get("expected_evidence") or ""),
                                        "check_ids": ids, "phase": str(step.get("phase") or ""), "status": "pending",
@@ -1545,6 +1576,8 @@ class Pipeline:
                         raise ValueError("流程阶段顺序必须为 " + " → ".join(ordered))
                     if not isinstance(obj.get("keywords"), list) or not any(isinstance(k, str) and k.strip() for k in obj["keywords"]):
                         raise ValueError("论文搜索必须提供非空 keywords")
+                if self.completion.paper_goals():
+                    normalized = compile_download_milestones(normalized, self.completion.paper_goals())
                 state.memory.plan = {"steps": normalized,
                     "requirements": audit_requirement_proposals(task, obj.get("requirements")),
                     "keywords": obj.get("keywords") if isinstance(obj.get("keywords"), list) else [],
@@ -1660,9 +1693,10 @@ class Pipeline:
                     "plan_step_id": step["id"], "goal": step["goal"], "decision_step": state.step_id}
         self._publish_review({**identity, "method": "code", "status": "running", "reason": "检查当前步骤的系统证据"})
         public_report = self.completion.public_report(state.verification)
+        public_report['download_progress'] = self.completion.download_progress()
         report = code_review(step, state.obs, execution.info, public_report)
         identity_error = paper_review_error(state.obs, self.completion, public_report, step)
-        if identity_error:
+        if identity_error and report.get('source') != 'download_artifact_milestone':
             report = {"method": "code", "status": "failed", "reason": identity_error,
                       "evidence": [identity_error], "checks": [*report.get("checks", []),
                       {"kind": "paper_identity", "status": "failed", "reason": identity_error, "evidence": [identity_error]}]}
@@ -1675,7 +1709,8 @@ class Pipeline:
         code_checks = copy.deepcopy(report.get('checks', []))
         if (report["status"] == "unknown" and execution.kind not in {"terminal", "deadline"}
                 and not (state.obs.info if state.obs else {}).get("pending_downloads")
-                and execution.info.get("status") not in {"pending", "in_progress"}):
+                and execution.info.get("status") not in {"pending", "in_progress"}
+                and not any(p.get("kind") == "download_complete" for p in step.get("verification", []))):
             review_execution = {k: execution.info[k] for k in ('status', 'error_code', 'action') if k in execution.info}
             review_execution['expected_effect'] = expected_effect
             paper = active_paper(self.completion, step)
