@@ -169,8 +169,17 @@ agent = Agent(decision_model=model, grounding=grounding, env=env,
 ```python
 agent = Agent(decision_model=model, grounding=grounding, env=env,
               wait_config={"operation_timeout_s": 300, "task_timeout_s": 1800,
-                           "download_start_timeout_s": 2, "poll_interval_s": 0.25})
+                           "download_start_timeout_s": 2, "poll_interval_s": 0.25, "render_timeout_s": 20})
 ```
+
+PDF 页面另有默认 20 秒的渲染等待：框架轮询正文区域，连续非空白且稳定后再交给模型，等待不增加决策步数。
+超时会明确提示模型检查；同一文档仍为空白时不会每轮重新等待。此检测是就绪启发式，不代表任务完成。
+前端分别展示 PDF 渲染等待和下载等待，轨迹保留等待结果。
+
+已绑定的论文标题、arXiv ID、官方 PDF 地址，以及下载完成的路径/字节数会进入精简决策上下文；
+传输完成与论文身份、文件名验收分开。明显指向其他 arXiv 论文的链接会在派发前拒绝。
+DOM 可用但缺引用时先进行一次候选动作纠正；多个元素匹配同一描述时要求明确引用，不直接猜选坐标。
+PDF 工具栏等无 AX 元素的界面仍可通过桌面观察和视觉定位操作，保存和改名仍由界面完成。
 
 本机前端可设置下载等待上限和任务时限，等待状态显示“不消耗步数”，保留中断入口。
 命令行对应 `--operation-timeout 300 --task-timeout 1800`，YAML 对应 `agent.wait_config`。

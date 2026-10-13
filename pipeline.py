@@ -50,6 +50,8 @@ from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_ST
 from .decision_context import action_scope, scoped_system, selected_memory, current_brief
 from .step_verifier import StepReviewer, code_review, make_review_model
 from .actions import BASIC_ACTIONS
+from .browser_feedback import active_paper, paper_action_error, operational_facts, exposed_nodes, paper_review_error
+from .visual_readiness import is_pdf_observation, content_thumbnail, stable_content
 
 # 实时状态推送（可选）：execute 阶段进度推给 viz 前端，失败不影响主流程
 try:
@@ -72,13 +74,14 @@ class WaitConfig:
     enabled: bool = True
     poll_interval_s: float = 0.25
     download_start_timeout_s: float = 2.0
+    render_timeout_s: float = 20.0
     operation_timeout_s: float = 300.0
     task_timeout_s: float = 1800.0
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise ValueError("wait_config.enabled must be boolean")
-        for name in ("poll_interval_s", "download_start_timeout_s", "operation_timeout_s", "task_timeout_s"):
+        for name in ("poll_interval_s", "download_start_timeout_s", "operation_timeout_s", "task_timeout_s", "render_timeout_s"):
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"wait_config.{name} must be a finite nonnegative number")
@@ -157,6 +160,8 @@ class StepState:
     step_progress: Dict[str, Any] = field(default_factory=dict)
     routing_hint: Dict[str, Any] = field(default_factory=dict)
     finish_feedback: str = ""
+    render_waits: Dict[tuple, str] = field(default_factory=dict)
+    operation_facts: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -299,7 +304,7 @@ class Pipeline:
         root = Path(__file__).resolve().parent
         source_hash = hashlib.sha256()
         for name in ("pipeline.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
-                     "execution_queue.py", "step_verifier.py", "step_progress.py", "decision_context.py", "memory/structured_memory.py", "desktop_state.py",
+                     "execution_queue.py", "step_verifier.py", "step_progress.py", "decision_context.py", "browser_feedback.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py",
                      "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
             source_hash.update(name.encode())
             source_hash.update((root / name).read_bytes())
@@ -396,7 +401,7 @@ class Pipeline:
                 result.final_answer = "任务计划与当前截图超出输入预算，未继续执行。"
                 break
             before = self._observation_record(state.obs, f"o_{step_no}")
-            decision = self.decide(messages)
+            decision = self.decide(messages, state)
             for call in decision.calls:
                 call.setdefault("actor_role", "decision")
                 call.setdefault("provenance", "sampled")
@@ -463,6 +468,7 @@ class Pipeline:
                          Execution(kind="deadline", info={"status": "rejected", "dispatched": False,
                                    "error_code": "task_timeout", "reason": "任务总时限已到，未执行新动作"}))
             execution = self._settle_execution(action, execution, state)
+            execution = self._settle_rendering(execution, state)
             execution = self._advance_paper_workflow(action, execution, state)
             self._emit("execution", action=self._compact_action(state.resolved_action or action),
                        execution_info=execution.info, outcome=execution.outcome)
@@ -548,6 +554,7 @@ class Pipeline:
         if state.obs is None:
             state.obs = self.env.reset(state.task)
             self._set_download_deadline()
+        state.obs = self._settle_rendering(Execution(kind="env", obs=state.obs), state).obs
         self.completion.observe(state.obs)
         state.verification = self.completion.evaluate()
         state.screenshot_history.append(state.obs.screenshot)
@@ -583,7 +590,12 @@ class Pipeline:
                                             bool(getattr(self.env, "browser_only", False)))
         system = scoped_system(self._active_actions, state.obs, getattr(self.env, "os_name", "linux"))
         current = state.queue.current if state.queue else None
-        required = current_brief(state, self.completion.public_spec.get('checks', []) if self.completion else [])
+        facts = operational_facts(state.obs, self.completion,
+                                  self.completion.public_report(state.verification) if self.completion else {}, current)
+        if facts != state.operation_facts:
+            state.operation_facts = facts
+            self._publish_diagnostic('operation_feedback', facts=facts)
+        required = current_brief(state, self.completion.public_spec.get('checks', []) if self.completion else [], facts)
         images = self._build_images(state) if getattr(self.model, "vision", True) else []
         if observation_info.get("dialog"):
             # Native JS dialogs may block a new screenshot. Their fresh event
@@ -606,11 +618,12 @@ class Pipeline:
             self.model.build_vision_message(user_text, images),
         ]
 
-    def decide(self, messages: List[dict]) -> Decision:
+    def decide(self, messages: List[dict], state: Optional[StepState] = None) -> Decision:
         raw, action = "", None
         calls: List[dict] = []
         base_messages = copy.deepcopy(messages)
         messages = copy.deepcopy(base_messages)
+        dom_repair_used = False
         attempts = max(1, self.max_retries)
         for attempt in range(attempts):
             if self._task_time_remaining() <= 0:
@@ -633,6 +646,11 @@ class Pipeline:
             if action is not None:
                 err = self._validate_action(action)
                 error_type = 'invalid_action'
+                if err is None and state is not None and not dom_repair_used and attempt + 1 < attempts:
+                    err = self._dom_reference_feedback(action, state)
+                    if err:
+                        dom_repair_used = True
+                        error_type = 'missing_dom_reference'
                 patch = (obj or {}).get("state_update") or {}
                 # Legacy auxiliary memory is optional. An invalid patch must
                 # not prevent an otherwise valid primitive from executing.
@@ -674,6 +692,27 @@ class Pipeline:
                             {'role': 'user', 'content': feedback}]
         return Decision(raw=raw, action=None, calls=calls)
 
+    def _dom_reference_feedback(self, action, state):
+        """One pre-dispatch repair; unavailable AX and explicit desktop remain visual."""
+        if action.action not in {'click', 'type', 'select', 'double_click', 'right_click'}:
+            return None
+        if action.args.get('target_ref') or action.args.get('element_id'):
+            return None
+        nodes = [n for n in exposed_nodes(state.obs) if n.get('direct')]
+        if action.action == 'type':
+            nodes = [n for n in nodes if n.get('role', '').lower() in {'textbox', 'searchbox', 'combobox'}]
+        if not nodes:
+            return None
+        try:
+            route = self.env.route_action(copy.deepcopy(action), state.obs)
+        except Exception:
+            return None
+        if route and route.get('channel') == 'browser_dom':
+            return None
+        return ('当前 AX 有可操作元素，但此动作没有可确定的 DOM 引用。请从本轮 AX 中选择正确的 '
+                'target_ref/element_id，结合论文标题和链接核对目标，不能猜编号；若目标确实是浏览器工具栏或系统窗口，'
+                '先 observe_desktop。网页画布等无对应 AX 元素时可保留视觉 target。此候选动作尚未执行。')
+
     def ground(self, action: Action, state: StepState) -> Action:
         action = copy.deepcopy(action)
         if state.obs and state.obs.info.get("dialog") and action.action not in {
@@ -689,6 +728,10 @@ class Pipeline:
             state.route = self.env.route_action(action, state.obs)
         except Exception:  # noqa: BLE001
             state.route = None
+        error = paper_action_error(action, state.obs,
+                                   active_paper(self.completion, state.queue.current if state.queue else None), state.route)
+        if error:
+            state.route = {"channel": "reobserve", "error_code": "paper_identity_mismatch", "reason": error}
         if state.route is not None:
             state.last_grounding_coord = None
             state.resolved_action = action
@@ -896,6 +939,7 @@ class Pipeline:
             if not raced:
                 break
             execution = self._settle_execution(action, execution, state)
+            execution = self._settle_rendering(execution, state)
         return execution
 
     def _set_download_deadline(self) -> None:
@@ -930,6 +974,62 @@ class Pipeline:
             return {}
         block = next((b for b in obs.context if b.get("kind") == "browser_ax"), {})
         return {key: obs.info.get(key, block.get(key)) for key in ("page_id", "document_id", "url")}
+
+    def _settle_rendering(self, execution: Execution, state: StepState) -> Execution:
+        """Wait for nonblank stable PDF content without spending policy steps.
+
+        This is a bounded readiness heuristic, never completion evidence. A timed
+        out document is offered to the policy once instead of waiting on every turn.
+        """
+        obs = execution.obs
+        cfg = self.wait_config
+        if not cfg.enabled or not is_pdf_observation(obs) or obs.info.get('dialog'):
+            return execution
+        key = tuple(self._observation_page(obs).get(k) for k in ('page_id', 'document_id', 'url'))
+        previous = content_thumbnail(obs.screenshot)
+        cached = state.render_waits.get(key)
+        if (cached == 'timeout' and previous is None) or (cached == 'completed' and previous is not None):
+            obs = copy.deepcopy(obs)
+            obs.info['render_wait'] = {'status': cached, 'reason': 'pdf_render'}
+            execution.obs = obs
+            return execution
+        started = time.monotonic()
+        deadline = started + min(cfg.render_timeout_s, self._task_time_remaining())
+        self._publish_diagnostic('framework_wait', status='waiting', reason='pdf_render', elapsed_s=0)
+        status = 'timeout'
+        last_update = started
+        while time.monotonic() < deadline:
+            time.sleep(min(cfg.poll_interval_s, max(0, deadline - time.monotonic())))
+            fresh = self._observe()
+            if fresh.info.get('observation_error'):
+                previous = None
+                continue
+            obs = fresh
+            fresh_key = tuple(self._observation_page(obs).get(k) for k in ('page_id', 'document_id', 'url'))
+            if obs.info.get('dialog') or not is_pdf_observation(obs) or fresh_key != key:
+                status = 'interrupted'
+                break
+            current = content_thumbnail(obs.screenshot)
+            if stable_content(previous, current):
+                status = 'completed'
+                break
+            previous = current
+            if time.monotonic() - last_update >= 1:
+                last_update = time.monotonic()
+                self._publish_diagnostic('framework_wait', status='waiting', reason='pdf_render',
+                                         elapsed_s=round(last_update - started, 3))
+        if status != 'interrupted':
+            state.render_waits[key] = status
+            # Keep a bounded cache even for long browsing sessions.
+            if len(state.render_waits) > 32:
+                state.render_waits.pop(next(iter(state.render_waits)))
+        obs = copy.deepcopy(obs)
+        result = {'status': status, 'reason': 'pdf_render', 'elapsed_s': round(time.monotonic() - started, 3)}
+        obs.info['render_wait'] = result
+        execution.obs = obs
+        execution.info['render_wait'] = result
+        self._publish_diagnostic('framework_wait', **result)
+        return execution
 
     def _settle_execution(self, action: Action, execution: Execution, state: StepState,
                           *, _deadline=None, _refresh_depth=0) -> Execution:
@@ -1550,7 +1650,13 @@ class Pipeline:
         identity = {"review_id": f"{self.run_id}:a{state.step_id}:{step['id']}",
                     "plan_step_id": step["id"], "goal": step["goal"], "decision_step": state.step_id}
         self._publish_review({**identity, "method": "code", "status": "running", "reason": "检查当前步骤的系统证据"})
-        report = code_review(step, state.obs, execution.info, self.completion.public_report(state.verification))
+        public_report = self.completion.public_report(state.verification)
+        report = code_review(step, state.obs, execution.info, public_report)
+        identity_error = paper_review_error(state.obs, self.completion, public_report, step)
+        if identity_error:
+            report = {"method": "code", "status": "failed", "reason": identity_error,
+                      "evidence": [identity_error], "checks": [*report.get("checks", []),
+                      {"kind": "paper_identity", "status": "failed", "reason": identity_error, "evidence": [identity_error]}]}
         # A complete trusted task contract is stronger than intermediate plan milestones.
         if state.verification.get("status") == "passed" and execution.kind != "terminal":
             report = {"method": "code", "status": "passed", "reason": "整项任务的全部确定性验收条件已满足",
@@ -1563,6 +1669,10 @@ class Pipeline:
                 and execution.info.get("status") not in {"pending", "in_progress"}):
             review_execution = {k: execution.info[k] for k in ('status', 'error_code', 'action') if k in execution.info}
             review_execution['expected_effect'] = expected_effect
+            paper = active_paper(self.completion, step)
+            if paper:
+                report['bound_paper'] = {k: paper['binding'][k]
+                                                    for k in ('full_title', 'canonical_id', 'pdf_url')}
             report = self._review_visual(state, step, review_execution, report, identity, before=before_observation)
         report['code_checks'] = code_checks
         state.step_review = report

@@ -1140,6 +1140,9 @@ class BrowserSession:
         tokens = set(re.findall(r"[a-z0-9]+", t)) - self._STOPWORDS
         allowed_set = set(allowed) if allowed is not None else None
         candidates = []
+        requested_role = next((role for word, role in (
+            ('textbox', 'textbox'), ('search box', 'textbox'), ('input', 'textbox'),
+            ('button', 'button'), ('link', 'link')) if re.search(r'\b' + re.escape(word) + r'\b', t)), None)
         for ref, n in self.nodes.items():
             if allowed_set is not None and ref not in allowed_set:
                 continue
@@ -1149,7 +1152,11 @@ class BrowserSession:
             value = (n.get("value") or "").lower()
             role = (n.get("role") or "").lower()
             hay = f"{role} {name} {value}"
-            score = 0
+            if requested_role and role != requested_role and not (requested_role == 'textbox' and role in {'searchbox', 'combobox'}):
+                continue
+            # Whole accessible-name match handles "Search button" without
+            # lowering the threshold for weak token/substring guesses.
+            score = 40 if name and re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', t) else 0
             for q in quoted:
                 q = q.strip()
                 if not q:
@@ -1688,7 +1695,10 @@ class BrowserSession:
             except Exception:  # noqa: BLE001
                 return
             if prev == digest:
-                return
+                from .visual_readiness import content_thumbnail
+                url = str(getattr(page, 'url', '')).lower().split('?', 1)[0]
+                if not ('/pdf/' in url or url.endswith('.pdf')) or content_thumbnail(bytes(buf)) is not None:
+                    return
             prev = digest
             time.sleep(interval_ms / 1000.0)
 

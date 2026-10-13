@@ -216,6 +216,8 @@ class VMwareEnvironment(Environment):
         语义兜底：base 模型常漏给/给错 target_ref，此时用 action 的英文 target 描述
         在 AX 快照里确定性匹配一个 ref 回填，再走 DOM 定位——不逼模型逐字抄 hex ref。
         """
+        if obs is not None and obs.info.get('active_surface') == 'desktop':
+            return None
         session = self._get_browser_session()
         if session is None or session.snapshot is None or obs is None:
             return None
@@ -238,6 +240,9 @@ class VMwareEnvironment(Environment):
                 ref = session.resolve_target(target, allowed=allowed)
             except Exception:  # noqa: BLE001
                 ref = None
+            if not ref and getattr(session, 'last_resolution_error', None) == 'ambiguous':
+                return {'channel': 'reobserve', 'error_code': 'ambiguous',
+                        'reason': '多个 AX 元素匹配此描述，请结合标题和链接选择当前 target_ref，不能通过视觉猜选。'}
             if ref:
                 action.args["target_ref"] = ref
                 return session.route(action, obs)

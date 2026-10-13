@@ -159,6 +159,15 @@ def test_studio_human_demonstration_from_buttons_to_dataset(request, tmp_path):
             page.screenshot(path=str(tmp_path / 'studio-step-review.png'), full_page=True)
             page.set_viewport_size({"width": 390, "height": 844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            page.evaluate("""() => {
+              addCard({kind:'status',event:'operation_feedback',facts:['下载传输已完成：data.pdf，12345 字节','<script>bad()</script>'],ts:1});
+              addCard({kind:'status',event:'framework_wait',reason:'pdf_render',status:'waiting',elapsed_s:3,ts:1});
+            }""")
+            assert '下载传输已完成：data.pdf' in page.locator('#timeline').inner_text()
+            assert '等待 PDF 渲染' in page.locator('#st-status').inner_text()
+            page.evaluate("addCard({kind:'status',event:'framework_wait',reason:'pdf_render',status:'timeout',elapsed_s:20,ts:1})")
+            assert 'PDF 渲染等待超时' in page.locator('#timeline').inner_text()
+            assert '等待超时' in page.locator('#st-status').inner_text()
             assert not errors
             browser.close()
     finally:

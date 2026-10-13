@@ -243,6 +243,9 @@ class WindowsEnvironment(Environment):
                 ref = session.resolve_target(target, allowed=allowed)
             except Exception:  # noqa: BLE001
                 ref = None
+            if not ref and getattr(session, 'last_resolution_error', None) == 'ambiguous':
+                return {'channel': 'reobserve', 'error_code': 'ambiguous',
+                        'reason': '多个 AX 元素匹配此描述，请结合标题和链接选择当前 target_ref，不能通过视觉猜选。'}
             if ref:
                 action.args["target_ref"] = ref
                 return session.route(action, obs)

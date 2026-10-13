@@ -65,7 +65,12 @@ def live_browser(request, tmp_path, monkeypatch):
             if path != "/no-cookie":
                 self.send_header("Set-Cookie", "session=test-session; Path=/")
             self.end_headers()
-            self.wfile.write(PAGE if path != "/child" else b"<h1>Child tab</h1>")
+            if path == '/pdf/render-fixture':
+                self.wfile.write(b"""<style>body{background:black;color:black;margin:0}</style>
+                <script>setTimeout(() => {document.body.style.background='white';
+                document.body.innerHTML=('<h2 style="margin:12px 20%">Rendered paper content</h2>').repeat(20)},4000)</script>""")
+            else:
+                self.wfile.write(PAGE if path != "/child" else b"<h1>Child tab</h1>")
         def log_message(self, *args):
             pass
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -232,3 +237,30 @@ def test_real_pipeline_recovers_modal_and_verifies_paper(live_browser, tmp_path,
                    for m in c["messages"]) for c in calls)
     assert "先处理当前截图/AX中的遮挡" in str(calls[2]["messages"])
     assert events[-1]["event_type"] == "episode_end"
+
+
+def test_real_browser_delayed_pdf_content_wait_and_semantic_dom(live_browser, monkeypatch):
+    # A local PDF-like URL deliberately renders later; no external paper/model.
+    from osworld_agent.adapters.windows_env import WindowsEnvironment
+    from osworld_agent.pipeline import Pipeline, Execution, StepState
+    from osworld_agent.visual_readiness import content_thumbnail
+    from test_pipeline_completion import Model
+    session, base = live_browser
+    env = WindowsEnvironment(width=900, height=700)
+    env._browser_session = session
+    obs = env.observe()
+    action = Action('click', {'target': 'Download AAA PDF link'})
+    route = env.route_action(action, obs)
+    assert route['channel'] == 'browser_dom'
+    assert session.nodes[route['target_ref']]['id'] == 'pdf'
+    assert session.goto(base + '/pdf/render-fixture')['status'] == 'executed'
+    obs = env.observe()
+    assert content_thumbnail(obs.screenshot) is None
+    monkeypatch.setattr('osworld_agent.pipeline._viz_log_status', None)
+    pipe = Pipeline(model=Model([]), env=env, grounding=None, system_prompt='test',
+                    wait_config={'render_timeout_s': 8})
+    state = StepState(obs=obs, step_id=1)
+    result = pipe._settle_rendering(Execution(kind='browser_dom', obs=obs), state)
+    assert result.obs.info['render_wait']['status'] == 'completed'
+    assert content_thumbnail(result.obs.screenshot) is not None
+    assert state.step_id == 1 and not pipe.model.calls
