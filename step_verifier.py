@@ -78,8 +78,14 @@ def code_review(step, obs, execution_info, contract):
             runtime = info.get("runtime_state", {})
             apps = runtime.get("applications", [])
             expected = predicate["app"].casefold().removesuffix(".exe")
+            windows = runtime.get('source') == 'windows_window_api'
+            if windows:
+                from .desktop_state import windows_application_process
+                expected = windows_application_process(predicate['app'])
             hits = [a for a in apps if isinstance(a, dict) and
                     str(a.get("process_name", "")).casefold().removesuffix(".exe") == expected]
+            if windows and expected == 'explorer':
+                hits = [a for a in hits if a.get('class_name') in {'CabinetWClass', 'ExploreWClass'}]
             if hits:
                 status, reason, evidence = "passed", "操作系统报告应用窗口存在", [str(a.get("title", a["process_name"])) for a in hits[:3]]
             elif runtime.get("complete") is True:

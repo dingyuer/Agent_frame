@@ -40,7 +40,9 @@ def scoped_system(names, obs, os_name="linux"):
     text += "\n".join(f"- {n}({', '.join(ACTION_REGISTRY[n].params)})" for n in names)
     text += "\n即使提供 target_ref，click/type/select 仍须填写英文 target；target_ref 是字符串。type 可加 overwrite:true；hotkey.keys 为数组；wait.seconds 大于0且不超过60；scroll.direction 为 up/down。"
     if any(b.get("kind") == "browser_ax" for b in (obs.context if obs else [])):
-        text += "\n浏览器：PDF 查看器工具栏、浏览器权限提示、系统另存对话框可能不在 AX 中。先 observe_desktop，再依据新桌面截图定位；返回网页用 observe_browser。"
+        text += "\n浏览器：PDF 查看器工具栏、浏览器权限提示、系统另存对话框可能不在 AX 中。PDF 的根节点/嵌入容器不是按钮，不需要为它们编造 target_ref。先 observe_desktop，再依据新桌面截图定位；返回网页用 observe_browser。"
+    if os_name.lower() == 'windows':
+        text += '\nWindows 桌面：先 observe_desktop 再操作。资源管理器未打开时用 hotkey keys=["win","e"]；switch_applications 只激活已打开的目标窗口，不能代替启动应用。已在前台时继续操作内容，不要重复切换。'
     if (obs.info if obs else {}).get("dialog"):
         text += "\n当前存在 JS 对话框，截图可能过期，先 handle_dialog，accept 为布尔值。"
     return text

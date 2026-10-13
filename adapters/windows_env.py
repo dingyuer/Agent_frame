@@ -366,6 +366,10 @@ class WindowsEnvironment(Environment):
             return StepResult(observation=self.observe(), info={
                 "status": "rejected", "dispatched": False, "channel": "desktop",
                 "error": "请先 observe_desktop 获取桌面截图后再执行 GUI 操作；网页操作使用 DOM 或 observe_browser"})
+        if name == 'switch_applications':
+            from ..desktop_state import switch_windows_application
+            result = switch_windows_application(action.args.get('app_code'))
+            return StepResult(observation=self.observe(), info=result)
         # 坐标化后执行 pyautogui 命令
         cmd = to_pyautogui(action)
         if cmd:

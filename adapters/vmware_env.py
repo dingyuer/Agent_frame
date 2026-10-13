@@ -101,8 +101,9 @@ def to_pyautogui(action: Action) -> str:
         app_name = a.get("app_name")
         return SAVE_DOC_CMD.format(app_name=repr(app_name) if app_name else "None")
     if name == "switch_applications":
-        # 简化：alt+tab 切应用（要按 app_code 精确定位需扩展）
-        return f"{head} pyautogui.hotkey('alt', 'tab')"
+        # A blind Alt+Tab ignores app_code and can toggle forever. Adapters
+        # must implement targeted activation or explicitly reject this action.
+        return ""
     if name == "set_cell_values":
         # LibreOffice UNO 直写单元格（不经 GUI），写完后 store() 落盘
         cell_values = a.get("new_cell_values") or {}
@@ -498,6 +499,11 @@ class VMwareEnvironment(Environment):
         if name not in BASIC_ACTIONS:
             return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                 "error_code": "non_basic_action", "action": name})
+        if name == 'switch_applications':
+            return StepResult(observation=self.observe(), info={
+                'status': 'rejected', 'dispatched': False, 'channel': 'desktop',
+                'error_code': 'application_switch_unsupported',
+                'reason': '此环境不支持按 app_code 精确激活应用；请根据桌面截图使用任务栏、系统启动器或 hotkey，不能反复调用 switch_applications。'})
         if name in {"observe_desktop", "observe_browser"}:
             self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
             return StepResult(observation=self.observe(), info={"status": "executed", "dispatched": False, "action": name})

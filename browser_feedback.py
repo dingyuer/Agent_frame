@@ -65,7 +65,7 @@ def paper_action_error(action, obs, goal, route=None):
     return ''
 
 
-def operational_facts(obs, completion, report, step=None):
+def operational_facts(obs, completion, report, step=None, *, os_name=""):
     """Only public binding + browser event evidence, never model-written facts."""
     lines = []
     goal = active_paper(completion, step)
@@ -79,6 +79,11 @@ def operational_facts(obs, completion, report, step=None):
         if current and not same_paper(current, binding['canonical_id']):
             lines.append('当前打开的是其他论文，请回到上述已核实地址。')
     info = (obs.info or {}) if obs else {}
+    if info.get('active_surface') == 'desktop':
+        foreground = next((a for a in info.get('runtime_state', {}).get('applications', []) if a.get('foreground')), None)
+        if foreground:
+            lines.append('系统观察到的前台窗口：' + str(foreground.get('process_name', '')) + ' / '
+                         + str(foreground.get('title', ''))[:160])
     pending = info.get('pending_downloads', [])
     if pending:
         lines.append('系统仍有下载进行中；等待框架确认，不要重复点击下载。')
@@ -106,6 +111,7 @@ def operational_facts(obs, completion, report, step=None):
     rendering = info.get('render_wait', {})
     if rendering.get('status') == 'timeout':
         lines.append('PDF 渲染等待已超时，当前画面尚未确认就绪；请检查页面或切换观察，不要在空白画面反复保存。')
+    lines.extend(rename_ui_guidance(obs, completion, report, os_name))
     return list(dict.fromkeys(lines))
 
 
@@ -126,3 +132,48 @@ def paper_review_error(obs, completion, report, step):
                     and check.get('reason') == 'download transport does not identify the bound official paper'):
                 return '下载文件的来源与已绑定论文不符，不能确认下载步骤完成。'
     return ''
+
+
+def rename_ui_guidance(obs, completion, report, os_name):
+    """Describe a GUI route only for a verifier-selected registered artifact.
+
+    No file lookup or mutation happens here. Paths come from browser events and
+    must agree with the public verifier's chosen artifact, not model memory.
+    """
+    if completion is None or os_name.lower() != 'windows':
+        return []
+    from pathlib import PureWindowsPath
+    import json
+    public = {c['id']: c for c in completion.public_spec.get('checks', [])}
+    artifacts = [a for a in (obs.info or {}).get('artifacts', [])
+                 if isinstance(a, dict) and a.get('completed') is True] if obs else []
+    pairs = []
+    for check in (report or {}).get('checks', []):
+        spec = public.get(check.get('id'), {})
+        if (check.get('status') != 'failed' or check.get('reason') != 'downloaded filename does not match'
+                or not spec.get('filename')):
+            continue
+        path = check.get('path')
+        if not isinstance(path, str) or not PureWindowsPath(path).is_absolute() or any(ord(c) < 32 for c in path):
+            continue
+        matching = [a for a in artifacts if isinstance(a.get('path'), str)
+                    and PureWindowsPath(a['path']) == PureWindowsPath(path)]
+        if len(matching) == 1:
+            pairs.append((PureWindowsPath(path), spec['filename']))
+    if len(pairs) != 1:
+        return []
+    path, name = pairs[0]
+    info = obs.info or {}
+    lines = ['当前文件需要界面改名：' + json.dumps(path.name, ensure_ascii=False)
+             + ' → ' + json.dumps(name, ensure_ascii=False) + '。无需再次下载。']
+    if info.get('active_surface') != 'desktop':
+        lines.append('先 observe_desktop 获取桌面截图，再操作资源管理器。')
+    foreground = next((a for a in info.get('runtime_state', {}).get('applications', []) if a.get('foreground')), {})
+    explorer = (str(foreground.get('process_name', '')).casefold() == 'explorer.exe'
+                and foreground.get('class_name') in {'CabinetWClass', 'ExploreWClass'})
+    lines.append('资源管理器已在前台，继续定位文件，不要再次 switch_applications。' if explorer
+                 else '若资源管理器尚未打开，用 hotkey keys=["win","e"] 打开；不要重复切换不存在的窗口。')
+    lines.append('按新截图逐步操作：资源管理器地址栏 Ctrl+L，输入下载目录 '
+                 + json.dumps(str(path.parent), ensure_ascii=False) + ' 并 Enter；选中上述原文件后按 F2，编辑名称并 Enter 确认。')
+    lines.append('注意扩展名：若重命名框只显示名称主体，保留系统隐藏的扩展名，避免生成双重 .pdf；显示完整文件名时填写完整目标名。最终仍以框架文件验收为准。')
+    return lines

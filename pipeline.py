@@ -305,7 +305,7 @@ class Pipeline:
         source_hash = hashlib.sha256()
         for name in ("pipeline.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
                      "execution_queue.py", "step_verifier.py", "step_progress.py", "decision_context.py", "browser_feedback.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py",
-                     "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
+                     "adapters/windows_env.py", "adapters/vmware_env.py", "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
             source_hash.update(name.encode())
             source_hash.update((root / name).read_bytes())
         manifest = {"run_id": self.run_id, "task": task, "framework_source_hash": source_hash.hexdigest(),
@@ -591,7 +591,8 @@ class Pipeline:
         system = scoped_system(self._active_actions, state.obs, getattr(self.env, "os_name", "linux"))
         current = state.queue.current if state.queue else None
         facts = operational_facts(state.obs, self.completion,
-                                  self.completion.public_report(state.verification) if self.completion else {}, current)
+                                  self.completion.public_report(state.verification) if self.completion else {}, current,
+                                  os_name=getattr(self.env, "os_name", ""))
         if facts != state.operation_facts:
             state.operation_facts = facts
             self._publish_diagnostic('operation_feedback', facts=facts)
@@ -698,7 +699,15 @@ class Pipeline:
             return None
         if action.args.get('target_ref') or action.args.get('element_id'):
             return None
-        nodes = [n for n in exposed_nodes(state.obs) if n.get('direct')]
+        # A PDF document may expose only its viewer/container or a sparse
+        # partial AX tree. Never demand a made-up DOM reference on that surface.
+        # Explicit refs and semantic DOM routing still work in ground().
+        if is_pdf_observation(state.obs):
+            return None
+        from .browser_session import INTERACTIVE
+        nodes = [n for n in exposed_nodes(state.obs)
+                 if n.get('direct') and n.get('role') in INTERACTIVE
+                 and not n.get('states', {}).get('disabled')]
         if action.action == 'type':
             nodes = [n for n in nodes if n.get('role', '').lower() in {'textbox', 'searchbox', 'combobox'}]
         if not nodes:

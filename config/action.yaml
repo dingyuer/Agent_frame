@@ -78,7 +78,7 @@ actions:
 
   switch_applications:
     params: [app_code]
-    description: "切换活动应用窗口（app_code 如 libreoffice_calc / chrome / libreoffice_writer）"
+    description: "激活已打开的目标应用窗口；Windows 支持 app_code=file_explorer/chrome 或进程名。未打开时请用系统启动器或快捷键；不支持精确切换的环境会明确拒绝"
     kind: env
     resolve: none
 
