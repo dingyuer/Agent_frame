@@ -157,6 +157,8 @@ def verify_cell_values(env, cell_values, app_name, sheet_name):
 
 
 class VMwareEnvironment(Environment):
+    cli_target = "guest"
+
     """包装 OSWorld DesktopEnv 的 VMware 环境。"""
 
     evaluation_available = True
@@ -167,6 +169,7 @@ class VMwareEnvironment(Environment):
                  snapshot_name: str = "init_state_ca3", provider: str = "vmware",
                  cache_dir: Optional[str] = None, decision_model=None):
         self.task_config = task_config
+        self.guest_workspace_dir = (task_config or {}).get("cli_workspace_dir", "~/agent_workspace")
         self.os_name = "linux"           # Ubuntu 虚拟机
         self.screen_width = screen_width
         self.screen_height = screen_height

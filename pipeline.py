@@ -16,7 +16,10 @@
 """
 from __future__ import annotations
 
+from .report_delivery import wants_report
+
 import copy
+import os
 import json
 import time
 import hashlib
@@ -24,8 +27,9 @@ import math
 import re
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from .actions import (
@@ -44,15 +48,33 @@ from .verifiers import CompletionVerifier
 from .task_specs import task_profile, task_analysis, audit_requirement_proposals, TASK_ANALYSIS_VERSION
 from .step_progress import ProgressConfig, StepProgressMonitor
 from .model.decision_judge import DecisionJudge, DecisionJudgeConfig
-from .judge_evidence import effect_review, evidence_fingerprint, checkpoint, target_identity
+from .model.judge_selection import RuntimeDecisionJudge
+from .judge_evidence import effect_review, evidence_fingerprint, checkpoint, target_identity, select_frame
 from .paper_workflow import PaperWorkflow, WORKFLOW_VERSION, binding_group_hash
-from .paper_resolver import ADAPTER_VERSION
-from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS, compile_download_milestones
-from .decision_context import action_scope, scoped_system, selected_memory, current_brief
+from .paper_identity import PaperIdentitySelector
+from .paper_sources import SOURCE_POLICY_VERSION, paper_search_policy
+from .paper_resolver import ADAPTER_VERSION, arxiv_id_from_url
+from .paper_search import PaperSearchRecovery
+from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS, compile_download_milestones, refine_paper_plan
+from .decision_context import action_scope, system_sections, selected_memory, current_brief
+from .decision_modes import decision_mode, mode_capability, mode_evidence_key
 from .step_verifier import StepReviewer, code_review, make_review_model, unresolved_desktop_checks
 from .actions import BASIC_ACTIONS
-from .browser_feedback import active_paper, paper_action_error, operational_facts, exposed_nodes, paper_review_error
-from .visual_readiness import is_pdf_observation, content_thumbnail, stable_content
+from .browser_feedback import active_paper, paper_action_error, paper_download_preflight_error, redundant_sort_selection_error, search_navigation_error, operational_facts, exposed_nodes, paper_review_error
+from .visual_readiness import is_pdf_observation, content_thumbnail, stable_content, likely_loading_page
+from .pipeline_types import WaitConfig, AgentResult, StepState, Decision, Execution
+from . import pipeline_format
+from .plan_compiler import normalize_plan_actions
+from .phase_timing import timed_phase
+from .parallel_work import measured_call, prepare_model_client
+from .download_review_scope import named_download_receipts
+from .planning_service import PlanningService
+from .settlement import SettlementService, SettlementPorts
+from .review_service import ReviewService, ReviewPorts
+from . import progress_controller
+from .download_click_guard import repeated_download_click_error, remember_unconfirmed_download_click
+from .progress_controller import ProgressController, ProgressPorts
+from .progress_controller import _NO_CHANGE_DIFF_THRESHOLD, _LOOP_HISTORY_LEN, _FAILURE_REPEAT_LIMIT
 
 # 实时状态推送（可选）：execute 阶段进度推给 viz 前端，失败不影响主流程
 try:
@@ -60,144 +82,20 @@ try:
 except Exception:  # noqa: BLE001
     _viz_log_status = None
 
-# 确定性卡死检测参数
-_NO_CHANGE_DIFF_THRESHOLD = 2.0       # 64x64 灰度 mean-abs-diff 阈值（< 此值视为无变化）
-_LOOP_HISTORY_LEN = 6                 # 周期循环检测的历史长度
-_FAILURE_REPEAT_LIMIT = 2              # 执行失败/解析失败只计一层，不再重复累积 STALL
+# Re-export existing stall constants; the controller owns their definitions.
 
 
 # --------------------------------------------------------------------------- #
-# 数据容器
+# Runtime types are imported above and re-exported for existing callers.
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class WaitConfig:
-    """Framework waits are bounded wall time, never extra policy decisions."""
-    enabled: bool = True
-    poll_interval_s: float = 0.25
-    download_start_timeout_s: float = 2.0
-    render_timeout_s: float = 20.0
-    download_max_bytes: int = 50 * 1024 * 1024
-    operation_timeout_s: float = 300.0
-    task_timeout_s: float = 1800.0
-
-    def __post_init__(self):
-        if type(self.download_max_bytes) is not int or self.download_max_bytes < 0:
-            raise ValueError('wait_config.download_max_bytes must be a nonnegative integer')
-        if type(self.enabled) is not bool:
-            raise ValueError("wait_config.enabled must be boolean")
-        for name in ("poll_interval_s", "download_start_timeout_s", "operation_timeout_s", "task_timeout_s", "render_timeout_s"):
-            value = getattr(self, name)
-            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-                raise ValueError(f"wait_config.{name} must be a finite nonnegative number")
-            if name != "download_start_timeout_s" and value == 0:
-                raise ValueError(f"wait_config.{name} must be positive")
 
 
-@dataclass
-class AgentResult:
-    """单任务运行结果。"""
-    task: str
-    success: bool = False
-    score: float = 0.0
-    steps: int = 0
-    final_answer: str = ""
-    trajectory: List[dict] = field(default_factory=list)
-    screenshots: Dict[int, Any] = field(default_factory=dict)   # step -> 决策前截图（PIL 或 bytes）
-    plan: Optional[Dict[str, Any]] = None   # 阶段0 产出的任务计划（steps/keywords/final_check）
-    evaluation_available: bool = False
-    reward_source: str = "unavailable"
-    termination_reason: str = "unknown"
-    verification: Dict[str, Any] = field(default_factory=dict)
-    planning_calls: List[dict] = field(default_factory=list)
-    run_id: str = ""
-    run_manifest: Dict[str, Any] = field(default_factory=dict)
-    events: List[dict] = field(default_factory=list)
-    private_evaluation: Dict[str, Any] = field(default_factory=dict)
-    review_calls: List[dict] = field(default_factory=list)
 
 
-@dataclass
-class StepState:
-    """跨步骤流动的循环状态。"""
-    task: str = ""
-    obs: Optional[Observation] = None
-    memory: Optional[StructuredMemory] = None
-    skill_ctx: Optional[SkillContext] = None
-    skill_results: Dict[str, str] = field(default_factory=dict)
-    terminal_result: str = ""
-    code_agent_result: str = ""
-    page_source: str = ""
-    browser_result: str = ""
-    memory_text: str = ""
-    prompt_metadata: Dict[str, Any] = field(default_factory=dict)
-    prompt_text: str = ""                     # 本步喂给决策模型的输入文本（任务+记忆+结构观察+工具结果）
-    route: Optional[Dict[str, Any]] = None
-    resolved_action: Optional[Any] = None
-    # 视觉记忆
-    screenshot_history: List[Any] = field(default_factory=list)
-    last_grounding_coord: Optional[Tuple[int, int]] = None
-    last_grounding_target: str = ""
-    # 程序维护的信息
-    step_id: int = 0
-    last_action: str = ""
-    last_target: str = ""
-    execution_status: str = ""
-    failure_count: int = 0
-    # 卡死检测
-    no_change_count: int = 0
-    action_keys: List[str] = field(default_factory=list)
-    shell_outputs: List[str] = field(default_factory=list)   # 最近 shell 命令输出（用于 shell 卡死检测）
-    verification: Dict[str, Any] = field(default_factory=dict)
-    task_profile: Dict[str, Any] = field(default_factory=dict)
-    recovery: Dict[str, Any] = field(default_factory=dict)
-    phase_events: List[dict] = field(default_factory=list)
-    execution_feedback: Dict[str, Any] = field(default_factory=dict)
-    failure_counts: Dict[str, int] = field(default_factory=dict)
-    failure_class: str = ""
-    failure_key: str = ""
-    semantic_targets: Dict[str, Any] = field(default_factory=dict)
-    waiting_download_ids: set = field(default_factory=set)
-    last_browser_page: Dict[str, Any] = field(default_factory=dict)
-    queue: Optional[ExecutionQueue] = None
-    step_review: Dict[str, Any] = field(default_factory=dict)
-    progress_monitor: Optional[StepProgressMonitor] = None
-    step_progress: Dict[str, Any] = field(default_factory=dict)
-    routing_hint: Dict[str, Any] = field(default_factory=dict)
-    finish_feedback: str = ""
-    render_waits: Dict[tuple, str] = field(default_factory=dict)
-    control_mode: str = ''
-    consumed_downloads: set = field(default_factory=set)
-    operation_facts: List[str] = field(default_factory=list)
-    judge_rechecks: set = field(default_factory=set)
-    judge_checkpoints: List[dict] = field(default_factory=list)
 
 
-@dataclass
-class Decision:
-    """③ 决策阶段的产出（先分析当前屏幕 → 证据先行 → 预期效果）。"""
-    raw: str = ""
-    action: Optional[Action] = None
-    summary: str = ""                    # 一句话观察与行动计划；非完成证据
-    screen_analysis: str = ""            # 当前屏幕状态描述（含打开的应用）
-    observed_effect: str = ""            # 上一步动作的实际观察（先客观描述）
-    action_status: str = ""              # success / failure / uncertain
-    state_update: Dict[str, Any] = field(default_factory=dict)
-    expected_effect: str = ""            # 下一步动作的预期效果
-    calls: List[dict] = field(default_factory=list)   # 每次决策调用的完整记录（含重试）
 
 
-@dataclass
-class Execution:
-    """⑤ 执行阶段的产出。"""
-    kind: str = ""                        # skill / shell / subagent / terminal / finish_request / env
-    outcome: str = ""
-    executed: str = ""
-    obs: Optional[Observation] = None
-    done: bool = False
-    success: bool = False
-    answer: str = ""
-    info: Dict[str, Any] = field(default_factory=dict)   # 执行器返回的详细信息（browser_dom 状态等）
-    reward: float = 0.0                                  # 环境奖励（browser_dom 透传 step_result.reward）
 
 
 # --------------------------------------------------------------------------- #
@@ -211,8 +109,13 @@ class Pipeline:
                  max_retries: int = 3, enable_reflection: bool = True,
                  early_stop_repeat: int = 3, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
-                 planner_model=None, event_path=None, run_id=None, run_manifest=None, max_replans=1,
-                 wait_config=None, verifier_model=None, progress_config=None, decision_judge=None):
+                 planner_model=None, event_path=None, run_id=None, run_manifest=None, max_replans=3,
+                 wait_config=None, verifier_model=None, progress_config=None, decision_judge=None, mode_prompts=None, knowledge_method="all", knowledge_jev_url=""):
+        from .prompt_settings import validate_mode_prompts
+        self.mode_prompts = validate_mode_prompts(mode_prompts)
+        from .knowledge_selection import validate_method
+        self.knowledge_method = validate_method(knowledge_method)
+        self.knowledge_jev_url = knowledge_jev_url
         self.model = model
         self.grounding = grounding
         self.env = env
@@ -230,6 +133,7 @@ class Pipeline:
         self.event_path = event_path
         self.run_id = run_id or uuid.uuid4().hex
         self.run_manifest = copy.deepcopy(run_manifest or {})
+        self.run_manifest["decision_prompt_overrides"] = copy.deepcopy(self.mode_prompts)
         self.event_writer = None
         self.events = []
         self._current_step = 0
@@ -240,23 +144,38 @@ class Pipeline:
         self._verification = None         # 最近一次 finish 验证的调用记录
         self.wait_config = wait_config if isinstance(wait_config, WaitConfig) else WaitConfig(**(wait_config or {}))
         self.progress_config = progress_config if isinstance(progress_config, ProgressConfig) else ProgressConfig(**(progress_config or {}))
-        judge_config = decision_judge if isinstance(decision_judge, DecisionJudgeConfig) else DecisionJudgeConfig(**(decision_judge or {}))
-        self.decision_judge = DecisionJudge(judge_config) if judge_config.url else None
+        judge_options = dict(decision_judge or {}) if not isinstance(decision_judge, DecisionJudgeConfig) else {}
+        selection_policy = judge_options.pop('selection_policy', 'threshold')
+        if not isinstance(selection_policy, str) or selection_policy not in {'threshold', 'maximum_probability'}:
+            raise ValueError('selection_policy must be threshold or maximum_probability')
+        judge_config = decision_judge if isinstance(decision_judge, DecisionJudgeConfig) else DecisionJudgeConfig(**judge_options)
+        self.decision_judge = RuntimeDecisionJudge(judge_config, selection_policy=selection_policy) if judge_config.url else None
         self._task_deadline = None
         self.verifier_model = verifier_model if verifier_model is not None else make_review_model(model)
         self.reviewer = StepReviewer(self.verifier_model, self.compiler)
         self._active_actions = None
         self._model_final_report = None
+        self._reviewed_download_facts = []
+        self._paper_search_recovery = PaperSearchRecovery()
+        self.paper_identity_selector = PaperIdentitySelector(make_review_model(model))
 
     # ================= 主循环 ================= #
     def run(self, task: str) -> AgentResult:
+        self._run_started = time.perf_counter()
+        self._phase_timings = []
         self._task_deadline = time.monotonic() + self.wait_config.task_timeout_s
         self._replans = 0
         self._current_step = 0
+        self._knowledge_selection = None
+        self._report_delivery = {}
+        self._report_required = wants_report(task)
         self.reviewer.calls.clear()
         self._model_final_report = None
+        self._reviewed_download_facts = []
         self.completion = CompletionVerifier(task, self.completion_spec, self.private_completion_spec)
-        self._paper_workflow = PaperWorkflow()
+        self.paper_identity_selector.calls.clear()
+        self._paper_workflow = PaperWorkflow(identity_selector=self._select_paper_identity, task=task)
+        self._paper_search_recovery = PaperSearchRecovery(task=task)
         self.events = []
         manifest = self._make_manifest(task)
         result = AgentResult(task=task, run_id=self.run_id, run_manifest=manifest,
@@ -270,25 +189,49 @@ class Pipeline:
             self.events = self.event_writer.events
         else:
             self._emit("episode_start", manifest=manifest)
+        result.run_manifest["phase_timings"] = self._phase_timings
         result.events = self.events
         result.review_calls = self.reviewer.calls
         try:
+            self._publish_diagnostic('workbench_start', instruction=task, max_steps=self.max_steps)
             result = self._run(task, result)
+            delivery = getattr(self, '_report_delivery', {})
+            if delivery:
+                delivery['verification_status'] = 'passed' if result.success else 'not_passed'
+                result.run_manifest['report_delivery'] = copy.deepcopy(delivery)
+                if delivery.get('text'):
+                    result.final_answer = delivery['text']
+                self._publish_diagnostic('report_verification', status=delivery['verification_status'], version=delivery.get('version'))
             result.run_manifest["goal_bindings"] = self.completion.bindings
             result.run_manifest["goal_binding_hash"] = binding_group_hash(self.completion.bindings)
+            elapsed = round(time.perf_counter() - self._run_started, 3)
             self._emit("episode_end", outcome={
                 "success": result.success, "score": result.score,
                 "reward": result.score if result.evaluation_available else None,
                 "reward_valid": result.evaluation_available, "reward_source": result.reward_source,
-                "termination_reason": result.termination_reason, "verification": result.verification},
+                "termination_reason": result.termination_reason, "verification": result.verification,
+                "final_answer": result.final_answer,
+                "elapsed_s": elapsed}, elapsed_s=elapsed,
                 goal_bindings=result.run_manifest["goal_bindings"],
                 goal_binding_hash=result.run_manifest["goal_binding_hash"])
+            from .run_metrics import summarize_events
+            result.run_manifest['run_metrics'] = summarize_events(self.events)
+            if _viz_log_status:
+                _viz_log_status({'event': 'run_metrics', 'run_id': self.run_id, 'metrics': result.run_manifest['run_metrics']})
+            session = getattr(self.env, '_browser_session', None)
+            if callable(getattr(session, 'stop_preview', None)):
+                session.stop_preview()
+            result.run_manifest['knowledge_retrieval'] = copy.deepcopy(self._knowledge_selection)
             return result
         except BaseException as exc:
             self._emit("episode_error", error_type=type(exc).__name__,
-                       step=self._current_step, reward=None, reward_valid=False)
+                       step=self._current_step, reward=None, reward_valid=False,
+                       elapsed_s=round(time.perf_counter() - self._run_started, 3))
             raise
         finally:
+            session = getattr(self.env, '_browser_session', None)
+            if callable(getattr(session, 'stop_preview', None)):
+                session.stop_preview()
             if self.event_writer:
                 self.event_writer.close()
 
@@ -296,11 +239,20 @@ class Pipeline:
         if self._current_step:
             payload.setdefault("parent_decision_id", f"a_{self._current_step}")
         if self.event_writer:
-            return self.event_writer.emit(event_type, **payload)
-        event = {"event_id": f"{self.run_id}:e{len(self.events) + 1}", "run_id": self.run_id,
+            event = self.event_writer.emit(event_type, **payload)
+        else:
+            event = {"event_id": f"{self.run_id}:e{len(self.events) + 1}", "run_id": self.run_id,
                  "event_type": event_type, "timestamp": time.time(), "actor_role": "framework",
                  "source": "framework", **copy.deepcopy(payload)}
-        self.events.append(event)
+            self.events.append(event)
+        if _viz_log_status and event_type in {'action_context', 'transition', 'transition_finalized',
+                'model_call', 'execution', 'route', 'episode_end', 'episode_error', 'plan_revision'}:
+            try:
+                _viz_log_status({'event': 'workbench_record', 'run_id': self.run_id,
+                    'record': {'event_id': event.get('event_id'), 'run_id': self.run_id,
+                               'event_type': event_type, 'timestamp': time.time(), **payload}})
+            except Exception:
+                pass
         return event
 
     def _make_manifest(self, task):
@@ -311,9 +263,12 @@ class Pipeline:
                 "chat_template_revision", "temperature", "max_tokens", "capture_rollout")}
         root = Path(__file__).resolve().parent
         source_hash = hashlib.sha256()
-        for name in ("pipeline.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
-                     "execution_queue.py", "judge_evidence.py", "step_verifier.py", "step_progress.py", "decision_context.py", "browser_feedback.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py", "desktop_readiness.py", "desktop_capture.py", "windows_text.py",
-                     "adapters/windows_env.py", "adapters/vmware_env.py", "task_specs.py", "paper_workflow.py", "paper_resolver.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
+        for name in ("pipeline.py", "pipeline_types.py", "pipeline_format.py", "plan_compiler.py", "knowledge_base.py", "knowledge_selection.py", "replanning.py", "run_metrics.py",
+                     "model/grounding_usage.py", "model/grounding.py", "adapters/qwen_grounding.py", "adapters/uitars_grounding.py", "adapters/uivenus2_grounding.py",
+                     "planning_service.py", "phase_timing.py", "parallel_work.py", "download_review_scope.py", "settlement.py", "review_service.py", "progress_controller.py",
+                     "browser_interaction.py", "download_click_guard.py", "browser_profile.py", "persistent_chrome.py", "artifact_download.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
+                     "execution_queue.py", "judge_evidence.py", "model/judge_selection.py", "step_verifier.py", "step_progress.py", "decision_context.py", "decision_modes.py", "browser_feedback.py", "paper_search.py", "scholar_search.py", "browser_results.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py", "desktop_readiness.py", "desktop_capture.py", "windows_text.py",
+                     "adapters/windows_env.py", "adapters/vmware_env.py", "task_specs.py", "paper_sources.py", "paper_workflow.py", "paper_identity.py", "paper_resolver.py", "cli_executor.py", "adapters/cli_env.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
             source_hash.update(name.encode())
             source_hash.update((root / name).read_bytes())
         manifest = {"run_id": self.run_id, "task": task, "framework_source_hash": source_hash.hexdigest(),
@@ -325,6 +280,7 @@ class Pipeline:
                     "verifier_model": model_record(self.verifier_model), "max_steps": self.max_steps,
                     "public_completion": self.completion.public_spec,
                     "task_analysis": task_analysis(task, self.completion.public_spec),
+                    "paper_search_policy": paper_search_policy(task) if self.completion.paper_goals() else None,
                     "completion_hash": hashlib.sha256(json.dumps(self.completion.spec, sort_keys=True).encode()).hexdigest(),
                     **self.run_manifest}
         manifest["run_id"] = self.run_id
@@ -333,10 +289,12 @@ class Pipeline:
                    "early_stop_repeat": self.early_stop_repeat,
                    "failure_repeat_limit": _FAILURE_REPEAT_LIMIT, "wait_config": asdict(self.wait_config),
                    "progress_config": asdict(self.progress_config), "task_analysis_version": TASK_ANALYSIS_VERSION,
+                   "paper_source_policy_version": SOURCE_POLICY_VERSION,
                    "decision_judge": self.decision_judge.config.public() if self.decision_judge else None,
+                   "decision_judge_selection_policy": getattr(self.decision_judge, 'selection_policy', 'threshold'),
                    "paper_resolver_version": ADAPTER_VERSION, "paper_workflow_version": WORKFLOW_VERSION,
                    "enable_reflection": self.enable_reflection, "verifier_model": model_record(self.verifier_model),
-                   "decision_context_version": "current_step_brief_v2", "max_plan_steps": MAX_PLAN_STEPS, "step_verifier_version": "1.1", "judge_evidence_version": "9b_v1",
+                   "decision_context_version": "current_step_brief_v3", "paper_search_recovery_version": "1.0", "max_plan_steps": MAX_PLAN_STEPS, "step_verifier_version": "1.1", "judge_evidence_version": "9b_v2_alias",
                    "decision_model": model_record(self.model), "planner_model": model_record(self.planner_model)}
         manifest["runtime_config"] = runtime
         manifest["runtime_config_hash"] = hashlib.sha256(
@@ -351,23 +309,7 @@ class Pipeline:
 
     def _run(self, task: str, result: AgentResult) -> AgentResult:
         state = self._init_state(task)
-        if callable(getattr(self.env, 'prepare_workspace', None)):
-            workspace = self.env.prepare_workspace(self.run_id)
-            result.run_manifest['workspace'] = copy.deepcopy(workspace)
-            self._publish_diagnostic('workspace_ready', workspace=workspace)
-        state.task_profile = task_profile(task, self.completion.public_spec)
-        if self.decision_judge:
-            state.routing_hint['task'] = self.decision_judge.classify_task(task, remaining_s=self._task_time_remaining())
-            self._record_typed_judge()
-            state.task_profile['execution_hint'] = state.routing_hint['task']
-            result.run_manifest['task_routing_hint'] = copy.deepcopy(state.routing_hint['task'])
-            self._publish_diagnostic('decision_judgment', judgment=state.routing_hint['task'])
-        self._publish_diagnostic('task_analysis', analysis=task_analysis(task, self.completion.public_spec))
-        unresolved = [c["text"] for c in self.completion.public_spec.get("checks", [])
-                      if c.get("kind") == "unresolved_requirement"]
-        if unresolved:
-            # 这些要求无法确定性验收，交由 request_finish 时的「模型验收器」判断，不提前终止。
-            self._emit("contract_unresolved", requirements=unresolved, policy_trainable=False)
+        self._prepare_initial_state(task, state, result)
         # 规划是执行前置条件。小模型规划失败时不盲目开始操作。
         planned = self._plan(task, state)
         result.plan = state.memory.plan
@@ -378,6 +320,59 @@ class Pipeline:
             result.verification = {"status": "unknown", "reason": result.termination_reason, "checks": []}
             return result
 
+        return self._run_steps(task, state, result)
+
+    @timed_phase('startup_preparation')
+    def _prepare_initial_state(self, task, state, result):
+        # All inputs still reach the planner. Only independent prerequisites
+        # overlap; browser ownership and all event/state publication stay here.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix='agent-prepare') as pool:
+            client = pool.submit(measured_call, prepare_model_client, self.planner_model)
+            classification = (pool.submit(measured_call, self.decision_judge.classify_task,
+                task, remaining_s=self._task_time_remaining()) if self.decision_judge else None)
+            environment_started = time.perf_counter()
+            self._prepare_initial_environment(task, state, result)
+            environment_ms = (time.perf_counter() - environment_started) * 1000
+            preparation, client_ms = client.result()
+            if classification is not None:
+                judgment, judge_ms = classification.result()
+                state.routing_hint['task'] = judgment
+                self._record_typed_judge()
+                state.task_profile['execution_hint'] = judgment
+                result.run_manifest['task_routing_hint'] = copy.deepcopy(judgment)
+                self._publish_diagnostic('decision_judgment', judgment=judgment)
+            else:
+                judge_ms = 0
+        self._publish_diagnostic('parallel_preparation', client=preparation,
+            client_ms=client_ms, classification_ms=judge_ms,
+            environment_ms=round(environment_ms, 2),
+            reason='客户端准备、任务分类与初始环境准备并行；全部汇合后才规划')
+
+    def _prepare_initial_environment(self, task, state, result):
+        if callable(getattr(self.env, 'prepare_workspace', None)):
+            workspace = self.env.prepare_workspace(self.run_id)
+            result.run_manifest['workspace'] = copy.deepcopy(workspace)
+            self._publish_diagnostic('workspace_ready', workspace=workspace)
+        from .cli_executor import cli_capability
+        if not hasattr(self.env, 'initial_state'):
+            self.env.initial_state = {}
+        self.env.initial_state['cli_capability'] = cli_capability(self.env)
+        state.task_profile = task_profile(task, self.completion.public_spec)
+        self._publish_diagnostic('task_analysis', analysis=task_analysis(task, self.completion.public_spec))
+        unresolved = [c["text"] for c in self.completion.public_spec.get("checks", [])
+                      if c.get("kind") == "unresolved_requirement"]
+        if unresolved:
+            # 这些要求无法确定性验收，交由 request_finish 时的「模型验收器」判断，不提前终止。
+            self._emit("contract_unresolved", requirements=unresolved, policy_trainable=False)
+        # A preloaded browser page is part of the environment, not the task.
+        # Observe it before planning so the planner can use an existing search
+        # form instead of inventing a new portal from the title alone.
+        if getattr(self.env, 'browser_start_url', None):
+            state.obs = self._initial_browser_observation(task)
+            self._set_download_deadline()
+            self.completion.observe(state.obs)
+
+    def _run_steps(self, task, state, result):
         for step_no in range(1, self.max_steps + 1):
             if self._task_time_remaining() <= 0:
                 result.termination_reason = "task_timeout"
@@ -403,9 +398,10 @@ class Pipeline:
                 state.screenshot_history[-1] = state.obs.screenshot
                 try:
                     messages = self.build_input(state)
-                except (ObservationIncompleteError, ImageEncodingError):
+                except (ObservationIncompleteError, ImageEncodingError) as exc:
                     result.termination_reason = "observation_unavailable"
-                    result.final_answer = "当前截图不可用，已停止操作并保存采集记录。"
+                    result.final_answer = "当前观察不完整，已停止操作并保存采集记录：" + str(exc)[:180]
+                    self._publish_diagnostic('observation_unavailable', reason=str(exc)[:300])
                     self.completion.observe(None)
                     break
             except ContextBudgetError:
@@ -413,6 +409,17 @@ class Pipeline:
                 result.final_answer = "任务计划与当前截图超出输入预算，未继续执行。"
                 break
             before = self._observation_record(state.obs, f"o_{step_no}")
+            action_context = {'plan_revision': state.queue.revision if state.queue else None,
+                'plan_step_id': (state.queue.current or {}).get('id') if state.queue else None,
+                'plan_step': copy.deepcopy(state.queue.current or {}) if state.queue else {}}
+            self._emit('action_context', step=step_no, observation=before, policy_input=copy.deepcopy(messages), **action_context)
+            session = getattr(self.env, '_browser_session', None)
+            if _viz_log_status and callable(getattr(session, 'start_preview', None)):
+                def preview(frame):
+                    if (state.obs.info or {}).get('active_surface', 'browser') == 'browser':
+                        _viz_log_status({'event': 'live_frame', 'run_id': self.run_id,
+                                         'step': self._current_step, **frame})
+                session.start_preview(preview)
             decision = self.decide(messages, state)
             for call in decision.calls:
                 call.setdefault("actor_role", "decision")
@@ -434,6 +441,7 @@ class Pipeline:
                                                   "status": "unknown"})
                 result.trajectory.append({
                     "step": step_no, "error": "动作解析失败",
+                    **action_context,
                     "raw": (decision.raw or "")[-500:],
                     "observation": before,
                     "policy_input": copy.deepcopy(decision.calls[-1]["messages"] if decision.calls else messages),
@@ -450,7 +458,7 @@ class Pipeline:
                 })
                 self._emit("transition", transition=result.trajectory[-1])
                 state.memory.add_event("⚠️ 上一步动作解析失败，请重新输出合法的 next_action JSON")
-                if state.verification.get("status") == "passed":
+                if state.verification.get("status") == "passed" and not wants_report(state.task):
                     result.success = True
                     result.termination_reason = "verified"
                     break
@@ -465,7 +473,14 @@ class Pipeline:
             action = (self.ground(decision.action, state) if self._task_time_remaining() > 0
                       else copy.deepcopy(decision.action))
             self._emit("route", action=self._compact_action(decision.action),
-                       routing=state.route, resolved_action=self._compact_action(action))
+                       routing=state.route, resolved_action=self._compact_action(action),
+                       operation_mode=self._operation_mode(action, state.route))
+            if _viz_log_status is not None:
+                try:
+                    _viz_log_status({"event": "route", "step": step_no,
+                                     "operation_mode": self._operation_mode(action, state.route)})
+                except Exception:  # noqa: BLE001
+                    pass
             ground_ms = (time.perf_counter() - ground_started) * 1000
             execute_started = time.perf_counter()
             # execute 阶段推送进度（下载等长耗时动作让前端看到"执行中"而非干等）
@@ -479,15 +494,17 @@ class Pipeline:
             execution = (self.execute(action, state) if self._task_time_remaining() > 0 else
                          Execution(kind="deadline", info={"status": "rejected", "dispatched": False,
                                    "error_code": "task_timeout", "reason": "任务总时限已到，未执行新动作"}))
-            execution = self._settle_execution(action, execution, state)
-            execution = self._settle_rendering(execution, state)
-            execution = self._advance_paper_workflow(action, execution, state)
+            execution = self._settle_action(action, execution, state)
             self._emit("execution", action=self._compact_action(state.resolved_action or action),
-                       execution_info=execution.info, outcome=execution.outcome)
+                       execution_info=execution.info, outcome=execution.outcome,
+                       next_observation=self._observation_record(execution.obs, f"o_{step_no+1}") if execution.obs else None)
             if _viz_log_status is not None:
                 try:
                     _viz_log_status({"event": "executed", "step": step_no,
                                      "status": (execution.info or {}).get("status", ""),
+                                     "dispatched": (execution.info or {}).get("dispatched"),
+                                     "reason": (execution.info or {}).get("reason", ""),
+                                     "error_code": (execution.info or {}).get("error_code", ""),
                                      "action": (execution.info or {}).get("action", "")})
                 except Exception:  # noqa: BLE001
                     pass
@@ -499,6 +516,7 @@ class Pipeline:
                           if t.get("action_id") == f"a_{step_no}"), None)
             if entry is not None:
                 entry.update({
+                    **action_context,
                     "observation": before,
                     "next_observation": self._observation_record(state.obs, f"o_{step_no+1}"),
                     "policy_input": copy.deepcopy(decision.calls[-1]["messages"] if decision.calls else messages),
@@ -508,6 +526,7 @@ class Pipeline:
                     "prompt_metadata": state.prompt_metadata,
                     "valid_action": True,
                     "routing": copy.deepcopy(state.route),
+                    "operation_mode": self._operation_mode(action, state.route),
                     "execution_info": execution.info,
                     "framework_operations": copy.deepcopy(execution.info.get("framework_operations", [])),
                     "verification": copy.deepcopy(state.verification),
@@ -562,27 +581,25 @@ class Pipeline:
                 "screenshot": encode_image(obs.screenshot)}
 
     # ================= 六个阶段 ================= #
+    @timed_phase("observation")
+    def _initial_browser_observation(self, task):
+        return self.env.reset(task)
+
+    @timed_phase("observation")
     def preprocess(self, state: StepState) -> StepState:
         if state.obs is None:
             state.obs = self.env.reset(state.task)
             self._set_download_deadline()
-        state.obs = self._settle_rendering(Execution(kind="env", obs=state.obs), state).obs
+        from .cli_executor import cli_capability
+        state.obs.info['cli_capability'] = cli_capability(self.env)
+        if getattr(mode_capability(state.obs, state.queue.current if state.queue else None), 'mode', None) != 'cli':
+            state.obs = self._settle_rendering(Execution(kind="env", obs=state.obs), state).obs
+        from .report_delivery import collect_sources
+        collect_sources(state)
         self.completion.observe(state.obs)
         state.verification = self.completion.evaluate()
-        # Late events or a previously completed download need no extra policy action.
-        while state.queue and state.queue.current:
-            current = state.queue.current
-            predicates = current.get('verification', [])
-            if not predicates or any(p.get('kind') not in {'download_complete', 'download_valid'} for p in predicates):
-                break
-            progress = {'download_progress': self.completion.download_progress(),
-                        'download_transfers': self.completion.download_transfers(state.consumed_downloads)}
-            if code_review(current, state.obs, {}, progress)['status'] != 'passed':
-                break
-            self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
-                                                       info={'status': 'observed', 'dispatched': False}))
-            if state.queue.current is current:
-                break
+        state.download_facts = self.completion.download_facts()
+        self._advance_ready_download_steps(state)
         state.screenshot_history.append(state.obs.screenshot)
         if len(state.screenshot_history) > 3:
             state.screenshot_history = state.screenshot_history[-3:]
@@ -590,6 +607,83 @@ class Pipeline:
         self._emit("observation", observation_id=f"o_{state.step_id}",
                    observation=self._observation_record(state.obs, f"o_{state.step_id}"))
         return state
+
+    def _advance_ready_download_steps(self, state):
+        # Late events or a previously completed download need no extra policy action.
+        while state.queue and state.queue.current:
+            current = state.queue.current
+            predicates = current.get('verification', [])
+            final_contract_ready = (current.get('phase') == 'verify'
+                                    and state.verification.get('status') == 'passed')
+            artifact_check = (predicates and all(p.get('kind') in {'download_complete', 'download_valid', 'artifact_download'}
+                                                 for p in predicates))
+            if not (artifact_check or final_contract_ready):
+                break
+            progress = {'download_progress': self.completion.download_progress(),
+                        'download_transfers': self.completion.download_transfers(state.consumed_downloads),
+                        'consumed_artifact_ids': list(state.consumed_downloads),
+                        'download_facts': state.download_facts}
+            if code_review(current, state.obs, {}, progress)['status'] != 'passed':
+                break
+            self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
+                                                       info={'status': 'observed', 'dispatched': False}))
+            if state.queue.current is current:
+                break
+
+    @timed_phase("mode_selection")
+    def _select_decision_mode(self, state):
+        """Choose the mode after waits/queue updates and before policy inference.
+
+        The action-transition question describes the previous goal. Re-evaluate
+        against the actual current goal rather than letting that old answer or
+        page-density heuristics silently control a different next action.
+        """
+        current = state.queue.current if state.queue else None
+        from .cli_executor import cli_capability
+        if state.obs is not None:
+            state.obs.info['cli_capability'] = cli_capability(self.env)
+        hard = mode_capability(state.obs, current)
+        if hard is not None:
+            profile = hard
+        else:
+            judge = self.decision_judge
+            choose = getattr(judge, 'select_mode', None) if judge else None
+            answer, reason = {}, 'jev_not_available'
+            if callable(choose):
+                key = mode_evidence_key(state.task, state.obs, current)
+                cached = state.routing_hint.get('next_mode') or {}
+                if cached.get('evidence_key') == key:
+                    selection = cached
+                else:
+                    remaining = min(5.0, self._task_time_remaining())
+                    if remaining <= 0:
+                        judged = {'status': 'unknown', 'reason': 'task_deadline'}
+                    else:
+                        try:
+                            judged = choose(state.task, current, state.obs, remaining_s=remaining)
+                            self._record_typed_judge()
+                        except Exception as exc:  # Optional judge failure must remain bounded.
+                            judged = {'status': 'unknown', 'reason': 'mode_judge_' + type(exc).__name__}
+                    if not isinstance(judged, dict):
+                        judged = {'status': 'unknown', 'reason': 'mode_judge_invalid_response'}
+                    selected = (judged.get('answers') or {}).get('next_mode', {})
+                    selection = {'evidence_key': key, 'answer': selected if isinstance(selected, dict) else {},
+                                 'status': judged.get('status'), 'reason': judged.get('reason', ''),
+                                 'latency_ms': judged.get('latency_ms', 0),
+                                 'plan_step_id': (current or {}).get('id')}
+                    state.routing_hint['next_mode'] = selection
+                if selection.get('status') == 'answered':
+                    answer = selection.get('answer') or {}
+                reason = selection.get('reason') or 'jev_unknown'
+            profile = decision_mode(state.obs, current, judgment=answer, fallback_reason=reason)
+        data = profile.to_dict()
+        selection = state.routing_hint.get('next_mode') or {}
+        if profile.source == 'jev' or data.get('fallback_reason') == 'jev_dom_without_current_ax':
+            data['judgment'] = copy.deepcopy(selection.get('answer', {}))
+        if state.obs is not None:
+            state.obs.info['decision_mode'] = data
+        self._publish_diagnostic('decision_mode', step=state.step_id, profile=data)
+        return profile
 
     def build_input(self, state: StepState) -> List[dict]:
         page_source = state.page_source
@@ -603,31 +697,58 @@ class Pipeline:
             "dialog", "dialogs", "tabs", "active_modals", "browser_events", "artifacts",
             "pending_downloads", "download_events", "download_candidates", "document_kind", "content_type", "screenshot_stale")
             if observation_info.get(k)}
+        # The raw observation keeps every candidate. The policy sees every
+        # official arXiv PDF identifier without repeated page/document fields.
+        candidates = browser_events.get("download_candidates")
+        if isinstance(candidates, list):
+            official, other = [], []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                url = str(candidate.get('url') or '')
+                identifier = arxiv_id_from_url(url)
+                if identifier and '/pdf/' in url:
+                    official.append(identifier)
+                elif url:
+                    other.append({'url': url[:500], 'label': str(candidate.get('label') or '')[:100]})
+            browser_events['download_candidates'] = {
+                'total': len(candidates), 'arxiv_pdf_ids': list(dict.fromkeys(official)),
+                'other': other}
         if browser_events:
             blocks.insert(0, {"kind": "browser_events", "text": json.dumps(browser_events, ensure_ascii=False)})
         if state.obs and state.obs.text:
             blocks.append({"kind": "desktop_a11y", "text": state.obs.text})
-        # 显式场景状态：让模型明确知道「有结构走 DOM / 无结构走视觉」
+        # Fresh Jev target semantics select the prompt; capability checks guard
+        # surface/AX validity, while page-density rules are fallback only.
+        current = state.queue.current if state.queue else None
+        profile = self._select_decision_mode(state)
         hint = scene_hint(state.obs)
+        hint.update(mode='browser_' + profile.mode if profile.surface == 'browser' and profile.mode in {'dom', 'gui'} else profile.mode,
+                    reason=profile.reason, mode_source=profile.source,
+                    policy_mode=profile.mode, policy_surface=profile.surface)
         blocks.insert(0, {"kind": "scene", "text": "当前场景: " + json.dumps(hint, ensure_ascii=False)})
         tool_results = {k: v for k, v in {"page_source": page_source, "browser_result": browser_result}.items() if v}
+        if state.execution_feedback.get('cli_result'):
+            tool_results['cli_result'] = state.execution_feedback['cli_result']
         auxiliary = json.dumps(tool_results, ensure_ascii=False) if tool_results else ""
-        self._active_actions = action_scope(state.queue.current if state.queue else None, state.obs,
-                                            bool(getattr(self.env, "browser_only", False)))
-        system = scoped_system(self._active_actions, state.obs, getattr(self.env, "os_name", "linux"))
-        current = state.queue.current if state.queue else None
+        self._active_actions = action_scope(current, state.obs,
+                                            bool(getattr(self.env, "browser_only", False)), profile=profile)
+        sections = system_sections(self._active_actions, state.obs, getattr(self.env, "os_name", "linux"),
+                                   profile=profile, task=state.task, step=current, task_profile=state.task_profile,
+                                   mode_prompts=self.mode_prompts)
+        system = "\n".join(text for _, text in sections)
         mode = (state.obs.info or {}).get('control_mode', '') if state.obs else ''
         if mode and mode != state.control_mode:
             state.control_mode = mode
             self._publish_diagnostic('control_mode', mode=mode)
         facts = operational_facts(state.obs, self.completion,
                                   self.completion.public_report(state.verification) if self.completion else {}, current,
-                                  os_name=getattr(self.env, "os_name", ""))
+                                  os_name=getattr(self.env, "os_name", ""), search_recovery=self._paper_search_recovery)
         if facts != state.operation_facts:
             state.operation_facts = facts
             self._publish_diagnostic('operation_feedback', facts=facts)
         required = current_brief(state, self.completion.public_spec.get('checks', []) if self.completion else [], facts)
-        images = self._build_images(state) if getattr(self.model, "vision", True) else []
+        images = self._build_images(state) if getattr(self.model, "vision", True) and profile.mode != "cli" else []
         if observation_info.get("dialog"):
             # Native JS dialogs may block a new screenshot. Their fresh event
             # permits only dialog recovery; any retained image is explicitly stale.
@@ -637,9 +758,12 @@ class Pipeline:
             blocks=blocks, auxiliary=auxiliary, focus=(current or {}).get("goal", ""),
             required=required, required_title="当前子任务", memory_title="近期行动摘要（当时的观察与计划，非完成证据）", recent_memory=True,
             images=images,
-            require_image=bool(getattr(self.model, "vision", True)) and not bool(observation_info.get("dialog")))
+            require_image=bool(getattr(self.model, "vision", True)) and profile.mode != "cli" and not bool(observation_info.get("dialog")))
         metadata.update(selected_actions=self._active_actions, plan_window=state.queue.window() if state.queue else {},
-                        system_estimate=self.compiler.count(system), context_mode="current_step_brief_v2")
+                        system_estimate=self.compiler.count(system), system_bytes=len(system.encode('utf-8')),
+                         prompt_profile=copy.deepcopy((state.obs.info or {}).get('decision_mode', profile.to_dict())) if state.obs else profile.to_dict(),
+                         prompt_rules=[name for name, _ in sections],
+                        context_mode="current_step_brief_v3")
         state.prompt_metadata = metadata
         state.prompt_text = user_text
         if state.obs:
@@ -649,6 +773,7 @@ class Pipeline:
             self.model.build_vision_message(user_text, images),
         ]
 
+    @timed_phase("decision")
     def decide(self, messages: List[dict], state: Optional[StepState] = None) -> Decision:
         raw, action = "", None
         calls: List[dict] = []
@@ -674,9 +799,42 @@ class Pipeline:
             calls.append(call)
             obj = parse_decision(raw)
             action = action_from_decision(obj or {})
+            if action is not None and isinstance((obj or {}).get('next_action'), str):
+                # Retain the exact sampled output/tokens for SFT/RL provenance.
+                # The effective action is separately recorded, never fabricated
+                # as a new model response or as evidence of completion.
+                call['parser_normalization'] = 'finish_string_with_existing_explanation'
+                call['parsed_action'] = {'type': action.action, **copy.deepcopy(action.args)}
             if action is not None:
                 err = self._validate_action(action)
                 error_type = 'invalid_action'
+                if err is None and state is not None:
+                    err = search_navigation_error(action, state.task,
+                        state.queue.current if state.queue else None, state.obs, self.completion) or None
+                    if err:
+                        error_type = 'unobserved_search_result'
+                if err is None and state is not None:
+                    err = self._paper_search_action_error(action, state) or None
+                    if err:
+                        error_type = 'redundant_search_action'
+                if err is None and state is not None:
+                    err = redundant_sort_selection_error(action, state.obs) or None
+                    if err:
+                        error_type = 'redundant_control_action'
+                if err is None and state is not None and action.action == 'wait':
+                    info = state.obs.info or {} if state.obs else {}
+                    render = next((info.get(key, {}) for key in ('render_wait', 'page_readiness_wait')
+                                   if info.get(key, {}).get('suppress_policy_wait')), {})
+                    prior_loading = state.execution_feedback.get('page_readiness_wait', {})
+                    prior_page = prior_loading.get('page', {})
+                    current_page = self._observation_page(state.obs)
+                    if (prior_loading.get('suppress_policy_wait') and prior_page
+                            and all(prior_page.get(k) == current_page.get(k) for k in ('page_id', 'document_id', 'url'))):
+                        render = prior_loading
+                    if render.get('suppress_policy_wait'):
+                        err = ('框架已在时间预算内按秒等待并核查页面加载，继续 wait 不会推进任务。'
+                               '请根据新观察换入口/恢复页面，或如实报告加载失败；不要再消耗决策步等待。')
+                        error_type = 'redundant_loading_wait'
                 if err is None and state is not None and not dom_repair_used and attempt + 1 < attempts:
                     err = self._dom_reference_feedback(action, state)
                     if err:
@@ -723,11 +881,24 @@ class Pipeline:
                             {'role': 'user', 'content': feedback}]
         return Decision(raw=raw, action=None, calls=calls)
 
+    def _paper_search_action_error(self, action, state):
+        if self.completion is None:
+            return ''
+        goals = self.completion.paper_goals()
+        if len(goals) != 1 or goals[0].get('status') != 'pending':
+            return ''
+        return self._paper_search_recovery.action_error(action, state.obs, goals[0]['query'])
+
     def _dom_reference_feedback(self, action, state):
         """One pre-dispatch repair; unavailable AX and explicit desktop remain visual."""
         if action.action not in {'click', 'type', 'select', 'double_click', 'right_click'}:
             return None
         if action.args.get('target_ref') or action.args.get('element_id'):
+            return None
+        from .scene import observation_scene
+        selected_mode = ((state.obs.info or {}).get('decision_mode') or {}).get('mode') if state.obs else None
+        if ((selected_mode == 'gui' or (selected_mode is None and observation_scene(state.obs).get('mode') == 'browser_gui'))
+                and action.action in {'click', 'double_click', 'right_click', 'type'}):
             return None
         # A PDF document may expose only its viewer/container or a sparse
         # partial AX tree. Never demand a made-up DOM reference on that surface.
@@ -754,6 +925,11 @@ class Pipeline:
 
     def ground(self, action: Action, state: StepState) -> Action:
         action = copy.deepcopy(action)
+        if action.action == 'cli':
+            state.route = {'channel': 'cli'}
+            state.resolved_action = action
+            state.last_grounding_coord = None
+            return action
         if state.obs and state.obs.info.get("dialog") and action.action not in {
                 "handle_dialog", "observe_desktop", "observe_browser", "fail", "list_tabs"}:
             state.route = {"channel": "reobserve", "error_code": "blocked",
@@ -764,13 +940,25 @@ class Pipeline:
                                           or action.args.get("from_target", ""))
         # 先路由：带 target_ref 且引用有效 → browser_dom；否则走 GUI grounding
         try:
-            state.route = self.env.route_action(action, state.obs)
+            profile = (state.obs.info.get('decision_mode') or {}) if state.obs else {}
+            visual_target = (profile.get('mode') == 'gui' and profile.get('source') == 'jev'
+                             and action.action in {'click', 'double_click', 'right_click', 'type', 'drag_and_drop'}
+                             and not action.args.get('target_ref') and not action.args.get('element_id'))
+            state.route = None if visual_target else self.env.route_action(action, state.obs)
         except Exception:  # noqa: BLE001
             state.route = None
-        error = paper_action_error(action, state.obs,
-                                   active_paper(self.completion, state.queue.current if state.queue else None), state.route)
+        search_error = search_navigation_error(action, state.task,
+            state.queue.current if state.queue else None, state.obs, self.completion)
+        input_error = self._paper_search_action_error(action, state)
+        error = (input_error or search_error or redundant_sort_selection_error(action, state.obs, state.route)
+                 or paper_download_preflight_error(action, state.obs, self.completion, state.route)
+                 or paper_action_error(action, state.obs,
+                                      active_paper(self.completion, state.queue.current if state.queue else None), state.route))
         if error:
-            state.route = {"channel": "reobserve", "error_code": "paper_identity_mismatch", "reason": error}
+            state.route = {"channel": "reobserve", "error_code": "redundant_search_action" if input_error else "unobserved_search_result" if search_error else "paper_identity_mismatch", "reason": error}
+        if action.args.get('submit_key') and (state.route or {}).get('channel') not in {'browser_dom', 'reobserve'}:
+            state.route = {'channel': 'reobserve', 'error_code': 'unsupported',
+                           'reason': '输入后提交仅支持当前 DOM 输入框；请重新观察或分开 type 和 press'}
         if state.route is not None:
             state.last_grounding_coord = None
             state.resolved_action = action
@@ -801,6 +989,10 @@ class Pipeline:
         try:
             obs = self.env.observe()
             if obs is not None:
+                from .cli_executor import cli_capability
+                obs.info["cli_capability"] = cli_capability(self.env)
+                if getattr(self, "_last_cli_result", None):
+                    obs.info["cli_result"] = copy.deepcopy(self._last_cli_result)
                 return obs
         except Exception as exc:
             return Observation(info={"observation_error": type(exc).__name__})
@@ -816,8 +1008,9 @@ class Pipeline:
         self._emit("execution_attempt", action=self._compact_action(action), execution_info=info,
                    observation=self._observation_record(step_result.observation, "after_dom"), policy_trainable=False)
         if (info.get("status") != "rejected" or info.get("dispatched") is not False
+                or action.args.get('submit_key')
                 or info.get("error_code") not in {"not_found", "unsupported"}
-                or action.action not in {"click", "double_click", "right_click", "type", "select", "drag_and_drop"}):
+                or action.action not in {"click", "double_click", "right_click", "type", "drag_and_drop"}):
             return step_result
         fresh = self._observe()
         self._emit("observation", observation_id="recovery", observation=self._observation_record(fresh, "recovery"),
@@ -853,11 +1046,45 @@ class Pipeline:
         with context(lambda event: self._publish_diagnostic('framework_wait', **event), self._task_time_remaining):
             return self.env.step(action)
 
+    @timed_phase("dispatch")
     def execute(self, action: Action, state: StepState) -> Execution:
         name = action.action
+        if action.args.get('submit_key') and (state.route or {}).get('channel') not in {'browser_dom', 'reobserve'}:
+            return Execution(kind='rejected', obs=state.obs, info={'status': 'rejected', 'dispatched': False,
+                'error_code': 'unsupported', 'reason': '输入后提交需要有效 DOM 路由，不回退为未核实的视觉连按'})
         if name not in BASIC_ACTIONS:
             return Execution(kind="rejected", executed="rejected", obs=state.obs,
                 info={"status": "rejected", "dispatched": False, "error_code": "non_basic_action"})
+        if name == 'cli':
+            from .cli_executor import execute_cli
+            self._publish_diagnostic('cli_execution', status='running', action=self._compact_action(action))
+            info = execute_cli(self.env, action.args, remaining_s=self._task_time_remaining())
+            session = getattr(self.env, '_browser_session', None)
+            if (getattr(self.env, 'cli_target', None) == 'local' and session is not None
+                    and callable(getattr(session, 'record_cli_relocation', None))):
+                try:
+                    info['artifact_relocated'] = session.record_cli_relocation(info)
+                except Exception as exc:
+                    info['artifact_tracking_error'] = type(exc).__name__
+            if info.get('effect_verified') and info.get('operation') in {'rename', 'move'}:
+                if not hasattr(self, '_cli_relocations'):
+                    self._cli_relocations = {}
+                self._cli_relocations[info['path']] = info['destination']
+            self._last_cli_result = copy.deepcopy(info)
+            if info.get('operation') == 'write' and info.get('effect_verified'):
+                state.written_files = [r for r in getattr(state, 'written_files', [])
+                                       if r.get('path') != info.get('path')]
+                state.written_files.append(copy.deepcopy(info))
+            info['cli_result'] = copy.deepcopy(info)
+            obs = self._observe()
+            obs.info['cli_result'] = copy.deepcopy(info['cli_result'])
+            self._publish_diagnostic('cli_execution', **info['cli_result'])
+            return Execution(kind='cli', executed=self._compact_action(action), outcome=json.dumps(info['cli_result'], ensure_ascii=False), obs=obs, info=info)
+        repeated = repeated_download_click_error(action, state)
+        if repeated:
+            self._publish_diagnostic('repeated_download_click', **repeated)
+            return Execution(kind='rejected', executed='rejected', outcome=repeated['reason'],
+                             obs=state.obs, info=repeated)
         guard = getattr(self.env, 'prevent_duplicate_download', None)
         if callable(guard) and name in {'click', 'double_click', 'hotkey', 'press'}:
             try:
@@ -946,6 +1173,50 @@ class Pipeline:
         deadline = getattr(self, "_task_deadline", None)
         return max(0.0, deadline - time.monotonic()) if deadline is not None else float("inf")
 
+    def _follow_ambiguous_tabs(self, action, execution, state):
+        """Use Jev only when one dispatched action created multiple real tabs."""
+        observed = getattr(execution, 'obs', None)
+        follow = (observed.info or {}).get('tab_follow_candidates') if observed is not None else None
+        candidates = (follow or {}).get('candidates') or []
+        if (not 2 <= len(candidates) <= 8 or self.decision_judge is None
+                or not hasattr(self.decision_judge, 'select_opened_tab')
+                or self._task_time_remaining() <= 0):
+            return execution
+        current = state.queue.current if state.queue else None
+        judged = self.decision_judge.select_opened_tab(
+            state.task, (current or {}).get('goal', ''), action.args.get('target', ''), candidates,
+            getattr(state.obs, 'screenshot', None), remaining_s=min(3.0, self._task_time_remaining()))
+        self._record_typed_judge()
+        answer = (judged.get('answers') or {}).get('tab') or {}
+        label = answer.get('label', 'unknown')
+        choice = int(label[4:]) if isinstance(label, str) and re.fullmatch(r'tab_\d+', label) else -1
+        if not 0 <= choice < len(candidates):
+            execution.info['tab_follow'] = {'status': 'ambiguous', 'candidate_count': len(candidates)}
+            return execution
+        tab_id = candidates[choice]['tab_id']
+        try:
+            switched = self._step_environment(Action('switch_tab', {'tab_id': tab_id}))
+        except Exception:
+            switched = None
+        if switched is not None and (switched.info or {}).get('status') == 'executed':
+            execution.obs = switched.observation
+            execution.info['tab_follow'] = {'status': 'jev_selected', 'tab_id': tab_id,
+                                            'candidate_count': len(candidates)}
+            self._publish_diagnostic('tab_follow', **execution.info['tab_follow'])
+        return execution
+
+    def _select_paper_identity(self, query, candidates, **kwargs):
+        selector = self.paper_identity_selector
+        previous = len(selector.calls)
+        report = selector.select(query, candidates, **kwargs)
+        for call in selector.calls[previous:]:
+            call['decision_step'] = self._current_step
+            self.reviewer.calls.append(call)
+            self._record_call(call, 'verifier')
+        self._publish_diagnostic('paper_identity_review', query=query, report=report,
+            calls=selector.calls[previous:])
+        return report
+
     def _advance_paper_workflow(self, action, execution, state):
         if execution.kind in {"terminal", "finish_request", "deadline"} or self._task_time_remaining() <= 0:
             return execution
@@ -955,6 +1226,11 @@ class Pipeline:
 
         def workflow_event(event, **payload):
             self._emit(event, **payload)
+            if event == 'paper_resolution':
+                state.paper_resolution = {k: copy.deepcopy(payload[k]) for k in
+                    ('status', 'reason', 'reason_code', 'check_id', 'observed_urls', 'resolution_round') if k in payload}
+            elif event == 'goal_binding':
+                state.paper_resolution = {}
             if event == "framework_operation_started":
                 self._wait_status("waiting", "框架正在下载已确认的论文", 0)
             elif event == "framework_operation_finished":
@@ -1033,272 +1309,37 @@ class Pipeline:
         block = next((b for b in obs.context if b.get("kind") == "browser_ax"), {})
         return {key: obs.info.get(key, block.get(key)) for key in ("page_id", "document_id", "url")}
 
-    def _settle_rendering(self, execution: Execution, state: StepState) -> Execution:
-        """Wait for nonblank stable PDF content without spending policy steps.
+    @timed_phase("settlement")
+    def _settle_action(self, action, execution, state):
+        if execution.kind == 'cli':
+            # Background operations cannot be waiting on PDF pixels/window focus.
+            return execution
+        execution = self._follow_ambiguous_tabs(action, execution, state)
+        execution = self._settle_execution(action, execution, state)
+        execution = self._settle_rendering(execution, state)
+        execution = self._settle_page_readiness(action, execution)
+        return self._advance_paper_workflow(action, execution, state)
 
-        This is a bounded readiness heuristic, never completion evidence. A timed
-        out document is offered to the policy once instead of waiting on every turn.
-        """
-        obs = execution.obs
-        cfg = self.wait_config
-        if not cfg.enabled or not is_pdf_observation(obs) or obs.info.get('dialog'):
-            return execution
-        key = tuple(self._observation_page(obs).get(k) for k in ('page_id', 'document_id', 'url'))
-        previous = content_thumbnail(obs.screenshot)
-        cached = state.render_waits.get(key)
-        if (cached == 'timeout' and previous is None) or (cached == 'completed' and previous is not None):
-            obs = copy.deepcopy(obs)
-            obs.info['render_wait'] = {'status': cached, 'reason': 'pdf_render'}
-            execution.obs = obs
-            return execution
-        started = time.monotonic()
-        deadline = started + min(cfg.render_timeout_s, self._task_time_remaining())
-        self._publish_diagnostic('framework_wait', status='waiting', reason='pdf_render', elapsed_s=0)
-        status = 'timeout'
-        last_update = started
-        while time.monotonic() < deadline:
-            time.sleep(min(cfg.poll_interval_s, max(0, deadline - time.monotonic())))
-            fresh = self._observe()
-            if fresh.info.get('observation_error'):
-                previous = None
-                continue
-            obs = fresh
-            fresh_key = tuple(self._observation_page(obs).get(k) for k in ('page_id', 'document_id', 'url'))
-            if obs.info.get('dialog') or not is_pdf_observation(obs) or fresh_key != key:
-                status = 'interrupted'
-                break
-            current = content_thumbnail(obs.screenshot)
-            if stable_content(previous, current):
-                status = 'completed'
-                break
-            previous = current
-            if time.monotonic() - last_update >= 1:
-                last_update = time.monotonic()
-                self._publish_diagnostic('framework_wait', status='waiting', reason='pdf_render',
-                                         elapsed_s=round(last_update - started, 3))
-        if status != 'interrupted':
-            state.render_waits[key] = status
-            # Keep a bounded cache even for long browsing sessions.
-            if len(state.render_waits) > 32:
-                state.render_waits.pop(next(iter(state.render_waits)))
-        obs = copy.deepcopy(obs)
-        result = {'status': status, 'reason': 'pdf_render', 'elapsed_s': round(time.monotonic() - started, 3)}
-        obs.info['render_wait'] = result
-        execution.obs = obs
-        execution.info['render_wait'] = result
-        self._publish_diagnostic('framework_wait', **result)
-        return execution
+    def _settlement_service(self):
+        # Resolve ports at call time to preserve adapter/config replacement.
+        return SettlementService(SettlementPorts(
+            wait_config=self.wait_config, env=self.env, decision_judge=self.decision_judge,
+            observe=self._observe, remaining=self._task_time_remaining,
+            browser_event_metadata=self._browser_event_metadata, download_id=self._download_id,
+            observation_page=self._observation_page, emit=self._emit,
+            publish_diagnostic=self._publish_diagnostic, record_typed_judge=self._record_typed_judge,
+            wait_status=self._wait_status, pdf_observation=is_pdf_observation))
+
+    def _settle_rendering(self, execution: Execution, state: StepState) -> Execution:
+        return self._settlement_service()._settle_rendering(execution, state)
+
+    def _settle_page_readiness(self, action: Action, execution: Execution) -> Execution:
+        return self._settlement_service()._settle_page_readiness(action, execution)
 
     def _settle_execution(self, action: Action, execution: Execution, state: StepState,
                           *, _deadline=None, _refresh_depth=0) -> Execution:
-        """Observe relevant asynchronous downloads without resampling or replaying an action.
-
-        Only event metadata is polled. A single fresh observation is collected after
-        an actual wait, including on the last allowed decision. Missing signals get
-        a bounded startup grace; a native dialog immediately yields to the policy.
-        """
-        cfg = self.wait_config
-        if not cfg.enabled or execution.kind not in {"browser_dom", "env", "browser", "finish_request"}:
-            return execution
-        metadata = self._browser_event_metadata()
-        if metadata is None:
-            return execution
-        info = execution.info
-        original_metadata = copy.deepcopy(state.obs.info if state.obs else {})
-        page = self._observation_page(state.obs)
-        if page.get("page_id") or page.get("url"):
-            state.last_browser_page = dict(page)
-        else:
-            page = dict(state.last_browser_page)
-        target_url = str(action.args.get("url") or "").split("#", 1)[0]
-        from urllib.parse import urljoin
-        nodes = [n for b in (state.obs.context if state.obs else []) if b.get("kind") == "browser_ax"
-                 for n in b.get("nodes", [])]
-        target_node = next((n for n in nodes if action.args.get("target_ref")
-                            and n.get("ref") == action.args["target_ref"]), {})
-        linked_url = urljoin(page.get("url") or "", str(target_node.get("href") or target_node.get("url") or "")) if target_node else ""
-        related_urls = {u.split("#", 1)[0] for u in (target_url, linked_url) if u}
-        candidates = list(original_metadata.get("download_candidates", []))
-        for block in state.obs.context if state.obs else []:
-            candidates.extend(block.get("download_candidates", []))
-        candidate_urls = {str(c.get("url", "")).split("#", 1)[0] for c in candidates if isinstance(c, dict)}
-        prior_ids = {self._download_id(item) for key in ("artifacts", "download_events")
-                     for item in original_metadata.get(key, []) if isinstance(item, dict)}
-        tracked = set(state.waiting_download_ids)
-        # Adapter artifact lists are cumulative across tabs, not causal evidence.
-        # Only the executor's top-level operation ID identifies its own transfer.
-        explicit_ids = {self._download_id(info)} - {""}
-        started = time.monotonic()
-        grace_end = started + cfg.download_start_timeout_s
-        operation_end = min(started + cfg.operation_timeout_s,
-                            _deadline if _deadline is not None else float("inf"))
-        last_ui = -float("inf")
-        announced = False
-        waited = False
-        outcome = "no_signal"
-        failure = None
-
-        def merge(events):
-            for key in ("artifacts", "download_events", "pending_downloads", "artifact_events", "dialogs", "dialog"):
-                if key in events:
-                    info[key] = copy.deepcopy(events[key])
-                    if execution.obs is not None:
-                        # Keep the decision's before-observation immutable even if an adapter reuses it.
-                        execution.obs.info[key] = copy.deepcopy(events[key])
-            if events.get("dialogs") and "dialog" not in events:
-                info["dialog"] = copy.deepcopy(events["dialogs"][0])
-                if execution.obs is not None:
-                    execution.obs.info["dialog"] = copy.deepcopy(events["dialogs"][0])
-            elif "dialogs" in events and not events["dialogs"] and not events.get("dialog"):
-                info.pop("dialog", None)
-                if execution.obs is not None:
-                    execution.obs.info.pop("dialog", None)
-
-        def related(item):
-            ident = self._download_id(item)
-            if ident in tracked or ident in explicit_ids:
-                return True
-            urls = {str(item.get(key) or "").split("#", 1)[0] for key in ("url", "final_url", "source_url")}
-            if related_urls.intersection(urls):
-                return True
-            if item.get("page_id") and page.get("page_id"):
-                return item["page_id"] == page["page_id"]
-            return bool(item.get("page_url") and page.get("url") and item["page_url"] == page["url"])
-
-        def pending_items(events):
-            source = events.get("pending_downloads")
-            if source is None:
-                source = [d for d in events.get("download_events", []) if d.get("status") == "in_progress"]
-            selected = []
-            for item in source:
-                if not isinstance(item, dict):
-                    continue
-                ident = self._download_id(item)
-                if ident and related(item):
-                    selected.append(item)
-                    tracked.add(ident)
-            return selected
-
-        # Copy container metadata only; PIL images need not be duplicated.
-        if execution.obs is not None:
-            execution.obs = copy.copy(execution.obs)
-            execution.obs.info = copy.deepcopy(execution.obs.info)
-        # Executor evidence covers the small interval before the first event poll.
-        seed = {**info, **metadata}
-        pending_items(seed)
-        candidate = (action.action in {"click", "double_click", "goto", "download", "press", "hotkey"}
-                     and info.get("dispatched") is not False
-                     and info.get("status") not in {"rejected", "failed", "error"}
-                     and (execution.kind == "browser_dom" or page.get("page_id")))
-        # An event reader returning {} has no active browser; it is not a wait signal.
-        candidate = candidate and bool(metadata or tracked)
-        download_intent = (action.action == "download" or bool(target_node.get("download"))
-                           or bool(related_urls.intersection(candidate_urls))
-                           or bool(re.search(r"pdf|download|export|下载|导出", str(action.args), re.I)))
-        candidate = candidate and download_intent
-        while True:
-            merge(metadata)
-            pending = pending_items(metadata)
-            completed = {self._download_id(item) for item in metadata.get("artifacts", [])
-                         if isinstance(item, dict) and item.get("completed") is True and related(item)}
-            failed = [item for item in metadata.get("download_events", []) if isinstance(item, dict)
-                      and item.get("status") in {"failed", "canceled", "cancelled", "timeout"}
-                      and related(item) and (self._download_id(item) in tracked or self._download_id(item) not in prior_ids)]
-            if metadata.get("dialog") or metadata.get("dialogs"):
-                outcome = "dialog"
-                state.recovery = {"status": "resolve_dialog", "instruction": "先处理浏览器原生对话框，再检查下载状态；不要重复触发下载。"}
-                break
-            if failed and not pending:
-                outcome, failure = "failed", next((item['error_code'] for item in failed if item.get('error_code')), 'download_failed')
-                break
-            if (tracked and tracked.issubset(completed)) or (completed - prior_ids and not pending):
-                outcome = "completed"
-                break
-            if not pending and not tracked and (not candidate or time.monotonic() >= grace_end):
-                break
-            if tracked and not pending:
-                # Disappearance without a terminal event is not proof of completion.
-                outcome, failure = "uncertain", "download_state_unavailable"
-                break
-            now = time.monotonic()
-            deadline = min(operation_end, now + self._task_time_remaining())
-            for item in pending:
-                if isinstance(item.get("deadline_at"), (float, int)):
-                    deadline = min(deadline, now + max(0.0, item["deadline_at"] - time.time()))
-            if now >= deadline:
-                outcome = "task_timeout" if self._task_time_remaining() <= 0 else "timeout"
-                failure = "download_timeout" if pending else None
-                cancel = getattr(self.env, "cancel_download", None) or getattr(
-                    getattr(self.env, "_browser_session", None), "cancel_download", None)
-                for item in pending:
-                    if cancel is not None:
-                        try:
-                            canceled = cancel(self._download_id(item))
-                            self._emit("framework_wait_cancel", download_id=self._download_id(item),
-                                       result=canceled, policy_trainable=False)
-                        except Exception as exc:
-                            self._emit("framework_wait_cancel", download_id=self._download_id(item),
-                                       error_type=type(exc).__name__, policy_trainable=False)
-                final_metadata = self._browser_event_metadata()
-                if final_metadata is not None:
-                    metadata = final_metadata
-                    merge(metadata)
-                break
-            if not announced:
-                self._emit("framework_wait", status="waiting", reason="pending_download" if pending else "download_start_grace",
-                           download_ids=sorted(tracked), elapsed_s=0, policy_trainable=False)
-                announced = True
-            if now - last_ui >= 1:
-                self._wait_status("waiting", "等待下载完成" if pending else "等待浏览器下载事件", now - started)
-                last_ui = now
-            sleep_for = min(cfg.poll_interval_s, max(0.0, deadline - now))
-            if not pending:
-                sleep_for = min(sleep_for, max(0.0, grace_end - now))
-            time.sleep(sleep_for)
-            waited = True
-            metadata = self._browser_event_metadata()
-            if metadata is None:
-                outcome, failure = "uncertain", "browser_events_unavailable"
-                break
-        if waited or outcome == "dialog":
-            execution.obs = self._observe()
-            if execution.obs is not None:
-                execution.obs = copy.copy(execution.obs)
-                execution.obs.info = copy.deepcopy(execution.obs.info)
-            # Observation may dispatch late download/dialog events. Its newer
-            # arrays must win over metadata read before taking the screenshot.
-            fresh = execution.obs.info if execution.obs is not None else {}
-            metadata = {**(metadata or {}), **{key: fresh[key] for key in
-                ("artifacts", "download_events", "pending_downloads", "artifact_events", "dialogs", "dialog")
-                if key in fresh}}
-            if "dialogs" in fresh and not fresh.get("dialog"):
-                metadata.pop("dialog", None)
-            merge(metadata)
-        terminal_ids = {self._download_id(item) for key in ("artifacts", "download_events")
-                        for item in (metadata or {}).get(key, []) if isinstance(item, dict) and
-                        (item.get("completed") is True or item.get("status") in {"failed", "canceled", "cancelled", "timeout"})}
-        late_pending = pending_items(metadata or {})
-        state.waiting_download_ids = tracked - terminal_ids
-        if (metadata or {}).get("dialog") or (metadata or {}).get("dialogs"):
-            outcome = "dialog"
-        elif late_pending and not failure and _refresh_depth < 4 and time.monotonic() < operation_end:
-            # Preserve the original deadline across late-event refreshes.
-            return self._settle_execution(action, execution, state, _deadline=operation_end,
-                                          _refresh_depth=_refresh_depth + 1)
-        if failure:
-            info["wait_error_code"] = failure
-            info["wait_reason"] = f"{failure}；先检查实际下载状态，不要自动重发原动作"
-            # Preserve dispatch status; waiting does not make a failed policy action succeed.
-            if info.get("status") not in {"rejected", "failed", "error"}:
-                info["status"] = "uncertain"
-                info["reason"] = info["wait_reason"]
-        if announced or failure or outcome == "dialog":
-            elapsed = time.monotonic() - started
-            info["framework_wait"] = {"status": outcome, "elapsed_s": round(elapsed, 3), "download_ids": sorted(tracked)}
-            self._emit("framework_wait", **info["framework_wait"], policy_trainable=False)
-            self._wait_status("failed" if failure else "completed",
-                              "浏览器对话框需要处理" if outcome == "dialog" else "下载等待失败" if failure else "浏览器等待结束", elapsed)
-        return execution
+        return self._settlement_service()._settle_execution(
+            action, execution, state, _deadline=_deadline, _refresh_depth=_refresh_depth)
 
     @staticmethod
     def _wait_status(status, reason, elapsed):
@@ -1312,6 +1353,7 @@ class Pipeline:
     def postprocess(self, step_no: int, decision: Decision, execution: Execution,
                     state: StepState, result: AgentResult) -> Tuple[StepState, bool]:
         """⑥ 后处理：记录 expected/observed + 控制状态 + 卡死检测 + Finish 验证。"""
+        remember_unconfirmed_download_click(state, decision.action, state.resolved_action, execution)
         # 1) 记录模型对上一步的判断（observed / action_status）
         state.memory.observed_effect = decision.observed_effect
         state.memory.action_status = decision.action_status
@@ -1374,8 +1416,14 @@ class Pipeline:
         before_screenshot = state.screenshot_history[-1] if state.screenshot_history else None
         if execution.obs is not None:
             state.obs = execution.obs
+        from .report_delivery import collect_sources, wants_report
+        collect_sources(state)
+        if wants_report(state.task) and (execution.kind == 'finish_request' or
+                (state.queue and (state.queue.current or {}).get('phase') == 'report')):
+            self._ensure_report(state)
         self.completion.observe(state.obs, execution.info)
         state.verification = self.completion.evaluate()
+        state.download_facts = self.completion.download_facts()
         if execution.info.get("error_code") == "blocked":
             state.recovery = {"status": "resolve_obstruction", "original_action": self._compact_action(decision.action),
                               "blocker": execution.info.get("blocker"),
@@ -1386,6 +1434,9 @@ class Pipeline:
             state.recovery["status"] = "reobserve_original_target"
         self._update_plan_progress(state, execution, before_observation=before_observation,
                                    expected_effect=decision.expected_effect, action=decision.action)
+        # A finish request can advance a preceding semantic step. Reconcile
+        # already-proven download milestones before final review ends the run.
+        self._advance_ready_download_steps(state)
         execution.obs = state.obs
         result.trajectory[-1]["step_verification"] = copy.deepcopy(state.step_review)
         result.trajectory[-1]["execution_queue"] = state.queue.snapshot() if state.queue else {}
@@ -1403,26 +1454,61 @@ class Pipeline:
             self._clear_stall(state)
             state.memory.control_state = "ADVANCE"
         should_break = False
+        report_required = wants_report(state.task)
+        report_milestone = bool(report_required and state.queue and state.queue.current and state.queue.current.get('phase') == 'report')
+        if report_required and state.queue is not None and (state.queue.current is None or report_milestone):
+            self._ensure_report(state)
         # 8) 设置下一步的 expected_effect（当前决策的 expected_effect → 下一步对比用）
         state.memory.expected_effect = decision.expected_effect
         # All accepted task conditions must be backed by framework evidence.
-        if state.verification.get("status") == "passed" and execution.kind != "terminal":
+        if state.verification.get("status") == "passed" and execution.kind != "terminal" and not report_required:
             result.success = True
             result.final_answer = execution.answer or "框架已逐项验证所有任务完成条件。"
             result.termination_reason = "verified"
             should_break = True
-        if not should_break and (execution.kind == "finish_request" or
+        if not should_break and (execution.kind == "finish_request" or report_milestone or
                                  (state.queue is not None and state.queue.current is None and execution.kind != "terminal")):
             confirmed, reason = self._verify_finish(state, execution.answer)
+            # Repair textual omissions in the reporting phase, not with more
+            # browser clicks. One revision is allowed; never weaken the judge.
+            coverage = state.final_review_state.get('report', {}).get('coverage', [])
+            if (report_required and not confirmed and state.report_delivery.get('status') == 'complete'
+                    and state.report_delivery.get('version', 0) < 2 and any(c['status'] == 'failed' for c in coverage)):
+                state.report_delivery.update(status='needs_revision', revision_feedback=coverage)
+                self._ensure_report(state)
+                confirmed, reason = self._verify_finish(state, execution.answer)
             if confirmed:
+                if report_milestone:
+                    report_review = {**(self._model_final_report or {}), 'plan_step_id': state.queue.current['id'],
+                                     'goal': state.queue.current['goal'], 'status': 'passed', 'decision_step': state.step_id}
+                    state.queue.accept_review(report_review)
+                    state.queue.sync_memory(state.memory)
+                    self._publish_review(report_review)
+                    self._publish_queue(state)
+                    result.trajectory[-1]['execution_queue'] = state.queue.snapshot()
                 result.success = True
                 result.termination_reason = "verified"
                 result.final_answer = execution.answer or "独立核查确认原始任务的全部要求已满足。"
+                should_break = True
+            elif (report_required and state.report_delivery.get('version', 0) >= 2
+                  and any(c.get('status') == 'failed' for c in state.final_review_state.get('report', {}).get('coverage', []))):
+                result.termination_reason = 'report_review_failed'
+                result.final_answer = '文字结果修订后仍有要求未通过独立核查；保留正文与来源供检查。'
                 should_break = True
             elif getattr(self.env, "evaluation_available", False):
                 # OSWorld evaluation may run postconfig; invoke it once at episode end.
                 result.termination_reason = "evaluation_requested"
                 result.final_answer = execution.answer
+                should_break = True
+            elif state.download_facts and state.final_review_state.get('repeated_unchanged'):
+                # A repeated finish request cannot create new evidence. Keep
+                # the file result explicit and stop an unchanged semantic
+                # review from consuming the policy budget or replanning a
+                # download that already happened.
+                result.termination_reason = 'completion_inconclusive'
+                saved = [f['path'] for f in state.download_facts if f.get('status') == 'passed']
+                result.final_answer = ('文件下载及完整性已核实：' + '、'.join(saved) + '。' if saved else '') + (
+                    '整项任务仍有要求未获独立核查确认；证据未变化，已停止重复结束请求，保留已下载文件。')
                 should_break = True
             elif not self.completion.spec.get("checks") and self.verifier_model is None and self.decision_judge is None:
                 result.termination_reason = "completion_unverifiable"
@@ -1454,6 +1540,10 @@ class Pipeline:
     def _recover_plan(self, state: StepState, result: AgentResult, step_no: int) -> bool:
         if step_no >= self.max_steps:
             return False
+        goal = (state.queue.current or {}).get('goal', '') if state.queue else ''
+        lesson = f"受阻子任务：{goal}；失败类别：{state.failure_class}；证据：{state.execution_feedback.get('reason') or state.step_review.get('reason') or state.step_progress.get('reason', '')}"
+        state.memory.add_failure(lesson[:1000])
+        state.memory.record_failed_strategy(lesson[:1000])
         self._publish_diagnostic("framework_recovery", status="requested", failure_class=state.failure_class,
                    failure_count=state.memory.stall_count, failure_key=state.failure_key,
                    step_progress=state.step_progress,
@@ -1522,124 +1612,89 @@ class Pipeline:
 
     @staticmethod
     def _plan_actions(names):
-        aliases = {"open_url": "goto", "navigate": "goto", "key_press": "press", "press_key": "press",
-                   "input_text": "type", "type_text": "type"}
-        if isinstance(names, list):
-            names = [aliases.get(n, n) if isinstance(n, str) else n for n in names]
-        if not isinstance(names, list) or any(not isinstance(n, str) or n not in BASIC_ACTIONS for n in names):
-            raise ValueError("actions 只能包含基础 GUI/DOM 动作")
-        return list(dict.fromkeys(names))
+        return normalize_plan_actions(names)
 
+    @timed_phase("planning")
     def _plan(self, task: str, state: StepState, repair=False) -> bool:
-        """Mandatory task decomposition, with one bounded repair attempt.
-
-        A plan proposes actions and evidence; it cannot create or weaken the
-        trusted completion contract. Only existing check IDs may be attached.
-        """
-        prompt = build_planner_prompt(task, self.completion.public_spec, state.task_profile)
-        from .browser_feedback import workspace_facts
-        workspace_obs = state.obs or Observation(info={'initial_state': getattr(self.env, 'initial_state', {})})
-        if workspace := workspace_facts(workspace_obs):
-            prompt += '\n框架操作目录（本轮固定）：\n' + '\n'.join(workspace)
-        if repair:
-            prompt += "\n当前计划受阻，请保留原目标，按以下已发生事实修订剩余步骤：\n" + json.dumps({
-                "previous_plan": state.memory.plan, "recovery": state.recovery,
-                "step_review": state.step_review, "step_progress": state.step_progress,
-                "phase_events": state.phase_events, "feedback": self.completion.public_report(state.verification),
-                "recent_actions": state.memory.action_history[-5:]}, ensure_ascii=False)
-        messages = [{"role": "user", "content": prompt}]
+        """Delegate planning; retain one owner for queue and memory installation."""
         if not repair:
             self.planning_calls = []
-        check_ids = {c["id"] for c in self.completion.public_spec.get("checks", [])}
-        for attempt in range(2):
-            if self._task_time_remaining() <= 0:
-                return False
-            raw = ""
-            call = None
+            from .knowledge_base import load_knowledge
+            from .knowledge_selection import select_knowledge, configure_selection_transport
+            selection_model = selection_judge = None
+            snapshot = None
+            started = time.perf_counter()
             try:
-                raw = self.planner_model.chat(messages, retries=1, json_mode=True)
-                call = copy.deepcopy(getattr(self.planner_model, "last_call", {}))
-                call.update(messages=copy.deepcopy(messages), response=raw, valid_plan=False,
-                            plan_stage="replan" if repair else "initial")
-                self.planning_calls.append(call)
-                obj = parse_decision(raw)
-                steps = obj.get("steps") if isinstance(obj, dict) else None
-                if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_PLAN_STEPS:
-                    raise ValueError(f"steps 必须是非空子目标列表；资源上限为 {MAX_PLAN_STEPS} 项，请合并同一目标的零碎动作")
-                normalized = []
-                for i, step in enumerate(steps, 1):
-                    if not isinstance(step, dict) or not isinstance(step.get("goal"), str) or not step["goal"].strip():
-                        raise ValueError("每一步需要非空 goal")
-                    if not isinstance(step.get("expected_evidence"), str) or not step["expected_evidence"].strip():
-                        raise ValueError("每一步必须给出非空 expected_evidence，说明实际可以观察到的结果")
-                    ids = step.get("check_ids", [])
-                    if not isinstance(ids, list) or any(not isinstance(x, str) or x not in check_ids for x in ids):
-                        raise ValueError("check_ids 只能引用给定的系统验收条件；没有时用 []")
-                    try:
-                        verification = [] if ids and "verification" not in step else normalize_verification(step.get("verification"))
-                    except ValueError as exc:
-                        raise ValueError(f"第 {i} 个子目标 verification：{exc}") from exc
-                    for predicate in verification:
-                        if predicate['kind'] in {'download_complete', 'download_valid'} and predicate['check_id'] not in check_ids:
-                            raise ValueError('下载谓词 check_id 必须引用已有系统条件')
-                    normalized.append({"idx": i, "goal": step["goal"].strip(),
-                                       "expected_evidence": str(step.get("expected_evidence") or ""),
-                                       "check_ids": ids, "phase": str(step.get("phase") or ""), "status": "pending",
-                                       "verification": verification,
-                                       "actions": self._plan_actions(step.get("actions", []))})
-                if state.task_profile.get("kind") == "paper_download":
-                    phases = {step["phase"] for step in normalized}
-                    allowed = {phase["phase"] for phase in state.task_profile["workflow"]}
-                    required = {"verify"} if repair else allowed
-                    if not phases.issubset(allowed):
-                        raise ValueError("论文计划包含未知流程阶段")
-                    if not required.issubset(phases):
-                        raise ValueError("论文下载规划缺少流程阶段：" + ",".join(sorted(required - phases)))
-                    ordered = [item["phase"] for item in state.task_profile["workflow"]]
-                    indexes = [next(i for i, step in enumerate(normalized) if step["phase"] == phase)
-                               for phase in ordered if phase in phases]
-                    if indexes != sorted(indexes):
-                        raise ValueError("流程阶段顺序必须为 " + " → ".join(ordered))
-                    if not isinstance(obj.get("keywords"), list) or not any(isinstance(k, str) and k.strip() for k in obj["keywords"]):
-                        raise ValueError("论文搜索必须提供非空 keywords")
-                if self.completion.paper_goals():
-                    normalized = compile_download_milestones(normalized, self.completion.paper_goals())
-                state.memory.plan = {"steps": normalized,
-                    "requirements": audit_requirement_proposals(task, obj.get("requirements")),
-                    "keywords": obj.get("keywords") if isinstance(obj.get("keywords"), list) else [],
-                    "final_check": str(obj.get("final_check") or ""),
-                    "completion_spec": copy.deepcopy(self.completion.public_spec)}
-                state.memory.task_state["goal"] = task
-                state.memory.task_state["current_subgoal"] = normalized[0]["goal"]
-                state.queue = ExecutionQueue(state.memory.plan, revision=self._replans)
-                state.progress_monitor = StepProgressMonitor(self.progress_config)
-                state.step_progress = {}
-                state.queue.sync_memory(state.memory)
-                self._publish_diagnostic('task_analysis', analysis={**task_analysis(task, self.completion.public_spec),
-                    'requirement_proposals': state.memory.plan['requirements']})
-                self._publish_queue(state)
-                state.memory.add_event(f"已制定任务计划：{len(normalized)} 步。只有系统证据可核实步骤完成。")
-                call["valid_plan"] = True
-                self._record_call(call, "planner")
-                return True
+                snapshot = load_knowledge()
+                if self.knowledge_method == 'decision':
+                    selection_model = make_review_model(self.model)
+                    if selection_model:
+                        selection_model.cfg.max_tokens = 4096
+                        selection_model.cfg.timeout = max(.1, min(120, self._task_deadline-time.monotonic())) if self._task_deadline else 120
+                        configure_selection_transport(selection_model)
+                elif self.knowledge_method == 'jev':
+                    cfg = self.decision_judge.config if self.decision_judge else DecisionJudgeConfig()
+                    from dataclasses import replace
+                    from .model.decision_judge import DecisionJudge
+                    selection_judge = DecisionJudge(replace(cfg, url=self.knowledge_jev_url or cfg.url))
+                self._knowledge_selection = select_knowledge(task, snapshot, method=self.knowledge_method,
+                    model=selection_model, judge=selection_judge,
+                    remaining_s=max(0, self._task_deadline-time.monotonic()) if self._task_deadline else None)
+                for call in self._knowledge_selection.pop('calls', []):
+                    self._record_call(call, actor_role='knowledge_selector')
             except Exception as exc:
-                if call is None:
-                    call = copy.deepcopy(getattr(self.planner_model, "last_call", {}))
-                    call.update(messages=copy.deepcopy(messages), error_type=type(exc).__name__, valid_plan=False)
-                    self.planning_calls.append(call)
-                call["validation_error"] = str(exc)[:300]
-                self._record_call(call, "planner")
-                if attempt == 0:
-                    if raw:
-                        messages.append({"role": "assistant", "content": raw})
-                    messages.append({"role": "user", "content": f"规划不可用：{str(exc)[:300]}。请修正后输出完整 JSON。"})
-        return False
+                failed_calls = getattr(exc, 'calls', None) or [client.last_call for client in (selection_model, selection_judge) if getattr(client, 'last_call', None)]
+                for call in failed_calls:
+                    self._record_call(copy.deepcopy(call), actor_role='knowledge_selector')
+                self._knowledge_selection = (select_knowledge(task, snapshot, method='all') if snapshot
+                                             else {'entries': [], 'method': 'all'})
+                self._knowledge_selection.pop('calls', None)
+                self._knowledge_selection.update(requested_method=self.knowledge_method, status='fallback',
+                    error=type(exc).__name__, latency_ms=round((time.perf_counter()-started)*1000, 2),
+                    reason='知识筛选失败，回退为全部启用知识；文件读取失败时按原任务规划')
+            finally:
+                if selection_model: selection_model.close()
+                if selection_judge: selection_judge.close()
+            self._publish_diagnostic('knowledge_retrieval', **self._knowledge_selection)
+
+        def accept_plan(plan, call):
+            previous = state.queue
+            previous_snapshot = previous.snapshot() if previous else None
+            state.memory.plan = plan
+            normalized = plan['steps']
+            state.memory.task_state["goal"] = task
+            state.memory.task_state["current_subgoal"] = normalized[0]["goal"]
+            state.queue = ExecutionQueue(state.memory.plan, revision=self._replans, previous=previous if repair else None)
+            state.progress_monitor = StepProgressMonitor(self.progress_config)
+            state.step_progress = {}
+            state.queue.sync_memory(state.memory)
+            self._emit('plan_revision', revision=self._replans, previous=previous_snapshot,
+                       plan=copy.deepcopy(state.memory.plan), queue=state.queue.snapshot(),
+                       reason=plan.get('strategy_change', '') or ('依据失败证据调整剩余计划' if repair else '初始计划'))
+            self._publish_diagnostic('task_analysis', analysis={**task_analysis(task, self.completion.public_spec),
+                'requirement_proposals': state.memory.plan['requirements']})
+            self._publish_queue(state)
+            if repair:
+                self._publish_diagnostic('replan_strategy', strategy_change=plan.get('strategy_change', ''),
+                                         revision=self._replans)
+            state.memory.add_event(f"已制定任务计划：{len(normalized)} 步。只有系统证据可核实步骤完成。")
+            call["valid_plan"] = True
+            self._record_call(call, "planner")
+
+        service = PlanningService(self.planner_model, self._task_time_remaining,
+                                  self._record_call, self._publish_diagnostic)
+        return service.plan(
+            task, state, self.completion.public_spec, self.completion.paper_goals(),
+            self.planning_calls, getattr(self.env, 'initial_state', {}), accept_plan,
+            repair=repair,
+            knowledge=getattr(self, '_knowledge_selection', None),
+            verification_feedback=self.completion.public_report(state.verification) if repair else None)
 
     def _publish_review(self, report):
         self._emit("step_verification", report=report, policy_trainable=False)
         if _viz_log_status:
             try:
-                _viz_log_status({"event": "step_verification", "step": self._current_step, **report})
+                _viz_log_status({"event": "step_verification", "run_id": self.run_id, "step": self._current_step, **report})
             except Exception:
                 pass
 
@@ -1647,7 +1702,7 @@ class Pipeline:
         self._emit(event, **payload, policy_trainable=False)
         if _viz_log_status:
             try:
-                _viz_log_status({'event': event, 'step': self._current_step, **payload})
+                _viz_log_status({'event': event, 'step': self._current_step, 'run_id': self.run_id, **payload})
             except Exception:
                 pass
 
@@ -1658,7 +1713,7 @@ class Pipeline:
             state.progress_monitor = StepProgressMonitor(self.progress_config)
         report = state.step_review if review is None else review
         step = next((s for s in state.queue.plan['steps'] if s['id'] == report.get('plan_step_id')), state.queue.current)
-        state.step_progress = state.progress_monitor.observe(step, report, before, state.obs, action, info)
+        state.step_progress = state.progress_monitor.observe(step, report, before, state.obs, action, info, collected_sources=state.report_sources)
         self._publish_diagnostic('step_progress', report=state.step_progress)
         if state.step_progress['status'] == 'stalled':
             state.failure_class = 'step_no_progress'
@@ -1673,37 +1728,37 @@ class Pipeline:
         self._emit("execution_queue", queue=snapshot, policy_trainable=False)
         if _viz_log_status:
             try:
-                _viz_log_status({"event": "execution_queue", "step": self._current_step, "queue": snapshot})
+                _viz_log_status({"event": "execution_queue", "step": self._current_step, "run_id": self.run_id, "queue": snapshot})
             except Exception:
                 pass
 
     def _record_typed_judge(self):
         if self.decision_judge and self.decision_judge.last_call:
             call = copy.deepcopy(self.decision_judge.last_call)
+            call['decision_step'] = self._current_step
             self.reviewer.calls.append(call)
             self._record_call(call, 'verifier')
+            # Publish the real typed request/response, not the VLM's operator
+            # prompt. Authentication headers are never present in last_call.
+            self._publish_diagnostic('jev_call', call=call)
+
+    def _review_service(self):
+        return ReviewService(ReviewPorts(
+            completion=self.completion, decision_judge=self.decision_judge, reviewer=self.reviewer,
+            remaining=self._task_time_remaining, record_typed_judge=self._record_typed_judge,
+            recheck_jev=self._recheck_jev, publish_review=self._publish_review, record_call=self._record_call))
 
     def _code_step_review(self, state, step, execution_info, allow_contract=True):
-        started = time.monotonic()
-        public = self.completion.public_report(state.verification)
-        public['download_progress'] = self.completion.download_progress()
-        public['download_transfers'] = self.completion.download_transfers(state.consumed_downloads)
-        report = code_review(step, state.obs, execution_info, public)
-        error = paper_review_error(state.obs, self.completion, public, step)
-        if error and report.get('source') != 'download_artifact_milestone':
-            report = {'method': 'code', 'status': 'failed', 'reason': error, 'evidence': [error],
-                      'checks': [*report.get('checks', []), {'kind': 'paper_identity', 'status': 'failed', 'reason': error}]}
-        if allow_contract and state.verification.get('status') == 'passed':
-            report = {'method': 'code', 'status': 'passed', 'reason': '整项任务的全部确定性验收条件已满足',
-                      'evidence': ['completion_contract'], 'checks': report.get('checks', [])}
-        report['latency_ms'] = round((time.monotonic() - started) * 1000, 2)
-        return report, public
+        from .cli_executor import file_check_samples
+        if state.obs is not None:
+            state.obs.info['cli_checks'] = file_check_samples(self.env, step.get('verification', []), self._task_time_remaining)
+        return self._review_service()._code_step_review(state, step, execution_info, allow_contract)
 
     def _recheck_jev(self, state, step, execution_info, code, typed, before, identity):
         """One observation per subtask, and one additional call only on new evidence."""
         config = self.decision_judge.config
         if (not config.recheck_unknown or typed.get('status') != 'unknown'
-                or typed.get('step_outcome') == 'progress'
+                or (typed.get('step_outcome') == 'progress' and not typed.get('progress_hint'))
                 or typed.get('action_effect', {}).get('status') == 'passed'
                 or typed.get('judgment', {}).get('error_type')):
             return typed
@@ -1730,14 +1785,19 @@ class Pipeline:
             if step.get('id') in {'whole_task', 'final'}:
                 public = self.completion.public_report(state.verification)
                 hard_block = not self._model_review_allowed(state.verification)
-                refreshed = {'method': 'code', 'status': state.verification.get('status', 'unknown'),
-                             'reason': public.get('reason', '重新检查当前确定性条件'), 'checks': public.get('checks', []),
-                             'evidence': ['fresh_completion_contract']}
+                refreshed = self._final_code_evidence(state, state.verification)
+                hard_block = hard_block or any(c.get('status') != 'passed'
+                    for c in [*refreshed.get('download_checks', []), *refreshed.get('file_checks', [])])
+                refreshed['evidence'] = ['fresh_completion_contract']
+                for report_key in ('report_delivery', 'observed_sources', 'report_review_instruction',
+                                   'file_delivery_evidence', 'file_review_instruction'):
+                    if report_key in code:
+                        refreshed[report_key] = code[report_key]
             else:
                 refreshed, _ = self._code_step_review(state, step, execution_info)
                 hard_block = refreshed['status'] == 'failed' or unresolved_desktop_checks(refreshed) or any(
-                    p.get('kind') in {'download_complete', 'download_valid'} for p in step.get('verification', []))
-            if hard_block or refreshed['status'] == 'passed':
+                    p.get('kind') in {'download_complete', 'download_valid', 'artifact_download'} for p in step.get('verification', []))
+            if hard_block or (refreshed['status'] == 'passed' and not (step.get('id') in {'whole_task', 'final'} and wants_report(state.task))):
                 result = {**refreshed, 'prior_judgment': typed.get('judgment')}
                 retry_status, reason = 'code_resolved', '补充观察后由代码核查裁定，不再调用 Jev'
             elif (fresh.info or {}).get('pending_downloads'):
@@ -1749,6 +1809,8 @@ class Pipeline:
             else:
                 result = self.decision_judge.review(state.task, step, before, fresh, execution_info, refreshed,
                     remaining_s=self._task_time_remaining(), checkpoints=state.judge_checkpoints)
+                if self.decision_judge.last_call:
+                    self.decision_judge.last_call['recheck'] = True
                 self._record_typed_judge()
                 retry_status, reason = 'reviewed', '已根据新证据复核一次；仍不确定时交回执行器恢复'
         result['recheck'] = {'status': retry_status, 'reason': reason, 'observation_count': 1,
@@ -1772,36 +1834,37 @@ class Pipeline:
                                  reason='保存阶段观察作为最终核查的历史证据；不替代当前系统验收')
 
     def _review_visual(self, state, step, execution_info, code, identity, before=None):
-        # Explicit Jev selection covers both step and final semantic review.
-        # Unknown stays unknown; deterministic gates are enforced by callers.
-        if unresolved_desktop_checks(code):
-            return {**identity, **code}
-        typed = None
-        exclusive = self.decision_judge and self.decision_judge.config.review_mode == 'exclusive'
-        if self.decision_judge and (exclusive or step.get('id') not in {'whole_task', 'final'}):
-            self._publish_review({**identity, 'method': 'decision_model', 'status': 'running', 'reason': 'Decision 评估器正在核查动作前后证据'})
-            typed = self.decision_judge.review(state.task, step, before, state.obs, execution_info, code,
-                                               remaining_s=self._task_time_remaining(), checkpoints=state.judge_checkpoints)
-            self._record_typed_judge()
-            if exclusive:
-                typed = self._recheck_jev(state, step, execution_info, code, typed, before, identity)
-            self._publish_review({**identity, **typed})
-            state.routing_hint['surface'] = typed.get('judgment', {}).get('answers', {}).get('surface', {})
-            if exclusive or typed['status'] in {'passed', 'failed'}:
-                return {**identity, **typed}
-        self._publish_review({**identity, "method": "model", "status": "running", "reason": "独立核查截图与补充证据"})
-        previous = len(self.reviewer.calls)
-        report = self.reviewer.visual_review(state.task, step, state.obs, execution_info, code,
-                                             remaining_s=self._task_time_remaining())
-        for call in self.reviewer.calls[previous:]:
-            self._record_call(call, "verifier")
-        report = {**identity, **report}
-        if typed:
-            report['decision_judgment'] = typed
-            report['latency_ms'] = round(report.get('latency_ms', 0) + typed.get('latency_ms', 0), 2)
-        self._publish_review(report)
-        return report
+        return self._review_service()._review_visual(state, step, execution_info, code, identity, before)
 
+    def _parallel_action_review(self, state, step, execution, action, before, review_execution, effect):
+        enabled = (self.decision_judge is not None
+            and getattr(getattr(self.decision_judge, 'config', None), 'transition_diagnostics', False)
+            and hasattr(self.decision_judge, 'assess_transition') and action is not None
+            and execution.kind not in {'terminal', 'finish_request', 'deadline'}
+            and self._task_time_remaining() > 0)
+        if not enabled:
+            report, public = self._code_step_review(state, step, execution.info,
+                                                    allow_contract=execution.kind != 'terminal')
+            return report, public, None
+        # The four questions depend on before/after observations and the local
+        # action effect, not the subtask contract result. No other Jev call may
+        # start until this future is joined (last_call has a single owner).
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='agent-action-review') as pool:
+            future = pool.submit(measured_call, self.decision_judge.assess_transition,
+                state.task, step, before, state.obs, review_execution, effect,
+                remaining_s=min(12.0, self._task_time_remaining()))
+            (report, public), code_ms = measured_call(self._code_step_review,
+                state, step, execution.info, allow_contract=execution.kind != 'terminal')
+            transition, judge_ms = future.result()
+        self._record_typed_judge()
+        self._publish_diagnostic('parallel_action_review', plan_step_id=step['id'],
+            code_ms=code_ms, judge_ms=judge_ms,
+            elapsed_ms=round((time.perf_counter()-started)*1000, 2),
+            reason='代码核查与 Jev 四问并行；等待两者结束后才推进队列，代码失败不能被模型覆盖')
+        return report, public, transition
+
+    @timed_phase("step_review")
     def _update_plan_progress(self, state: StepState, execution: Execution, before_observation=None, expected_effect='', action=None) -> None:
         """Review after each action, then advance exactly one queue entry on evidence."""
         state.finish_feedback = ""
@@ -1812,28 +1875,72 @@ class Pipeline:
         identity = {"review_id": f"{self.run_id}:a{state.step_id}:{step['id']}",
                     "plan_step_id": step["id"], "goal": step["goal"], "decision_step": state.step_id}
         self._publish_review({**identity, "method": "code", "status": "running", "reason": "检查当前步骤的系统证据"})
-        report, public_report = self._code_step_review(state, step, execution.info, allow_contract=execution.kind != 'terminal')
         review_execution = {k: execution.info[k] for k in ('status', 'error_code', 'action', 'dispatched') if k in execution.info}
+        if execution.kind == 'cli':
+            review_execution.update({k: copy.deepcopy(execution.info[k]) for k in ('channel', 'cli_result', 'effect_verified', 'path', 'destination', 'exit_code') if k in execution.info})
+        scroll = execution.info.get('scroll_feedback')
+        if isinstance(scroll, dict):
+            # Full container diagnostics stay in the trajectory; model review
+            # receives only the measured local effect, not an unbounded chain.
+            review_execution['scroll_feedback'] = {k: copy.deepcopy(scroll[k]) for k in (
+                'available', 'requested_delta', 'actual_delta', 'moved', 'noop',
+                'at_top', 'at_bottom', 'target_container') if k in scroll}
         if action is not None:
             review_execution['action'] = action.action
             review_execution['args'] = {k: copy.deepcopy(action.args[k]) for k in (
-                'target', 'target_ref', 'element_id', 'text', 'url', 'key', 'keys', 'option') if k in action.args}
+                'operation', 'path', 'destination', 'command', 'cwd', 'target', 'target_ref', 'element_id', 'text', 'url', 'key', 'keys', 'option', 'submit_key') if k in action.args}
+            if execution.info.get('compound_action'):
+                review_execution['compound_action'] = copy.deepcopy(execution.info['compound_action'])
+            if state.route and state.route.get('target_ref') and 'target_ref' not in review_execution['args']:
+                review_execution['args']['target_ref'] = str(state.route['target_ref'])
         review_execution['target_node'] = target_identity(before_observation, review_execution.get('args') or {})
         review_execution['expected_effect'] = expected_effect
-        effect = effect_review(before_observation, state.obs, review_execution)
-        report = {**identity, **report, 'action_effect': effect}
+        observation_only = execution.kind == 'framework_observation'
+        effect = ({'status': 'not_applicable', 'source': 'framework', 'scope': 'observation',
+                   'reason': '仅核查已经观察到的状态，本项没有新的动作派发'} if observation_only else
+                  effect_review(before_observation, state.obs, review_execution))
+        report, public_report, transition = self._parallel_action_review(
+            state, step, execution, action, before_observation, review_execution, effect)
+        report = {**identity, **report, 'action_effect': effect,
+                  'action_scope': 'framework_observation' if observation_only else 'action'}
+        if transition is not None:
+            answers = transition.get('answers', {})
+            model_effect = answers.get('correct', {}).get('label', 'unknown')
+            transition['effective_correct'] = (
+                'yes' if effect['status'] == 'passed' else
+                'no' if effect['status'] == 'failed' else
+                'waiting' if effect['status'] == 'pending' else model_effect)
+            ax_usable = any(node.get('direct') and node.get('role') in
+                            {'button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio'}
+                            for block in (state.obs.context or []) if block.get('kind') == 'browser_ax'
+                            for node in block.get('nodes', []))
+            transition['dom_available'] = ax_usable
+            # This question was asked for the goal just reviewed. It must not
+            # overwrite the fresh, evidence-bound selection used by build_input.
+            state.routing_hint['transition_next_mode'] = answers.get('next_mode', {})
+            transition['next_mode_scope'] = 'reviewed_goal_advisory'
+            self._publish_diagnostic('jev_transition', decision_step=state.step_id,
+                                     plan_step_id=step['id'], transition=transition)
+            report['action_transition'] = transition
+        identity_pending = (step.get('phase') == 'identify' and self.completion.paper_goals()
+                            and any(goal['status'] != 'resolved' for goal in self.completion.paper_goals()))
+        if identity_pending and report['status'] == 'unknown':
+            report['reason'] = '尚未从官方论文页元数据核实目标身份；继续查找候选，不能凭模型记忆或截图推进'
         self._publish_review(report)
         code_checks = copy.deepcopy(report.get('checks', []))
         if (report["status"] == "unknown" and execution.kind not in {"terminal", "deadline"}
                 and not (state.obs.info if state.obs else {}).get("pending_downloads")
                 and execution.info.get("status") not in {"pending", "in_progress"}
-                and not any(p.get("kind") in {'download_complete', 'download_valid'} for p in step.get("verification", []))):
+                and not identity_pending
+                and not any(p.get("kind") in {'download_complete', 'download_valid', 'artifact_download'} for p in step.get("verification", []))):
             paper = active_paper(self.completion, step)
             if paper:
                 report['bound_paper'] = {k: paper['binding'][k]
                                                     for k in ('full_title', 'canonical_id', 'pdf_url')}
             report = self._review_visual(state, step, review_execution, report, identity, before=before_observation)
         report.setdefault('action_effect', effect)
+        if transition is not None:
+            report['action_transition'] = transition
         if report['action_effect'].get('method') == 'decision_model' and report['action_effect'].get('status') == 'passed':
             report['action_effect']['evidence_fingerprint'] = evidence_fingerprint(state.obs, step, review_execution)
         report['code_checks'] = copy.deepcopy(report.get('checks', code_checks))
@@ -1854,11 +1961,26 @@ class Pipeline:
         state.memory.add_event(f"系统步骤核查[{report['method']}]: {report['status']}，{report['reason']}")
         # No extra policy call is needed for content already proven by code.
         current = state.queue.current if state.queue else None
+        if current is not step and (current or {}).get('phase') == 'locate_fulltext':
+            # Opening the verified paper often exposes its PDF link in the
+            # same observation that completes identity. Review that fact now
+            # instead of asking the policy to navigate away and rediscover it.
+            pdf_review, _ = self._code_step_review(state, current,
+                {'status': 'observed', 'dispatched': False}, allow_contract=False)
+            if pdf_review.get('source') == 'official_pdf_link' and pdf_review['status'] == 'passed':
+                self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
+                    info={'status': 'observed', 'dispatched': False}))
+            current = state.queue.current if state.queue else None
         predicates = (current or {}).get('verification', [])
         if current is not step and predicates and all(p.get('kind') == 'download_valid' for p in predicates):
             if code_review(current, state.obs, {}, public_report)['status'] == 'passed':
                 self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
                     info={'status': 'observed', 'dispatched': False}))
+            current = state.queue.current if state.queue else None
+        if (current is not step and (current or {}).get('phase') == 'verify'
+                and state.verification.get('status') == 'passed'):
+            self._update_plan_progress(state, Execution(kind='framework_observation', obs=state.obs,
+                info={'status': 'observed', 'dispatched': False}))
 
     def _programmatic_done(self, state: StepState, execution: Execution) -> str:
         return "contract" if state.verification.get("status") == "passed" else ""
@@ -1941,127 +2063,25 @@ class Pipeline:
             return "已执行"
         return (execution.outcome or "")[:80]
 
-    @staticmethod
-    def _stable_action_key(action) -> str:
-        """稳定的动作签名：忽略每次变化的 ref/id/坐标/href，用于「重复动作」卡死检测。
 
-        action_signature 会把 element_id/target_ref 也算进去（每次快照 ref 都变），
-        导致「连续点同一链接」被判成不同动作、卡死检测失效。这里只保留语义 + 稳定参数。
-        """
-        if not action:
-            return ""
-        a = action.action
-        target = str(action.args.get("target", "") or action.args.get("from_target", ""))
-        target = re.sub(r"\(href[^)]*\)", "", target)          # 去掉 (href ...) 括号形式
-        target = re.sub(r"href\s+[^\s,)]*", "href", target)    # 归一化 "href URL" → "href"
-        target = re.sub(r"\[\d+\]", "", target)                # 去掉方括号数字 ref
-        target = Pipeline._normalize_target(target)
-        stable = {"action": a, "target": target[:200]}
-        for k in ("text", "option", "key", "url", "amount", "direction", "overwrite"):
-            if k in action.args:
-                stable[k] = action.args[k]
-        return json.dumps(stable, ensure_ascii=False, sort_keys=True)
 
-    @staticmethod
-    def _normalize_target(text):
-        text = unicodedata.normalize("NFKC", str(text)).casefold()
-        return "".join(c for c in text if not c.isspace() and not unicodedata.category(c).startswith("P"))
+    def _progress_controller(self):
+        return ProgressController(ProgressPorts(
+            observation_page=self._observation_page, download_id=self._download_id,
+            screen_diff=self._screen_diff, early_stop_repeat=lambda: self.early_stop_repeat))
 
     def _semantic_action_key(self, action, obs, state=None):
-        signature = json.loads(self._stable_action_key(action)) if action else {"action": "parse"}
-        alias = json.dumps([self._observation_page(obs), signature], sort_keys=True, ensure_ascii=False)
-        if action and obs is not None:
-            nodes = [n for b in obs.context if b.get("kind") == "browser_ax" for n in b.get("nodes", [])]
-            ref = action.args.get("target_ref") or action.args.get("element_id")
-            node = next((n for n in nodes if ref and str(n.get("ref")) == str(ref)), None)
-            if node is None:
-                target = self._normalize_target(action.args.get("target") or action.args.get("from_target") or "")
-                candidates = [n for n in nodes if self._normalize_target(n.get("name", ""))
-                              and self._normalize_target(n.get("name", "")) in target]
-                if len(candidates) == 1:
-                    node = candidates[0]
-            if node:
-                signature["target"] = {"role": node.get("role"), "name": self._normalize_target(node.get("name", "")),
-                                       "href": node.get("href") or node.get("url") or ""}
-                if state is not None:
-                    state.semantic_targets[alias] = signature["target"]
-            elif state is not None and alias in state.semantic_targets:
-                signature["target"] = state.semantic_targets[alias]
-        return signature
+        return self._progress_controller()._semantic_action_key(action, obs, state)
 
     def _count_failure(self, state, failure_class, action, obs):
-        key = json.dumps({"failure": failure_class, "page": self._observation_page(obs),
-                          "target": self._semantic_action_key(action, obs, state)}, ensure_ascii=False, sort_keys=True)
-        state.failure_counts[key] = state.failure_counts.get(key, 0) + 1
-        state.failure_count += 1
-        state.failure_class = failure_class
-        state.failure_key = key
-        state.memory.stall_count = state.failure_counts[key]
-        return state.memory.stall_count
+        return self._progress_controller()._count_failure(state, failure_class, action, obs)
 
-    @staticmethod
-    def _clear_stall(state):
-        state.failure_counts.clear()
-        state.failure_class = state.failure_key = ""
-        state.memory.stall_count = 0
-        state.no_change_count = 0
-        state.action_keys.clear()
-        state.shell_outputs.clear()
-        state.semantic_targets.clear()
-        state.memory.forbidden_repeats.clear()
 
-    @staticmethod
-    def _semantic_observation(obs):
-        if obs is None:
-            return None
-        return [{"kind": block.get("kind"), "url": block.get("url"),
-                 "nodes": [{k: n[k] for k in ("role", "name", "value", "checked", "selected", "expanded", "focused", "disabled", "states", "href", "url") if k in n}
-                           for n in block.get("nodes", [])]}
-                for block in obs.context if block.get("kind") == "browser_ax"]
 
     def _detect_stall(self, state: StepState, decision: Decision,
                       execution: Execution, before_screenshot, before_observation=None) -> Optional[str]:
-        """Count one actual failure per decision, scoped to semantic target and navigation.
-
-        Snapshot refs never participate; model self-assessment never supplies proof
-        of progress. A changed page/value/file or verified effect clears old failures.
-        """
-        before_observation = before_observation or state.obs
-        info = execution.info or {}
-        failure = info.get("wait_error_code")
-        if not failure and info.get("status") in {"rejected", "failed", "failure", "error", "uncertain"}:
-            failure = str(info.get("error_code") or info.get("status"))
-        if not failure and (info.get("pending_downloads") or info.get("status") in {"in_progress", "pending"}):
-            return None
-        if not failure:
-            before_ids = {self._download_id(a) for a in (before_observation.info if before_observation else {}).get("artifacts", [])}
-            after_ids = {self._download_id(a) for a in info.get("artifacts", []) if a.get("completed")}
-            changed = (bool(info.get("effect_verified")) or bool(after_ids - before_ids)
-                       or (execution.obs is not None and (
-                           self._observation_page(before_observation) != self._observation_page(execution.obs)
-                           or self._semantic_observation(before_observation) != self._semantic_observation(execution.obs))))
-            visible_change = execution.obs is not None and self._screen_diff(before_screenshot, execution.obs.screenshot) >= _NO_CHANGE_DIFF_THRESHOLD
-            if changed or (visible_change and before_screenshot is not None):
-                self._clear_stall(state)
-                return None
-            if execution.kind == "shell":
-                output = state.terminal_result or ""
-                if state.shell_outputs and output != state.shell_outputs[-1]:
-                    self._clear_stall(state)
-                state.shell_outputs.append(output)
-                failure = "unchanged_shell_output"
-            elif execution.kind in {"env", "browser_dom"} and decision.action and decision.action.action not in {
-                    "wait", "press", "hotkey", "handle_dialog", "switch_tab"}:
-                failure = "no_progress"
-            else:
-                return None
-        count = self._count_failure(state, failure, decision.action, before_observation)
-        limit = max(1, self.early_stop_repeat) if failure in {"no_progress", "unchanged_shell_output"} else _FAILURE_REPEAT_LIMIT
-        state.action_keys.append(state.failure_key)
-        state.action_keys[:] = state.action_keys[-_LOOP_HISTORY_LEN:]
-        if count >= limit:
-            return f"同一页面与语义目标的 {failure} 已发生 {count} 次"
-        return None
+        return self._progress_controller()._detect_stall(
+            state, decision, execution, before_screenshot, before_observation)
 
     def _model_review_allowed(self, report):
         # Models may review only genuinely unspecified/semantic requirements.
@@ -2071,31 +2091,182 @@ class Pipeline:
         checks = report.get("checks", [])
         return all(c.get("status") == "passed" or c.get("id") in unresolved for c in checks)
 
+    def _final_code_evidence(self, state, report):
+        """Revalidate episode receipts independently of the current popup/page.
+
+        These facts prove transfer/integrity, never whole-task correctness. In
+        particular consumed_downloads prevents a second acquisition from using
+        the same file; it must not hide that file from final inspection.
+        """
+        state.download_facts = self.completion.download_facts()
+        public = self.completion.public_report(report)
+        code = {'method': 'code', 'status': report.get('status', 'unknown'),
+                'reason': public.get('reason', '明确条件已检查，剩余语义要求需独立核查'),
+                'checks': public.get('checks', [])}
+        # Only terminal-step file requirements are final invariants; intermediate
+        # files may intentionally be renamed/removed by later steps.
+        steps = (getattr(state.memory, 'plan', None) or {}).get('steps', [])
+        predicates = []
+        from .cli_executor import cli_capability
+        cap = cli_capability(self.env)
+        relocations = getattr(self, '_cli_relocations', {})
+        for item in steps:
+            for original in item.get('verification', []):
+                if original.get('kind') not in {'file_exists', 'file_absent', 'file_content', 'files_equal'}:
+                    continue
+                predicate = copy.deepcopy(original)
+                # Only earlier milestones follow framework-observed moves.
+                # Explicit final path requirements are never rewritten.
+                if item.get('phase') not in {'verify', 'final'} and predicate['kind'] != 'file_absent' and cap['target'] == 'local':
+                    for key in ('path', 'other_path'):
+                        if key not in predicate:
+                            continue
+                        path = os.path.abspath(os.path.join(cap['workspace'], predicate[key]))
+                        seen = set()
+                        while path in relocations and path not in seen:
+                            seen.add(path)
+                            path = relocations[path]
+                        if seen:
+                            predicate[key] = path
+                # Later explicit conditions on a path supersede intermediate
+                # existence/content states, e.g. intentional deletion.
+                family = 'presence' if predicate['kind'] in {'file_exists', 'file_absent'} else predicate['kind']
+                predicates = [p for p in predicates if not (p.get('path') == predicate['path'] and
+                    ('presence' if p['kind'] in {'file_exists', 'file_absent'} else p['kind']) == family)]
+                predicates.append(predicate)
+        if predicates and state.obs is not None:
+            from .cli_executor import file_check_samples
+            state.obs.info['cli_checks'] = file_check_samples(self.env, predicates, self._task_time_remaining)
+            file_report = code_review({'verification': predicates}, state.obs, {}, {})
+            code['file_checks'] = file_report['checks']
+            code['checks'] = [*code['checks'], *file_report['checks']]
+        if state.download_facts:
+            code['download_facts'] = copy.deepcopy(state.download_facts)
+            code['download_evidence_scope'] = (
+                '来自本轮浏览器完成事件，并在本次验收重新读取真实文件核验。'
+                'status=passed 已证明该文件下载完成且未改变；弹窗关闭、换页或截图看不到下载提示不能否定该事实。'
+                '若交付物是ZIP，应结合包内已校验成员与contained_formats判断格式，不要求网站必须直接交付裸PPT/PDF。'
+                '这不证明对象身份、来源区域、数量、命名等全部任务要求满足；仅核对尚未证明的要求。')
+        # Generic tasks have no complete deterministic contract, but their
+        # compiled file predicates still cannot be waived by a visual model.
+        # Inspect all required formats even if a navigation goal is stuck at
+        # the front of the queue; repeated inspections do not need new files.
+        formats = {p.get('format', 'any')
+            for item in (getattr(state.memory, 'plan', None) or {}).get('steps', [])
+            for p in item.get('verification', []) if p.get('kind') == 'artifact_download'}
+        if formats:
+            from .artifact_download import verified_download
+            valid = [f for f in state.download_facts if f.get('status') == 'passed']
+            code['download_checks'] = []
+            for fmt in sorted(formats):
+                artifact = verified_download(valid, format=fmt)
+                reason = ('已核实本轮实际下载文件及所需格式（允许已验证的ZIP内成员）' if artifact else
+                    '尚无所需格式的有效下载文件；已有交付物：' +
+                    ', '.join(f.get('format', 'unknown') for f in valid) +
+                    '。请检查详情页附件或选择正确文件；若是打包ZIP，必须实际包含所需格式，不要重复请求结束。')
+                code['download_checks'].append({'kind': 'artifact_download', 'format': fmt,
+                    'status': 'passed' if artifact else 'unknown', 'reason': reason,
+                    'path': artifact['path'] if artifact else None})
+        return code
+
+    def _finish_evidence_fingerprint(self, obs, facts):
+        base = self._review_fingerprint(obs)
+        if not facts:
+            return base
+        return hashlib.sha256((base + json.dumps(facts, sort_keys=True, ensure_ascii=False)).encode()).hexdigest()
+
+    @staticmethod
+    def _download_proof_invalidated(previous, current):
+        """A model cannot restore an accepted file that was removed or changed.
+
+        Only files actually present in the previous review's passed receipts
+        participate. An unrelated earlier failed download does not block a
+        later valid file; a verified content-preserving rename can be reviewed
+        again for its new filename without being treated as corrupted bytes.
+        """
+        now = {f['artifact_id']: f for f in current}
+        return any(f.get('status') == 'passed' and (
+            f['artifact_id'] not in now or now[f['artifact_id']].get('status') != 'passed'
+            or any(now[f['artifact_id']].get(key) != f.get(key)
+                   for key in ('sha256', 'bytes', 'file_identity')))
+            for f in previous)
+
+    @timed_phase("final_review")
     def _verify_finish(self, state: StepState, answer: str) -> Tuple[bool, str]:
+        from .report_delivery import wants_report
+        report_required = wants_report(state.task)
+        if report_required and state.report_delivery.get('status') != 'complete':
+            return False, '信息整理结果尚未生成完成，不能验收通过'
         report = self.completion.evaluate()
         state.verification = report
         self._verification = copy.deepcopy(report)
-        if report.get("status") == "passed":
+        if report.get("status") == "passed" and not report_required:
             return True, "全部确定性验收条件通过"
         if not self._model_review_allowed(report):
             public = self.completion.public_report(report)
             return False, public.get("reason") or "确定性验收条件尚未满足，模型不能覆盖"
+        code = self._final_code_evidence(state, report)
+        if report_required:
+            code['report_delivery'] = copy.deepcopy(state.report_delivery)
+            code['report_review_instruction'] = '正文是待核查交付物，不是完成证据；依据 observed_sources 核对覆盖原始要求、事实与引用，不以当前截图是否展示正文来判断。'
+        missing_download = next((c for c in [*code.get('download_checks', []), *code.get('file_checks', [])] if c['status'] != 'passed'), None)
+        if missing_download:
+            self._publish_review({**code, 'plan_step_id': 'whole_task', 'decision_step': state.step_id})
+            return False, missing_download['reason']
+        if self._model_final_report and self._download_proof_invalidated(
+                self._reviewed_download_facts, state.download_facts):
+            self._model_final_report = None
+            return False, '已接受验收所依据的下载文件丢失或改变，原成功结论失效'
+        fingerprint = self._finish_evidence_fingerprint(state.obs, state.download_facts)
+        previous = state.final_review_state
+        if (state.download_facts and previous.get('fingerprint') == fingerprint
+                and previous.get('report', {}).get('status') == 'unknown'):
+            previous['repeated_unchanged'] = True
+            self._publish_diagnostic('finish_review_unchanged',
+                reason='下载收据与页面证据未变化，不重复模型验收或重新规划下载',
+                download_facts=state.download_facts)
+            return False, previous['report']['reason']
+        state.final_review_state = {'repeated_unchanged': False}
         step = {"id": "whole_task", "goal": state.task,
                 "expected_evidence": "核对原始任务的所有要求（包含数量、对象身份、保存或提交结果）；不能只核对当前步骤或规划摘要。",
                 "planner_review_hint": str((getattr(state.memory, 'plan', None) or {}).get('final_check') or '')[:2000],
                 "unresolved_requirements": [c['text'] for c in self.completion.public_spec.get('checks', [])
                                             if c.get('kind') == 'unresolved_requirement'],
                 "verification": [{"kind": "visual"}]}
+        if state.download_facts:
+            step['expected_evidence'] += (
+                '代码提供的 download_facts 是当前重新验证的真实文件证据：passed 文件的下载完成与完整性已经确认。'
+                '不能因下载弹窗已关闭或当前截图不显示下载记录而重新判定未下载；继续核对原任务其余要求。')
         identity = {"review_id": f"{self.run_id}:a{state.step_id}:whole_task",
                     "plan_step_id": "whole_task", "goal": state.task, "decision_step": state.step_id}
-        code = {**identity, "method": "code", "status": "unknown", "reason": "明确条件已检查，剩余语义要求需独立核查",
-                "checks": self.completion.public_report(report).get("checks", [])}
+        code = {**identity, **code}
+        submitted_facts = copy.deepcopy(code.get('download_facts', []))
         self._publish_review(code)
         reviewed = self._review_visual(state, step, {}, code, identity)
+        state.download_facts = self.completion.download_facts()
+        if reviewed['status'] == 'passed' and self._download_proof_invalidated(submitted_facts, state.download_facts):
+            reviewed = {**identity, 'method': 'code', 'status': 'failed',
+                'reason': '送审时有效的下载文件在核查期间丢失或改变，模型结论不能覆盖文件校验失败',
+                'checks': [], 'download_facts': copy.deepcopy(state.download_facts), 'evidence': []}
+            self._publish_review(reviewed)
         self._model_final_report = reviewed if reviewed["status"] == "passed" and reviewed.get("method") != "code" else None
         self._reviewed_state = state
-        self._reviewed_observation = self._review_fingerprint(state.obs)
+        # Never mark facts appearing only after the model call as reviewed.
+        self._reviewed_download_facts = submitted_facts
+        receipt_scope = named_download_receipts(state.task, submitted_facts) if self._model_final_report else []
+        if receipt_scope:
+            self._model_final_report['revalidation_scope'] = 'named_download_receipts'
+            self._model_final_report['receipt_ids'] = receipt_scope
+        self._reviewed_observation = self._finish_evidence_fingerprint(state.obs, submitted_facts)
+        state.final_review_state = {'fingerprint': self._reviewed_observation,
+            'report': copy.deepcopy(reviewed), 'repeated_unchanged': False}
         return reviewed["status"] == "passed", reviewed["reason"]
+
+    def _ensure_report(self, state):
+        from .report_delivery import generate_report
+        state.report_delivery = generate_report(state, self.model, self._publish_diagnostic,
+            self._record_call, self._task_time_remaining)
+        self._report_delivery = state.report_delivery
 
     @classmethod
     def _review_fingerprint(cls, obs):
@@ -2157,7 +2328,7 @@ class Pipeline:
         else:
             state.execution_status = str(execution.info.get("status") or "unknown")
         state.execution_feedback = {key: copy.deepcopy(execution.info[key]) for key in (
-            "status", "dispatched", "reason", "error", "error_code", "wait_error_code", "wait_reason", "effect_verified", "framework_wait")
+            "cli_result", "status", "dispatched", "reason", "error", "error_code", "wait_error_code", "wait_reason", "effect_verified", "framework_wait", "scroll_feedback", "page_readiness_wait")
             if key in execution.info}
         state.execution_feedback.setdefault("status", state.execution_status)
         state.execution_feedback.setdefault("dispatched", None)
@@ -2166,10 +2337,20 @@ class Pipeline:
 
     def _validate_action(self, action: Action) -> Optional[str]:
         if action.action not in BASIC_ACTIONS:
-            return "只允许基础 GUI/DOM 交互动作，不能调用代码、直接下载或直接修改文件"
+            return "只允许已注册的 GUI/DOM/CLI 动作"
         if self._active_actions is not None and action.action not in self._active_actions:
             return "本轮可用动作：" + ", ".join(self._active_actions)
         return validate_action(action)
+
+    def _locate_recorded(self, screenshot, target):
+        previous = getattr(self.grounding, 'last_calls', None)
+        if isinstance(previous, list):
+            previous.clear()
+        try:
+            return self.grounding.locate(screenshot, target)
+        finally:
+            for call in getattr(self.grounding, 'last_calls', []):
+                self._record_call(copy.deepcopy(call), 'grounder')
 
     def _resolve(self, action: Action, obs: Observation) -> Action:
         spec = get_action_spec(action.action)
@@ -2186,7 +2367,7 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 pass
         if spec.resolve == "point":
-            gr = self.grounding.locate(obs.screenshot, str(action.args.get("target", "")))
+            gr = self._locate_recorded(obs.screenshot, str(action.args.get("target", "")))
             coord = resolve_coords(gr)
             # 保留 target 之外的参数（如 type 的 text），让「定位+聚焦」类动作能带上其余参数
             extra = {k: v for k, v in action.args.items() if k != "target"}
@@ -2199,7 +2380,7 @@ class Pipeline:
             x, y = coord
             return Action(action.action, {"x": x, "y": y, **extra})
         if spec.resolve == "select":
-            gr = self.grounding.locate(obs.screenshot, str(action.args.get("target", "")))
+            gr = self._locate_recorded(obs.screenshot, str(action.args.get("target", "")))
             coord = resolve_coords(gr)
             if coord is None:
                 coord = self._ocr_fallback(obs.screenshot, str(action.args.get("target", "")))
@@ -2209,8 +2390,8 @@ class Pipeline:
             x, y = coord
             return Action(action.action, {"x": x, "y": y, "option": action.args.get("option", "")})
         if spec.resolve == "drag":
-            g1 = self.grounding.locate(obs.screenshot, str(action.args.get("from_target", "")))
-            g2 = self.grounding.locate(obs.screenshot, str(action.args.get("to_target", "")))
+            g1 = self._locate_recorded(obs.screenshot, str(action.args.get("from_target", "")))
+            g2 = self._locate_recorded(obs.screenshot, str(action.args.get("to_target", "")))
             c1, c2 = resolve_coords(g1), resolve_coords(g2)
             if c1 is None or c2 is None:
                 return Action(action.action, {"grounding_failed": True})
@@ -2284,34 +2465,89 @@ class Pipeline:
                     break
         return matches[0] if matches else None
 
+    def _final_code_snapshot(self):
+        return self.completion.evaluate(), self.completion.download_facts()
+
+    def _parallel_final_snapshot(self):
+        # The browser stays on its owning execution path. File checks run in a
+        # worker; completion.observe() cannot mutate their ledger until joined.
+        # These are preliminary checks only: the post-observation checks below
+        # still catch changes/deletion during capture and callback execution.
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='agent-final-check') as pool:
+            future = pool.submit(measured_call, self._final_code_snapshot)
+            fresh, observation_ms = measured_call(self._observe)
+            (report, facts), code_ms = future.result()
+        self._publish_diagnostic('parallel_final_evidence', code_ms=code_ms,
+            observation_ms=observation_ms,
+            elapsed_ms=round((time.perf_counter()-started)*1000, 2),
+            reason='最终观察与文件预检并行；观察合入后仍重新检查文件与验收条件')
+        return report, facts, fresh
+
+    @timed_phase("final_revalidation")
     def _evaluate(self, result: AgentResult) -> float:
-        def refresh_final_pages():
+        def refresh_final_pages(observation=None):
             checks = self.completion.spec.get("checks", [])
             if not any(check.get("scope") == "final" and check.get("kind") in {
                     "url_equals", "text_present", "element_state"} for check in checks):
-                return
+                return False
             # Evaluators, callbacks and redirects can change the page after the
             # last action observation. Final page predicates need fresh evidence;
             # milestones stay latched and artifact-only contracts avoid this call.
-            observation = self._observe()
+            if observation is None:
+                observation = self._observe()
             self.completion.observe(observation)
             self._emit("observation", observation_id="o_final", stage="final_evaluation",
                        observation=self._observation_record(observation, "o_final"))
+            return True
 
         if not getattr(self.env, "evaluation_available", False):
-            refresh_final_pages()
-            report = self.completion.evaluate()
+            fresh = None
+            fresh_applied = False
+            if self._model_final_report:
+                report, download_facts, fresh = self._parallel_final_snapshot()
+                # Final page predicates still require the newly captured page,
+                # even when a failed file proof prevents another model review.
+                fresh_applied = refresh_final_pages(fresh)
+                if fresh_applied:
+                    report = self.completion.evaluate()
+            else:
+                refresh_final_pages()
+                report, download_facts = self._final_code_snapshot()
+            if download_facts:
+                report['download_facts'] = download_facts
+                if result.termination_reason == 'completion_inconclusive':
+                    report['reason'] = '文件结果已单独核实，整任务语义验收仍不确定；没有新的证据，停止重复结束请求'
             was_success = result.success
             model_report = self._model_final_report
-            if model_report and self._model_review_allowed(report) and report.get("status") != "passed":
+            if model_report and self._download_proof_invalidated(self._reviewed_download_facts, download_facts):
+                model_report = self._model_final_report = None
+                report['reason'] = '最终模型验收所依据的下载文件已丢失或改变，原成功结论失效'
+            if model_report and self._model_review_allowed(report) and (report.get("status") != "passed" or getattr(self, "_report_required", False)):
                 # Observe again after callbacks; revoke/review if visible evidence changed.
                 state = self._reviewed_state
-                fresh = self._observe()
-                self.completion.observe(fresh)
-                report = self.completion.evaluate()
-                if not self._model_review_allowed(report):
+                if fresh is None:
+                    fresh = self._observe()
+                if not fresh_applied:
+                    self.completion.observe(fresh)
+                    report = self.completion.evaluate()
+                if facts := self.completion.download_facts():
+                    report['download_facts'] = facts
+                if self._download_proof_invalidated(self._reviewed_download_facts, report.get('download_facts', [])):
+                    model_report = self._model_final_report = None
+                    report['reason'] = '补充最终观察时下载文件已丢失或改变，原成功结论失效'
+                elif not self._model_review_allowed(report):
                     model_report = None
-                elif self._review_fingerprint(fresh) != self._reviewed_observation:
+                elif (model_report.get('revalidation_scope') == 'named_download_receipts'
+                      and set(model_report.get('receipt_ids', [])) == set(named_download_receipts(state.task, report.get('download_facts', [])))
+                      and report.get('download_facts', []) == self._reviewed_download_facts):
+                    # The original whole-task model review is retained, not promoted
+                    # to deterministic success. Code re-read the same file above.
+                    # Notification disappearance is unrelated to this durable result.
+                    self._publish_diagnostic('final_review_reused',
+                        reason='指定文件的收据与内容未变，复用已通过的整任务语义核查；文件仍由代码重新检查',
+                        receipt_ids=model_report['receipt_ids'])
+                elif self._finish_evidence_fingerprint(fresh, report.get('download_facts', [])) != self._reviewed_observation:
                     state.obs = fresh
                     confirmed, _ = self._verify_finish(state, "")
                     model_report = self._model_final_report if confirmed else None
@@ -2324,6 +2560,8 @@ class Pipeline:
                                            "reward_valid": False, "completion": report}
                     self._emit("verification", stage="final_evaluation", report=result.verification, policy_trainable=False)
                     return 0.0
+            if getattr(self, '_report_required', False) and not model_report:
+                report = {**report, 'status': 'unknown', 'reason': '文字交付物尚未通过独立核查；网页或文件条件通过不能代替报告验收'}
             result.success = report.get("status") == "passed"
             result.verification = copy.deepcopy(report)
             if result.success and not was_success:
@@ -2393,56 +2631,28 @@ class Pipeline:
             return 0.0
 
     # ---- 纯静态小工具 ----
-    @staticmethod
-    def _coordinate_of(action: Action) -> Optional[Tuple[int, int]]:
-        a = action.args
-        if "x" in a and "y" in a:
-            return int(a["x"]), int(a["y"])
-        if "x1" in a and "y1" in a:
-            return int(a["x1"]), int(a["y1"])
-        return None
 
-    @staticmethod
-    def _target_of(action: Action) -> str:
-        a = action.args
-        if action.action in ("click", "double_click", "right_click", "select"):
-            return str(a.get("target", ""))
-        if action.action == "drag_and_drop":
-            return f"{a.get('from_target', '')} -> {a.get('to_target', '')}"
-        if action.action == "type":
-            t = str(a.get("target", ""))
-            txt = str(a.get("text", ""))
-            if t:
-                return f"{txt!r} → {t}"
-            return txt
-        if action.action == "scroll":
-            return f"{a.get('direction', '')} {a.get('amount', '')}"
-        if action.action == "run_in_terminal":
-            return str(a.get("command", ""))
-        if action.action == "goto":
-            return str(a.get("url", ""))
-        if action.action == "hotkey":
-            return "+".join(a.get("keys", []))
-        if action.action == "press":
-            return str(a.get("key", ""))
-        return ""
 
-    @staticmethod
-    def _action_desc(action: str, target: str) -> str:
-        if target:
-            return f"{action} {target}"
-        return action
 
-    @staticmethod
-    def _compact_action(action) -> str:
-        if isinstance(action, Action):
-            return json.dumps({"action": action.action, "args": action.args}, ensure_ascii=False)
-        return str(action)
 
-    @staticmethod
-    def _describe_outcome(step_result) -> str:
-        if step_result.done:
-            return "任务完成"
-        if step_result.reward and step_result.reward > 0:
-            return f"有进展(奖励 {step_result.reward})"
-        return "已执行（屏幕状态待下一步判断）"
+
+
+    _action_desc = staticmethod(pipeline_format._action_desc)
+
+    _compact_action = staticmethod(pipeline_format._compact_action)
+
+    _coordinate_of = staticmethod(pipeline_format._coordinate_of)
+
+    _describe_outcome = staticmethod(pipeline_format._describe_outcome)
+
+    _operation_mode = staticmethod(pipeline_format._operation_mode)
+
+    _target_of = staticmethod(pipeline_format._target_of)
+
+    _stable_action_key = staticmethod(progress_controller._stable_action_key)
+
+    _normalize_target = staticmethod(progress_controller._normalize_target)
+
+    _clear_stall = staticmethod(progress_controller._clear_stall)
+
+    _semantic_observation = staticmethod(progress_controller._semantic_observation)

@@ -9,7 +9,10 @@ htmlcov/
 
 # Local environments and credentials
 .venv/
+.venv-mac/
+.venv312/
 venv/
+viz/studio_settings.json
 .env
 .env.*
 !.env.example
@@ -19,6 +22,7 @@ venv/
 *.log
 logs/
 runs/
+local_runs/
 outputs/
 workspace/
 downloads/
@@ -29,3 +33,12 @@ human_runs/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local diagnostics and exported conversations
+.runtime/
+_session*
+*.pending-update
+
+# Unused local UI/server snapshots
+viz/server_old.py
+viz/static/index_old.html

@@ -107,7 +107,9 @@ def test_pending_duplicate_download_returns_same_identity_without_request(sessio
 def test_parallel_same_name_downloads_are_reserved_and_duplicate_is_canceled(session):
     owner = browser_thread(lambda self, fn: fn())
     owner(session, lambda: session._await(asyncio.sleep(0)))
-    release = asyncio.Event()
+    async def new_event():
+        return asyncio.Event()
+    release = owner(session, lambda: session._await(new_event()))
     async def save(path):
         await release.wait()
         Path(path).write_bytes(b"downloaded")

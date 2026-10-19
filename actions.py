@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from .config import ACTION_YAML, load_yaml
 
 # Policy capability boundary: configuration/skills cannot silently re-enable code shortcuts.
-BASIC_ACTIONS = frozenset({"click", "double_click", "right_click", "type", "scroll", "press",
+BASIC_ACTIONS = frozenset({"cli","click", "double_click", "right_click", "type", "scroll", "press",
     "hotkey", "goto", "select", "drag_and_drop", "switch_applications", "wait", "get_page_source",
     "handle_dialog", "list_tabs", "switch_tab", "close_tab", "observe_desktop", "observe_browser",
     "request_finish", "fail"})
@@ -129,6 +129,14 @@ def action_from_decision(obj: Dict[str, Any]) -> Optional[Action]:
         return None
     if "next_action" in obj:
         na = obj["next_action"]
+        # An explicit finish request with an existing explanation is unambiguous.
+        # Normalize only this observed spelling error; never invent click/key
+        # parameters or infer task success from the operator's explanation.
+        if (na == "request_finish"
+                and set(obj) <= {"next_action", "summary", "answer"}):
+            answer = obj.get("answer", obj.get("summary"))
+            if isinstance(answer, str) and answer.strip():
+                return Action(action="request_finish", args={"answer": answer})
         if isinstance(na, dict) and "type" in na:
             return Action(action=str(na["type"]).strip(),
                           args={k: v for k, v in na.items() if k != "type"})
@@ -141,6 +149,9 @@ def action_from_decision(obj: Dict[str, Any]) -> Optional[Action]:
 
 def validate_action(act: Action) -> Optional[str]:
     """校验动作是否合法；返回 None 表示合法，否则返回中文错误说明。"""
+    if act.action == "cli":
+        from .cli_executor import validate_cli
+        return validate_cli(act.args)
     spec = ACTION_REGISTRY.get(act.action) if act.action in BASIC_ACTIONS else None
     if spec is None:
         return f"未知动作类型「{act.action}」。可选动作：{', '.join(ACTION_REGISTRY)}"
@@ -162,6 +173,11 @@ def validate_action(act: Action) -> Optional[str]:
     missing = [k for k in spec.params if act.args.get(k) in (None, "")]
     if missing:
         return f"动作「{act.action}」缺少必填参数：{', '.join(missing)}"
+    if "submit_key" in act.args:
+        if act.action != 'type' or act.args['submit_key'] != 'Enter':
+            return 'submit_key 仅支持 type 输入后按 Enter'
+        if act.args.get('overwrite') is not True or not (act.args.get('target_ref') or act.args.get('element_id')):
+            return '输入后提交须使用当前 DOM 引用并设置 overwrite:true；其他情况分开 type 和 press'
     # 类型级校验（仅对有额外约束的动作）
     if act.action == "scroll":
         try:

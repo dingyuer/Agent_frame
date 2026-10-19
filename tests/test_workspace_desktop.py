@@ -43,7 +43,8 @@ def test_workspace_allocated_before_browser_and_kept_through_episode(session):
     marker = Path(first['workspace_dir']) / 'old.pdf'
     marker.write_bytes(b'old')
     second = session.begin_episode('task')
-    assert second['workspace_dir'] != first['workspace_dir']
+    assert second['workspace_dir'] == first['workspace_dir']
+    assert second['episode_id'] == first['episode_id']
     assert marker.read_bytes() == b'old' and not session.event_metadata()['artifacts']
 
 

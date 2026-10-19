@@ -1,6 +1,7 @@
 import sys
 import importlib.util
 from pathlib import Path
+import pytest
 
 # Bind tests to this checkout regardless of the clone directory name.
 root = Path(__file__).resolve().parents[1]
@@ -9,6 +10,16 @@ spec = importlib.util.spec_from_file_location(
 module = importlib.util.module_from_spec(spec)
 sys.modules["osworld_agent"] = module
 spec.loader.exec_module(module)
+
+
+@pytest.fixture(autouse=True)
+def isolated_run_history(tmp_path, monkeypatch):
+    """Mock launchers and CLI tests must never populate Studio's real history."""
+    from osworld_agent.viz import server
+    logs = str(tmp_path / 'local_runs')
+    monkeypatch.setenv('OSWORLD_LOCAL_RUNS_DIR', logs)
+    # server reads its default at import time; isolate that path as well.
+    monkeypatch.setattr(server, 'LOCAL_RUNS_DIR', logs)
 
 
 def pytest_addoption(parser):

@@ -1,4 +1,6 @@
 """resolve_target 单元测试：语义匹配 / ref 提取 / allowed 过滤（纯内存，无需浏览器）。"""
+import pytest
+
 from osworld_agent.browser_session import BrowserSession, BrowserOptions
 
 
@@ -23,6 +25,45 @@ def test_ref_in_target_extracted():
     # 模型把 ref 写进 target 描述里（如 "[3]"）→ 直接提取用
     s = _session()
     assert s.resolve_target("The search box [3]") == "3"
+
+
+def test_exact_exposed_ref_or_html_id_in_target_resolves_without_grounding():
+    s = _session()
+    s.nodes["3"]["id"] = "query"
+    assert s.resolve_target("3", allowed={"3"}) == "3"
+    assert s.resolve_target("query", allowed={"3"}) == "3"
+    assert s.resolve_target("query", allowed={"2"}) is None
+    assert s.resolve_target("4", allowed={"4"}) is None  # non-interactive snapshot node
+
+
+def test_hash_prefixed_observed_id_resolves_native_select_without_guessing_ref():
+    s = _session()
+    s.nodes['3'].update(id='searchtype', role='combobox')
+    assert s.resolve_target('#searchtype', allowed={'3'}) == '3'
+    assert s.resolve_target('#searchtype', allowed={'2'}) is None
+    assert s.resolve_target('#searchtype', allowed=set()) is None
+    assert s.resolve_target('#3', allowed={'3'}) is None  # ref 3 is not an HTML id
+    assert s.resolve_target('#SEARCHTYPE', allowed={'3'}) is None  # HTML ids are case-sensitive
+
+
+def test_hash_prefixed_id_requires_unique_direct_snapshot_node():
+    s = _session()
+    s.nodes['4']['id'] = 'container'
+    assert s.resolve_target('#container', allowed={'4'}) is None
+    s.nodes['2']['id'] = 'duplicate'
+    s.nodes['3']['id'] = 'duplicate'
+    assert s.resolve_target('#duplicate', allowed={'2'}) is None
+    assert s.last_resolution_error == 'ambiguous'
+
+
+@pytest.mark.parametrize('target', ['#searchtype option', '#searchtype>option', '#searchtype:focus',
+                                  '#searchtype[value="x"]', '#searchtype,button', '#searchtype.foo',
+                                  '#searchtype+button', '#searchtype~button', '#searchtype #child'])
+def test_hash_target_never_executes_or_semantically_guesses_compound_css(target):
+    s = _session()
+    s.nodes['2']['name'] = target  # even a matching accessible name must not bypass the restriction
+    s.nodes['3']['id'] = 'searchtype'
+    assert s.resolve_target(target, allowed={'2', '3'}) is None
 
 
 def test_non_direct_skipped():
@@ -94,6 +135,37 @@ def test_route_by_element_id():
     route = s.route(action, obs)
     assert route["channel"] == "browser_dom"
     assert route["target_ref"] == "2"
+
+
+def test_target_ref_semantic_mismatch_rejected():
+    # 拦截「点确定却路由到 语音转文字 复选框」的 target_ref 串号
+    from osworld_agent.actions import Action
+    from osworld_agent.env import Observation
+    s = _session()
+    s.nodes["64"] = {"ref": "64", "role": "checkbox", "name": "语音转文字", "value": "", "direct": True}
+    s.nodes["33"] = {"ref": "33", "role": "StaticText", "name": "确定", "value": "", "direct": True}
+    obs = Observation(info={"exposed_refs": list(s.nodes.keys())})
+    wrong = s.route(Action("click", {"target": "确定", "target_ref": "64"}), obs)
+    assert wrong["channel"] == "reobserve"
+    assert wrong["error_code"] == "mismatch"
+    # 正确 ref 走 DOM 定位
+    ok = s.route(Action("click", {"target": "确定", "target_ref": "33"}), obs)
+    assert ok["channel"] == "browser_dom"
+    # 复选框自身 → 允许
+    ck = s.route(Action("click", {"target": "语音转文字", "target_ref": "64"}), obs)
+    assert ck["channel"] == "browser_dom"
+
+
+def test_target_ref_semantic_substring_and_non_cjk_allowed():
+    # 子串命中（关闭 → 关闭此对话框）与英文标签不触发中文串号拦截
+    from osworld_agent.actions import Action
+    from osworld_agent.env import Observation
+    s = _session()
+    s.nodes["10"] = {"ref": "10", "role": "button", "name": "关闭此对话框", "value": "", "direct": True}
+    s.nodes["11"] = {"ref": "11", "role": "button", "name": "Submit", "value": "", "direct": True}
+    obs = Observation(info={"exposed_refs": list(s.nodes.keys())})
+    assert s.route(Action("click", {"target": "关闭", "target_ref": "10"}), obs)["channel"] == "browser_dom"
+    assert s.route(Action("click", {"target": "Submit", "target_ref": "11"}), obs)["channel"] == "browser_dom"
 
 
 def test_screen_to_viewport():

@@ -122,7 +122,8 @@ def test_full_episode_recovers_before_last_step_and_exports_reason(monkeypatch):
         return StepResult(env.obs, info={'status': 'executed', 'dispatched': True})
     env.execute_routed = execute
     initial = {'steps': [{'goal': '搜索并显示结果', 'expected_evidence': '结果已显示'}]}
-    replanned = {'steps': [{'goal': '更换入口搜索', 'expected_evidence': '看到结果'}]}
+    replanned = {'steps': [{'goal': '更换入口搜索', 'expected_evidence': '看到结果'}],
+                 'strategy_change': '此前反复按键未产生结果，改用新的搜索入口并核查结果列表。'}
     actions = [{'type': 'press', 'key': key} for key in ['ENTER', 'TAB', 'ENTER', 'TAB']]
     model = Model(actions, initial)
     model.responses += [json.dumps(replanned), json.dumps({'next_action': {'type': 'fail', 'reason': 'fixture ended'}})]
@@ -139,3 +140,20 @@ def test_full_episode_recovers_before_last_step_and_exports_reason(monkeypatch):
     assert exported['steps'][3]['step_progress']['status'] == 'stalled'
     assert exported['run_manifest']['runtime_config']['progress_config']['no_progress_limit'] == 4
     assert not result.evaluation_available
+
+
+def test_collection_can_progress_beyond_exploration_allowance_but_not_repeat_content():
+    from osworld_agent.env import Observation
+    monitor=StepProgressMonitor()
+    before=Observation(context=[{'kind':'browser_ax','url':'https://test/index','nodes':[]}],info={})
+    review={'plan_step_id':'p0_1','status':'unknown','step_outcome':'progress','progress_hint':False}
+    for i in range(6):
+        url=f'https://test/course/{i}'
+        text=f'课程 {i} 的报名时间：每周三下午 18:00'
+        after=Observation(context=[{'kind':'browser_ax','url':url,'nodes':[{'role':'StaticText','name':text}]}],info={})
+        result=monitor.observe(STEP,review,before,after,Action('click',{}),EXECUTED,collected_sources=[{'url':url,'text':text}])
+        assert result['status']=='watching' and result['idle_decisions']==0
+        before=after
+    for _ in range(4):
+        result=monitor.observe(STEP,review,before,after,Action('click',{}),EXECUTED,collected_sources=[{'url':url,'text':text}])
+    assert result['status']=='stalled'

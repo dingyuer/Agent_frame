@@ -90,7 +90,10 @@ class UItarsGrounding(Grounding):
                 self.url, self.api_key, self.model, self.width, self.height,
                 timeout=self.timeout,
             )
-        return self._delegate.locate(screenshot, target)
+        try:
+            return self._delegate.locate(screenshot, target)
+        finally:
+            self.last_calls = getattr(self._delegate, "last_calls", [])
 
 
 class UIVenus2Grounding(Grounding):
@@ -113,7 +116,10 @@ class UIVenus2Grounding(Grounding):
                 self.url, self.api_key, self.model, self.width, self.height,
                 timeout=self.timeout,
             )
-        return self._delegate.locate(screenshot, target)
+        try:
+            return self._delegate.locate(screenshot, target)
+        finally:
+            self.last_calls = getattr(self._delegate, "last_calls", [])
 
 
 class NullGrounding(Grounding):
@@ -173,6 +179,7 @@ class _ModelEntry:
 
 # 视觉定位模型注册表
 GROUNDING_REGISTRY: Dict[str, _ModelEntry] = {
+    "qwen_plus": _ModelEntry("qwen3.7-plus", "Qwen Plus 视觉定位（API）"),
     "ui_tars_7b": _ModelEntry("UI-TARS-1.5-7B", "UI-TARS 定位模型（vLLM @ 49999）"),
     "ui_venus2_9b": _ModelEntry("UI-Venus-2-9B", "UI-Venus-2 定位模型（vLLM @ 8001）"),
 }
@@ -182,6 +189,10 @@ def build_grounding_model(cfg: GroundingConfig) -> Grounding:
     """根据配置构造视觉定位客户端。"""
     entry = GROUNDING_REGISTRY.get(cfg.name)
     real_name = entry.name if entry else cfg.name
+    if cfg.name in {"qwen_plus", "qwen3.7-plus", "qwen-plus"}:
+        from ..adapters.qwen_grounding import QwenPlusGrounding
+        return QwenPlusGrounding(url=cfg.url, api_key=cfg.api_key, model=real_name,
+                                 width=cfg.width, height=cfg.height, timeout=cfg.timeout)
     if (cfg.name or "").startswith("ui_venus"):
         return UIVenus2Grounding(url=cfg.url, api_key=cfg.api_key, model=real_name,
                                  width=cfg.width, height=cfg.height, timeout=cfg.timeout)

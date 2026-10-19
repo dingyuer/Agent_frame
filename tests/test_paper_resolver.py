@@ -16,9 +16,20 @@ def metadata_html(title=TITLE, identifier=IDENTIFIER):
             f'<meta name="citation_pdf_url" content="https://arxiv.org/pdf/{identifier}">')
 
 
+def fixture_selection(query, candidates, **kwargs):
+    """Predetermined semantic fixture, not a production title-based fallback."""
+    matches = [item for item in candidates if query_matches_title(query, item.full_title)]
+    if len(matches) != 1:
+        return {'status': 'uncertain', 'selected_id': None, 'reason': 'fixture has no unique selected target', 'evidence': []}
+    item = matches[0]
+    return {'status': 'matched', 'selected_id': item.canonical_id, 'reason': 'fixture selects this observed target',
+            'evidence': [{'candidate_id': item.canonical_id, 'field': 'full_title', 'quote': item.full_title}]}
+
+
 def resolve(query='Roboclaw', identifier=IDENTIFIER, title=TITLE, extra_metadata=''):
     return resolve_arxiv_candidates(query, ['https://arxiv.org/abs/' + identifier],
-        fetcher=lambda url, timeout: {'url': url, 'text': metadata_html(title, identifier) + extra_metadata})
+        fetcher=lambda url, timeout: {'url': url, 'text': metadata_html(title, identifier) + extra_metadata},
+        identity_selector=fixture_selection)
 
 
 def test_official_metadata_binds_short_alias_without_substring_matching():
@@ -66,7 +77,7 @@ def test_multiple_matching_candidates_are_ambiguous_and_failures_do_not_establis
     urls = ['https://arxiv.org/abs/' + identifier for identifier in (IDENTIFIER, '2603.99999')]
     def fetch(url, timeout):
         return {'url': url, 'text': metadata_html(identifier=url.rsplit('/', 1)[-1])}
-    assert resolve_arxiv_candidates('Roboclaw', urls, fetcher=fetch).status == 'ambiguous'
+    assert resolve_arxiv_candidates('Roboclaw', urls, fetcher=fetch, identity_selector=fixture_selection).status == 'unavailable'
     def partial(url, timeout):
         if url.endswith('99999'):
             raise TimeoutError()
@@ -79,7 +90,7 @@ def test_typed_metadata_cache_avoids_request_and_timeout_is_bounded():
     url = 'https://arxiv.org/abs/' + IDENTIFIER
     evidence = parse_arxiv_metadata(url, metadata_html())
     result = resolve_arxiv_candidates('Roboclaw', [url], metadata=evidence,
-        fetcher=lambda *_args, **_kw: pytest.fail('cached evidence should avoid fetch'))
+        fetcher=lambda *_args, **_kw: pytest.fail('cached evidence should avoid fetch'), identity_selector=fixture_selection)
     assert result.status == 'resolved'
     timeouts = []
     def fetch(source, timeout):
@@ -106,3 +117,19 @@ def test_response_after_total_deadline_is_not_accepted(monkeypatch):
     result = resolve_arxiv_candidates('Roboclaw', ['https://arxiv.org/abs/' + IDENTIFIER],
                                      fetcher=late, total_timeout=1)
     assert result.status == 'unavailable'
+    assert result.reason_code == 'resolution_timeout'
+
+
+def test_resolution_reason_codes_distinguish_uncertain_evidence_from_mismatch():
+    assert resolve_arxiv_candidates('', []).reason_code == 'invalid_query'
+    assert resolve_arxiv_candidates('RoboClaw', []).reason_code == 'no_observed_candidate'
+    many = ['https://arxiv.org/abs/2603.' + str(i).zfill(5) for i in range(8)]
+    assert resolve_arxiv_candidates('RoboClaw', many).reason_code == 'too_many_candidates'
+    assert resolve().reason_code == 'verified_identity'
+    assert resolve('Different title').reason_code == 'semantic_uncertain'
+    failed = resolve_arxiv_candidates('RoboClaw', ['https://arxiv.org/abs/' + IDENTIFIER],
+        fetcher=lambda *args, **kwargs: (_ for _ in ()).throw(OSError('offline')))
+    assert failed.status == 'unavailable' and failed.reason_code == 'metadata_fetch_failed'
+    invalid = resolve_arxiv_candidates('RoboClaw', ['https://arxiv.org/abs/' + IDENTIFIER],
+        fetcher=lambda url, **kwargs: {'url': url, 'text': '<html>No citation metadata</html>'})
+    assert invalid.status == 'unavailable' and invalid.reason_code == 'metadata_invalid'

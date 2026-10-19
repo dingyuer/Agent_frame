@@ -16,6 +16,12 @@
 # =============================================================
 
 actions:
+  cli:
+    kind: cli
+    resolve: none
+    params: [operation]
+    description: "后台文件/终端操作。operation=list/stat/read/write/mkdir/copy/move/rename/open/shell/compare；文件操作带path，copy/move/rename另带destination，write带content，shell带command。可选cwd、timeout_s(1~120)、overwrite(默认false)。相对路径基于默认工程目录。"
+
   click:
     params: [target]
     description: "点击某个元素。优先用 DOM 定位：若 browser_ax 里该元素带 id，加可选参数 element_id（直接复制该 HTML id）；若带 ref，加可选参数 target_ref（复制完整 ref）。两者都走 DOM 确定性定位、无需视觉定位模型。找不到 id/ref 时，target 用英文描述整个元素，程序会退回视觉定位模型定位坐标"
@@ -36,6 +42,9 @@ actions:
 
   type:
     params: [target, text]
+    # Optional submit_key: Enter, only with overwrite: true and a current DOM
+    # reference. Executor validates a single-line text/search input and focus,
+    # records both primitive inputs, and reviews their combined result once.
     description: "点击并聚焦目标输入框/区域（target），然后输入文字（text）。默认是【追加】到光标处；若要【覆盖】原有内容（修改已有值，如把 80 改成 50），加可选参数 overwrite: true，会先清空原内容再输入新文字。优先用 DOM 定位：加可选参数 element_id（HTML id）或 target_ref（完整 ref）直接引用，走 DOM 确定性定位；都找不到时用英文 target 走视觉定位"
     kind: env
     resolve: point
@@ -145,6 +154,6 @@ actions:
 
 
 # =============================================================
-# 扩展需同时经 actions.BASIC_ACTIONS 明确登记为基础交互动作；禁止代码/文件捷径。
+# 扩展需同时经 actions.BASIC_ACTIONS 登记；CLI 仅由绑定目标机的执行器派发。
 # =============================================================
 extra_actions: {}

@@ -2,7 +2,7 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const presets = {'vllm-sr/d3-flash':'http://10.44.101.62:8007/v1/systemone', 'vllm-sr/d3':'http://10.44.101.62:8006/v1/systemone'};
+  const presets = {'vllm-sr/d3-flash':'http://114.212.10.51:8007/v1/systemone'};
   $('judge-model').addEventListener('change', () => {
     const field = $('judge-url');
     if (!field.value.trim() || Object.values(presets).includes(field.value.trim())) field.value = presets[$('judge-model').value] || '';
@@ -90,7 +90,7 @@
       payload = {config:config()};
       if (!probe) Object.assign(payload, {state:$('jev-state').value, questions:questionPayload()});
     } catch (e) { error(e.message); return; }
-    busy = true; $('jev-send').disabled = $('jev-probe').disabled = true;
+    busy = true; $('jev-send').disabled = $('jev-probe').disabled = $('jev-demo').disabled = true;
     $('jev-images').disabled = $('jev-clear').disabled = true;
     const output = document.querySelector('.jev-output'); output.classList.add('busy'); $('jev-status').textContent = 'RUNNING';
     $('jev-results').replaceChildren(); $('jev-raw-panel').hidden = true;
@@ -109,9 +109,18 @@
       error(e.message); $('jev-status').textContent = 'ERROR'; $('jev-timing').textContent = `请求结束 · ${((performance.now()-started)/1000).toFixed(2)} s`;
     } finally {
       clearInterval(timer); busy = false; output.classList.remove('busy');
-      $('jev-send').disabled = $('jev-probe').disabled = $('jev-images').disabled = $('jev-clear').disabled = false;
+      $('jev-send').disabled = $('jev-probe').disabled = $('jev-demo').disabled = $('jev-images').disabled = $('jev-clear').disabled = false;
     }
   }
   $('jev-send').addEventListener('click', () => send(false));
   $('jev-probe').addEventListener('click', () => send(true));
+  $('jev-demo').addEventListener('click', () => {
+    if (busy) return;
+    setFiles([]); $('jev-images').value = '';
+    $('jev-type').value = 'choice'; changeType();
+    $('jev-question-id').value = 'completion'; $('jev-questions').value = '';
+    $('jev-state').value = '演示样例（模拟证据）：用户要求打开 example.org 首页。当前浏览器 URL 为 https://example.org/，页面标题显示 Example Domain，页面主体包含 Example Domain。没有其它任务要求。';
+    $('jev-question').value = '根据给出的任务和可观察证据，任务目前处于什么状态？';
+    send(false);
+  });
 })();

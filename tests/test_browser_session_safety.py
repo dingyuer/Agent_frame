@@ -66,6 +66,7 @@ class FakePage:
         self.scroll_y = 0
         self.context = SimpleNamespace(new_cdp_session=lambda _: FakeCDP(self))
         self.screenshot = Mock(return_value=b"fake PNG")
+        self.bring_to_front = Mock()
 
     def evaluate(self, script, *args):
         if "cloneNode" in script:
@@ -143,6 +144,14 @@ class BrowserSessionSafetyTests(unittest.TestCase):
         result = self.session.execute_viewport_action(action(x=20, y=30), metadata)
         self.assertEqual(result["status"], "executed")
 
+    def test_pdf_viewer_visual_click_activates_tab_before_dispatch(self):
+        self.page.url = "https://export.arxiv.org/pdf/1706.03762"
+        _, _, metadata = self.observe()
+        result = self.session.execute_viewport_action(action(x=730, y=30), metadata)
+        self.assertEqual(result["status"], "executed")
+        self.page.bring_to_front.assert_called_once_with()
+        self.page.mouse.click.assert_called_once()
+
     def test_screenshot_failure_does_not_label_desktop_as_viewport(self):
         self.page.screenshot.side_effect = RuntimeError("capture failed")
         shot, snapshot, metadata = self.observe()
@@ -197,6 +206,34 @@ class BrowserSessionSafetyTests(unittest.TestCase):
         self.assertIs(self.session._pick_page(self.browser), popup)
         self.context.pages.remove(popup)
         self.assertIs(self.session._pick_page(self.browser), self.page)
+
+    def test_dispatched_click_follows_only_its_new_child_tab(self):
+        self.session._pick_page(self.browser)
+        self.session._arm_tab_follow(self.browser, self.page, 'click')
+        unrelated = FakePage('unrelated', opener_id='other-page')
+        self.context.pages.append(unrelated)
+        self.assertIs(self.session._pick_page(self.browser), self.page)
+        child = FakePage('child', opener_id='page1')
+        self.context.pages.append(child)
+        self.assertIs(self.session._pick_page(self.browser), child)
+        self.assertEqual(self.session._last_tab_follow['from_tab_id'], 'page1')
+        self.assertEqual(self.session._last_tab_follow['to_tab_id'], 'child')
+        self.context.pages.remove(child)
+        self.assertIs(self.session._pick_page(self.browser), self.page)
+
+    def test_unrelated_popup_without_click_stays_on_task_page(self):
+        self.session._pick_page(self.browser)
+        self.context.pages.append(FakePage('ad', opener_id='page1'))
+        self.assertIs(self.session._pick_page(self.browser), self.page)
+
+    def test_two_clicked_popups_are_reported_for_judge_instead_of_arbitrary_pick(self):
+        self.session._pick_page(self.browser)
+        self.session._arm_tab_follow(self.browser, self.page, 'click')
+        self.context.pages.extend([FakePage('candidate-a', opener_id='page1'),
+                                   FakePage('candidate-b', opener_id='page1')])
+        self.assertIs(self.session._pick_page(self.browser), self.page)
+        found = self.session._ambiguous_tab_follow['candidates']
+        self.assertEqual({item['tab_id'] for item in found}, {'candidate-a', 'candidate-b'})
 
     def test_reconnected_page_wrapper_uses_protocol_identity(self):
         self.observe()

@@ -345,7 +345,6 @@
   $('capture-export-zip').addEventListener('click',()=>exportData('zip'));
   $('capture-frame').addEventListener('load',()=>{state.frameReady=Boolean(state.observation?.screenshot);updateControls();});
   $('capture-frame').addEventListener('error',()=>{state.frameReady=false;updateControls();showError('浏览器截图无法显示，请刷新当前观察后继续。');});
-  document.querySelector('#topnav .brand').addEventListener('click',e=>{e.preventDefault();window.switchView('run');});
   window.CaptureStudio={async open(){
     if(state.busy||pending()||state.restored)return;state.restored=true;
     try{const data=await api('/collect/status');if(data.session_id)apply(data);}

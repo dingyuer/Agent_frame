@@ -1,4 +1,4 @@
-﻿"""可视化运行器：跑一个真实 OSWorld 任务，边跑边把模型调用推给 viz 服务器，结束后落盘轨迹。
+"""可视化运行器：跑一个真实 OSWorld 任务，边跑边把模型调用推给 viz 服务器，结束后落盘轨迹。
 
 历史轨迹目录命名：{example_id}__{run_ts}，其中 run_ts = YYYYMMDD_NNN（日期+当日序号），
 供前端历史列表区分多次运行、显示编号。traj.jsonl 写成前端 renderRunDetail 期望的格式。
@@ -34,6 +34,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     from osworld_agent.model.decision_judge import add_judge_arguments, judge_config_from_args
     add_judge_arguments(parser)
+    from osworld_agent.knowledge_selection import add_knowledge_arguments
+    add_knowledge_arguments(parser)
+    parser.add_argument('--judge-selection-policy', choices=['threshold', 'maximum_probability'],
+                        default='maximum_probability', help='Jev 标签选择：最高概率或阈值与分差')
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--examples-dir", required=True)
     parser.add_argument("--domain", default="all")
@@ -42,13 +46,13 @@ def main() -> None:
     parser.add_argument("--vm-path", default=None)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--model", default="Qwen3.6-27B")
-    parser.add_argument("--model-url", default="http://10.44.101.62:8094/v1")
+    parser.add_argument("--model-url", default="http://7.246.80.237:48888/v1")
     parser.add_argument("--model-api-key", default="EMPTY")
     parser.add_argument("--ground-model", default="UI-Venus-2-9B")
     parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
     parser.add_argument("--ground-api-key", default="EMPTY")
-    parser.add_argument("--ground-type", default="ui-venus2", choices=["ui-tars", "ui-venus2"],
-                        help="grounding 模型类型：ui-tars / ui-venus2")
+    parser.add_argument("--ground-type", default="ui-venus2", choices=["ui-tars", "ui-venus2", "qwen-plus"],
+                        help="grounding 模型类型：ui-tars / ui-venus2 / qwen-plus")
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--operation-timeout", type=float, default=300)
     parser.add_argument("--task-timeout", type=float, default=1800)
@@ -56,7 +60,10 @@ def main() -> None:
                         help="单文件下载资源上限 MiB，0 表示不限")
     parser.add_argument("--screen-width", type=int, default=1920)
     parser.add_argument("--screen-height", type=int, default=1080)
+    parser.add_argument('--mode-prompts-file', help='Studio 保存的各模式决策提示词 JSON')
     args = parser.parse_args()
+    from osworld_agent.prompt_settings import load_mode_prompts
+    mode_prompts = load_mode_prompts(args.mode_prompts_file)
 
     results_root = os.getenv("AGENTS_RESULTS_DIR",
                              os.path.join(_pkg, "viz", "runs"))
@@ -88,7 +95,12 @@ def main() -> None:
         name=args.model, url=args.model_url, api_key=args.model_api_key)))
 
     # 3) grounding（包装，记录定位）
-    if args.ground_type == "ui-venus2":
+    if args.ground_type == "qwen-plus":
+        from osworld_agent.adapters.qwen_grounding import QwenPlusGrounding
+        _ground = QwenPlusGrounding(
+            url=args.ground_url, api_key=args.ground_api_key, model=args.ground_model,
+            width=args.screen_width, height=args.screen_height)
+    elif args.ground_type == "ui-venus2":
         _ground = UIVenus2Grounding(
             url=args.ground_url, api_key=args.ground_api_key, model=args.ground_model,
             width=args.screen_width, height=args.screen_height)
@@ -106,11 +118,12 @@ def main() -> None:
         decision_model=model)
 
     # 5) 组装 + 跑
-    agent = Agent(decision_model=model, grounding=grounding, env=env,
+    agent = Agent(decision_model=model, grounding=grounding, env=env, mode_prompts=mode_prompts,
+                      knowledge_method=args.knowledge_method, knowledge_jev_url=args.knowledge_jev_url,
                   max_steps=args.max_steps, enable_reflection=False,
                   wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout,
                                "download_max_bytes": args.download_max_mib * 1024 * 1024},
-                  decision_judge=judge_config_from_args(args),
+                  decision_judge={**judge_config_from_args(args), 'selection_policy': args.judge_selection_policy},
                   completion_spec=task_config.get("completion"),
                   private_completion_spec=task_config.get("private_completion"),
                   event_path=os.path.join(results_dir, "events.jsonl"))

@@ -17,7 +17,7 @@ from test_browser_operational_feedback import pipe, bound
 from test_browser_lifecycle import session
 from test_paper_goal_binding import official_event
 from test_paper_completion import pdf_file, event
-from test_paper_resolver import TITLE, IDENTIFIER
+from test_paper_resolver import TITLE, IDENTIFIER, resolve
 from test_pipeline_completion import observation
 
 
@@ -61,6 +61,48 @@ def test_correct_download_beats_old_wrong_artifact_and_ignores_only_filename(tmp
     assert 'data.pdf' in steps[2]['goal'] and steps[2]['check_ids'] == ['check_1']
 
 
+def test_official_binding_advances_identity_without_final_download_check():
+    verifier = bound()
+    stages = compile_download_milestones([
+        {'phase': 'identify', 'goal': '核对论文身份', 'check_ids': ['check_1'],
+         'verification': [{'kind': 'text_present', 'text': 'Vaswani'}]},
+        {'phase': 'download', 'goal': '下载 PDF', 'check_ids': ['check_1'],
+         'verification': [{'kind': 'visual'}]},
+        {'phase': 'verify', 'goal': '验收文件', 'check_ids': ['check_1'], 'verification': [{'kind': 'visual'}]},
+    ], verifier.paper_goals())
+    assert stages[0]['check_ids'] == []
+    assert stages[-1]['check_ids'] == ['check_1']
+    p = pipe()
+    p.completion = verifier
+    obs = observation('https://export.arxiv.org/abs/' + IDENTIFIER)
+    state = StepState(task='核对论文身份', obs=obs, verification=verifier.evaluate())
+    report, _ = p._code_step_review(state, stages[0], {'status': 'observed'})
+    assert report['status'] == 'passed' and report['source'] == 'official_paper_binding'
+
+
+def test_observed_pdf_link_advances_after_identity_without_another_policy_action():
+    verifier = bound()
+    stages = compile_download_milestones([
+        {'phase': 'identify', 'goal': '核对论文身份', 'check_ids': ['check_1'],
+         'verification': [{'kind': 'visual'}]},
+        {'phase': 'locate_fulltext', 'goal': '找到 PDF', 'check_ids': ['check_1'],
+         'verification': [{'kind': 'visual'}]},
+        {'phase': 'download', 'goal': '下载 PDF', 'check_ids': ['check_1'],
+         'verification': [{'kind': 'visual'}]},
+    ], verifier.paper_goals())
+    obs = observation('https://export.arxiv.org/abs/' + IDENTIFIER)
+    obs.info['download_candidates'] = [{'url': 'https://export.arxiv.org/pdf/' + IDENTIFIER}]
+    p = pipe()
+    p.completion = verifier
+    state = StepState(task='下载目标论文', obs=obs, memory=StructuredMemory(),
+                      queue=ExecutionQueue({'steps': stages}), verification=verifier.evaluate())
+    p._update_plan_progress(state, Execution(kind='browser_dom', obs=obs,
+        info={'status': 'executed', 'dispatched': True}))
+    assert state.queue.current['phase'] == 'download'
+    assert [s['status'] for s in state.queue.plan['steps'][:2]] == ['done', 'done']
+    assert not p.model.calls and not p.env.actions
+
+
 def test_download_completion_advances_queue_without_visual_model(tmp_path):
     verifier, obs, right = downloads(tmp_path)
     p = pipe()
@@ -76,6 +118,31 @@ def test_download_completion_advances_queue_without_visual_model(tmp_path):
     assert right.exists() and not (tmp_path / 'data.pdf').exists()
 
 
+def test_download_without_filename_finishes_by_code_without_file_manager(tmp_path):
+    verifier = CompletionVerifier('搜索论文roboclaw并下载')
+    verifier.bind_paper('check_1', resolve().binding)
+    right = pdf_file(tmp_path / 'roboclaw.pdf', TITLE, 'Example Author', 'Abstract')
+    obs = observation('https://arxiv.org/pdf/' + IDENTIFIER)
+    obs.info['artifacts'] = [official_event(right, ident='right')]
+    verifier.observe(obs)
+    assert verifier.evaluate()['status'] == 'passed'
+    steps = compile_download_milestones([
+        {'phase': 'download', 'goal': '下载 PDF', 'verification': [{'kind': 'visual'}],
+         'check_ids': ['check_1']},
+        {'phase': 'verify', 'goal': '验收文件', 'verification': [{'kind': 'visual'}],
+         'check_ids': ['check_1']}], verifier.paper_goals())
+    p = pipe()
+    p.completion = verifier
+    p._review_visual = lambda *a, **kw: pytest.fail('File inspection must not use visual review')
+    state = StepState(task='搜索论文roboclaw并下载', obs=obs, memory=StructuredMemory(),
+                      queue=ExecutionQueue({'steps': steps}), verification=verifier.evaluate())
+    p._update_plan_progress(state, Execution(kind='browser_dom', obs=obs,
+        info={'status': 'executed', 'dispatched': True}))
+    assert state.queue.current is None
+    assert [step['status'] for step in state.queue.plan['steps']] == ['done'] * 3
+    assert not p.model.calls and not p.env.actions
+
+
 def test_late_download_event_advances_before_next_policy_call(tmp_path):
     verifier, obs, _ = downloads(tmp_path)
     p = pipe()
@@ -86,7 +153,7 @@ def test_late_download_event_advances_before_next_policy_call(tmp_path):
     assert state.queue.current['phase'] == 'rename'
     assert state.step_id == 3 and not p.model.calls and not p.env.actions
     p.build_input(state)
-    assert '将已下载论文改名为 data.pdf' in state.prompt_text
+    assert '将已核实的下载文件改名为 data.pdf' in state.prompt_text
 
 
 def test_wrong_or_deleted_artifact_never_completes_download(tmp_path):

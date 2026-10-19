@@ -2,7 +2,7 @@
 :root {
   --motion-fast: 160ms;
   --motion-normal: 280ms;
-  --motion-enter: 420ms;
+  --motion-enter: 480ms;
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --ease-slide: cubic-bezier(.25, .8, .25, 1);
   --border: #dfe8e2;
@@ -79,7 +79,7 @@ body {
   border: 1px solid #cfdfd0;
   background: linear-gradient(105deg, #dcece1, #edf5e9);
   box-shadow: 0 3px 8px #245a3b08, inset 0 1px 0 #ffffffbd;
-  transition: transform 360ms var(--ease-slide), width var(--motion-normal), height var(--motion-normal);
+  transition: transform 440ms var(--ease-out), width var(--motion-normal), height var(--motion-normal);
 }
 .nav-active-indicator::before {
   content: '';
@@ -245,16 +245,16 @@ select { cursor: pointer; border-radius: 8px; }
 .review-evidence small { display: block; color: #68806d; line-height: 1.8; }
 
 /* Short entrances; visible content never waits behind a long stagger. */
-[id^="view-"].active > .scroll { animation: studio-view-in 320ms var(--ease-out); }
+[id^="view-"].active { animation: studio-view-in 460ms var(--ease-out); }
 #view-run.active .task-panel { animation: studio-card-in var(--motion-enter) 30ms both var(--ease-out); }
 #view-run.active .model-panel { animation: studio-card-in var(--motion-enter) 80ms both var(--ease-out); }
 #view-run.active .advanced-settings { animation: studio-card-in var(--motion-enter) 120ms both var(--ease-out); }
 .task-section > .card, .run-item, .capture-step { animation: studio-card-in 240ms var(--ease-out); }
 .queue-doing span { position: relative; padding-left: 10px; }
 .queue-doing span::before { content: ''; position: absolute; left: 0; top: .5em; width: 4px; height: 4px; border-radius: 50%; background: #53896a; }
-@keyframes studio-view-in { from { opacity: .5; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-@keyframes studio-card-in { from { opacity: .35; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-@keyframes studio-panel-in { from { opacity: .45; transform: translateX(5px); } to { opacity: 1; transform: none; } }
+@keyframes studio-view-in { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: none; } }
+@keyframes studio-card-in { from { opacity: .1; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+@keyframes studio-panel-in { from { opacity: .15; transform: translateX(12px); } to { opacity: 1; transform: none; } }
 @keyframes studio-sheen { to { transform: translateX(110%); } }
 @media (hover: hover) and (pointer: fine) {
   .studio-btn:not(:disabled):hover, .run-btn:not(:disabled):hover { transform: translateY(-1px); }
@@ -274,3 +274,12 @@ select { cursor: pointer; border-radius: 8px; }
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
   select::picker(select), details::details-content { transition: none !important; }
 }
+
+/* Inline destructive confirmation, animated without rebuilding the list. */
+.run-delete-confirm{display:inline-flex;align-items:center;gap:7px;margin-left:10px;padding:5px 7px;background:#fff5f3;border:1px solid #f1d5cf;border-radius:8px;overflow:hidden;white-space:nowrap;transform-origin:right center;flex-shrink:0}
+.run-delete-confirm>span{font-size:12px;color:#ad4238;font-weight:500}
+.run-delete-confirm button{font-family:inherit;font-size:12px;line-height:1.5;border-radius:5px;padding:3px 10px;cursor:pointer;white-space:nowrap}
+.run-delete-confirm .run-del-yes{background:#c84a40;color:#fff;border:1px solid #c84a40}
+.run-delete-confirm .run-del-yes:hover{background:#b53c33}
+.run-delete-confirm .run-del-no{background:#fff;color:#596574;border:1px solid #e4dcd9}
+.run-delete-confirm button:disabled{cursor:wait;opacity:.6}

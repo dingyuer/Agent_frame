@@ -33,6 +33,7 @@ def main() -> None:
         wait_config=cfg.agent.wait_config,
         progress_config=cfg.agent.progress_config,
         decision_judge=cfg.agent.decision_judge,
+        knowledge_method=cfg.agent.knowledge_method, knowledge_jev_url=cfg.agent.knowledge_jev_url,
         completion_spec=cfg.completion,
         context_config=cfg.context,
         private_completion_spec=cfg.private_completion,

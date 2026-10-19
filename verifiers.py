@@ -61,7 +61,7 @@ def _normalize_spec(spec):
         "text_present": {"url", "text"},
         "unresolved_requirement": {"text"},
         "download": {"url", "filename", "sha256", "min_bytes", "bind_to"},
-        "paper_download": {"title", "query", "filename", "count", "format", "author", "year", "doi", "arxiv_id", "url", "min_bytes", "sha256", "bind_to"},
+        "paper_download": {"title", "query", "filename", "count", "format", "author", "year", "doi", "arxiv_id", "url", "min_bytes", "sha256", "bind_to", "workspace"},
     }
     checks, ids = [], set()
     for index, raw in enumerate(spec["checks"]):
@@ -115,6 +115,8 @@ def _normalize_spec(spec):
                     raise ValueError("sha256 must contain 64 hexadecimal characters")
                 check["sha256"] = check["sha256"].lower()
             if kind == "paper_download":
+                if "workspace" in check and check["workspace"] != "default":
+                    raise ValueError("paper workspace must be the selected default folder")
                 if "title" not in check and "query" not in check:
                     raise ValueError("paper_download requires title or query")
                 for field in ("title", "query"):
@@ -198,6 +200,12 @@ def _title_key(text):
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
+def _title_key_compact(text):
+    # 去掉所有空白，容忍 PDF 文本提取时词间空格丢失（如 UNIFYINGSTATIC3DANDDYNAMIC）。
+    # 只作为精确匹配失败后的兜底，不替代上面的词边界安全版。
+    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
 def _parse_pdf(path, evidence):
     """Parse downloaded bytes, never filenames or executor/model identity claims."""
     if evidence.get("bytes", 0) > 100 * 1024 * 1024:
@@ -250,6 +258,7 @@ def _paper_identity(check, parsed):
     if not lines:
         return {"status": "unknown", "reason": "PDF has no extractable first-page text for paper identity"}
     expected = _title_key(check["title"])
+    expected_compact = _title_key_compact(check["title"])
     heading = None
     # Exact, complete heading lines near the start of the actual PDF. A title
     # mentioned in its abstract/references, metadata, or filename is insufficient.
@@ -260,10 +269,11 @@ def _paper_identity(check, parsed):
         for end in range(start, min(start + 6, len(lines))):
             joined = (joined + " " + lines[end]).strip()
             key = _title_key(joined)
-            if key == expected:
+            key_compact = _title_key_compact(joined)
+            if key == expected or key_compact == expected_compact:
                 heading = {"title": " ".join(lines[start:end + 1]), "line": start + 1}
                 break
-            if len(key) > len(expected):
+            if len(key_compact) > len(expected_compact):
                 break
         if heading:
             break
@@ -358,6 +368,7 @@ class CompletionVerifier:
         self._bindings = {}
         self._inferred = spec is None
         self._legacy_download_sequence = 0
+        self._workspace_dir = None
 
     @property
     def bindings(self):
@@ -382,6 +393,52 @@ class CompletionVerifier:
         checks = [{k: copy.deepcopy(v) for k, v in c.items() if k != 'filename'}
                   for c in self._public_spec['checks'] if c['kind'] in {'download', 'paper_download'}]
         return list(self._download_checks(checks).values())
+
+    def download_facts(self):
+        """Recheck durable browser-download receipts, independently of task goals.
+
+        Closing a popup, observing another page or replanning cannot erase a
+        completed transfer. Conversely, a receipt is never a latched success:
+        every call rereads its file and compares it with the original browser
+        receipt. These facts establish transport/integrity only, not that the
+        downloaded content satisfies the user's whole task.
+        """
+        facts = []
+        for path, record in self._artifacts.items():
+            if not record.get('browser_receipt'):
+                continue
+            current, initial = _read_artifact(path), record['initial']
+            status, reason = current['status'], current['reason']
+            if record.get('migration_error'):
+                status, reason = 'failed', record['migration_error']
+            elif status == 'passed':
+                if initial['status'] != 'passed':
+                    status, reason = 'failed', 'file was not verified at the successful download event'
+                elif (current['identity'], current['bytes'], current['sha256']) != (
+                        initial['identity'], initial['bytes'], initial['sha256']):
+                    status, reason = 'failed', 'file has changed since the successful download event'
+                elif current['bytes'] <= 0:
+                    status, reason = 'failed', 'downloaded file is empty'
+                else:
+                    reason = 'browser download completed; current local file matches its original receipt'
+            fact = {'artifact_id': record['artifact_id'], 'path': path,
+                'version': record.get('version', 1), 'transport': 'browser',
+                'completed': True, 'urls': sorted(record['urls']),
+                'source_urls': sorted(record['source_urls']),
+                'bytes': current.get('bytes'), 'sha256': current.get('sha256'),
+                'file_identity': list(current['identity']) if current.get('identity') else None,
+                'status': status, 'reason': reason}
+            if status == 'passed':
+                from .artifact_download import inspect_download_format
+                fact.update(inspect_download_format(path))
+            facts.append(fact)
+        return facts
+
+    @staticmethod
+    def _download_format(path):
+        """Identify common saved-byte containers without trusting a filename."""
+        from .artifact_download import inspect_download_format
+        return inspect_download_format(path).get('format')
 
     def download_transfers(self, consumed=()):
         """Transport facts only; content, identity and final names are separate.
@@ -429,10 +486,15 @@ class CompletionVerifier:
         if not check or check['kind'] != 'paper_download':
             raise ValueError('Unknown public paper goal')
         query = check.get('query') or check.get('title')
-        if _title_key(binding.query) != _title_key(query) or not query_matches_title(query, binding.full_title):
-            raise ValueError('Official identity does not satisfy the original user query')
-        # Explicit title contracts remain exact; inferred short names may be
-        # expanded only by the adapter's complete leading-alias match.
+        if _title_key(binding.query) != _title_key(query):
+            raise ValueError('Paper selection refers to a different original user query')
+        if (binding.selection.get('method') != 'model_semantic'
+                or binding.selection.get('status') != 'matched'
+                or binding.selection.get('selected_id') != binding.canonical_id
+                or binding.selection.get('metadata_hash') != binding.evidence_hash):
+            raise ValueError('Paper identity requires model selection tied to official metadata')
+        # An explicit machine-supplied exact-title contract is still a real
+        # constraint. Natural-language queries are selected semantically.
         if 'title' in check and not self._inferred and _title_key(check['title']) != _title_key(binding.full_title):
             raise ValueError('Binding cannot relax an explicit full-title contract')
         if 'author' in check:
@@ -558,6 +620,19 @@ class CompletionVerifier:
         self._artifacts[path] = {'urls': resources, 'source_urls': sources, 'path': path,
             'initial': evidence, 'download_id': identifier, 'artifact_id': identifier,
             'version': event.get('version', 1), 'rename_history': copy.deepcopy(history)}
+        # Legacy artifact checks retain their existing compatibility behavior.
+        # The public durable-facts channel is stricter: only an actual completed
+        # browser receipt with a matching original file baseline enters it.
+        identity = event.get('file_identity')
+        if (event.get('transport') == 'browser' and event.get('completed') is True
+                and (event.get('artifact_id') or event.get('download_id'))
+                and evidence.get('status') == 'passed' and evidence.get('bytes', 0) > 0
+                and type(event.get('bytes')) is int and event['bytes'] == evidence['bytes']
+                and event.get('sha256') == evidence.get('sha256')
+                and isinstance(identity, (list, tuple)) and len(identity) == 2
+                and all(type(value) is int for value in identity)
+                and tuple(identity) == evidence.get('identity')):
+            self._artifacts[path]['browser_receipt'] = True
         self._artifact_ids[identifier] = path
 
     def observe(self, observation, execution_info=None):
@@ -572,6 +647,11 @@ class CompletionVerifier:
         observed_info = (observation.get("info", {}) if isinstance(observation, dict)
                          else getattr(observation, "info", {}))
         observed_info = observed_info if isinstance(observed_info, dict) else {}
+        initial_state = observed_info.get('initial_state') or {}
+        if isinstance(initial_state, dict) and isinstance(initial_state.get('workspace_dir'), str):
+            directory = Path(initial_state['workspace_dir']).expanduser()
+            if directory.is_absolute():
+                self._workspace_dir = str(directory.resolve())
         # Browser downloads often finish after click() returns. Their completion
         # can arrive only in a later observation, including request_finish's fresh
         # observation; always consume both channels.
@@ -704,6 +784,10 @@ class CompletionVerifier:
                         status, reason = "failed", "file has changed since the successful download event"
                     elif evidence["bytes"] < check["min_bytes"]:
                         status, reason = "failed", "downloaded file is smaller than min_bytes"
+                    elif check.get('workspace') == 'default' and self._workspace_dir is None:
+                        status, reason = 'unknown', 'default project folder is not established by the environment'
+                    elif check.get('workspace') == 'default' and str(Path(path).parent) != self._workspace_dir:
+                        status, reason = 'failed', 'downloaded file is outside the default project folder'
                     elif "filename" in check and Path(path).name != check["filename"]:
                         status, reason = "failed", "downloaded filename does not match"
                     elif "sha256" in check and evidence["sha256"] != check["sha256"]:

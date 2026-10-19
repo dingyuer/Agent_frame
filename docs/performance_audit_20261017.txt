@@ -1,0 +1,113 @@
+2026-10-17 performance audit and bounded input/submit
+
+Scope: current framework; Qwen 3.7 flash decisions, Jev d3-flash at the configured
+remote endpoint. Keep screenshots, action-transition four questions, independent
+semantic review, download receipts, file integrity and fresh final verification.
+
+Implemented
+
+1. A DOM type may explicitly request submit_key="Enter", with overwrite=true and
+   a current target_ref/element_id. Only single-line text/search inputs qualify.
+   After clearing and inserting, recheck document binding, connected target,
+   focus, editable state, exact input value and aria-expanded suggestions. Send Enter once, then use normal
+   browser settling, code review and all four Jev transition questions.
+   Do not apply to all input, textarea, passwords, GUI fallback or arbitrary
+   action batches. Ordinary type remains unchanged. Combined effects cannot
+   pass merely because the textbox value changed.
+   One policy decision, two primitives: execution_info.compound_action.primitives
+   retains partial execution, key dispatch and timings. Model output is exact.
+
+2. Explicit next_action="request_finish" with an existing summary/answer is
+   normalized to a finish request. No click/key parameters are inferred.
+   Original response and parser_normalization/parsed_action remain in the trace.
+   Finish still requires all original verification. Default positive SFT export
+   excludes the malformed shorthand; RL preserves raw tokens and normalization
+   metadata. The two previous malformed finishes no longer need a full repair
+   generation. Their original repair-path requests cost about 1.4-1.7 seconds;
+   this is avoided work on that error path, not an unconditional episode gain.
+
+3. Jev semantic review encodes each frame once per call and uses those exact
+   bytes for both the request and evidence hashes. No cross-observation cache,
+   downscaling, question removal or changed screenshot content. The review card
+   includes preparation/hash time; System One request timing remains separate.
+   Raw judgments now record prepare/request/decode timing and input sizes.
+   HTTP request time includes transport/server queue/inference; it is not a GPU
+   inference measurement.
+
+4. Fetch up to four already-observed official paper metadata URLs concurrently.
+   Keep the shared deadline, per-request limit, deterministic candidate order,
+   all-candidates requirement and subsequent single semantic selection. Partial
+   fetch failure never establishes uniqueness. No parallel model calls or direct
+   file download added. Injected fetchers must honor their timeout and support
+   concurrent reads; executor shutdown joins workers.
+
+5. Permanent HTTP 4xx model errors stop without identical retries/backoff.
+   Explicit unsupported response_format/extra_body options can be adjusted and
+   retried immediately. Transient network/408/409/429/5xx backoff remains.
+   Removed one duplicate planner source-policy paragraph, retaining the original
+   policy and environment-specific constraints.
+
+Validation and evidence
+
+- Latest targeted suite: 199 passed; trajectory/collection export suite: 46
+  passed; real Chromium interaction suite: 17 passed, then the final combined
+  input suite (including expanded suggestions) passed all 8 cases. Earlier broader targeted
+  runs: 196 and 127 passed (overlapping suites; do not add counts).
+- Full original suite was not rerun for this audit. Previous baseline failures
+  unrelated to these changes are not claimed fixed.
+- Real Qwen/Jev/CDP paper-download profiling run:
+  local_runs/live_paper_20261017_131237_audit_1, success, 2 decisions, 20.725 s
+  Pipeline time, 22.053 s harness process time. Planning 4.714 s, decisions
+  4.404 s, step-review phases 4.801 s, final semantic review 0.884 s, final
+  revalidation 0.320 s. Phase timers overlap/nest; do not sum all phases.
+  This run used cProfile and preceded the combined search change. It is not
+  evidence of a stable end-to-end speedup.
+- Controlled local search page, real Qwen/Jev/CDP:
+  local_runs/live_paper_20261017_131659_type_submit_live failed in 4 decisions:
+  model put CSS #query into target_ref. Preserve this failed run in the report.
+  Clarified first-column ref versus #id, and fixed the combined-action guard so
+  it preserves the original stale-reference recovery message.
+  local_runs/live_paper_20261017_131801_type_submit_live_2 then succeeded in one
+  decision: type roboclaw + Enter, one /search request, 6.663 s Pipeline time.
+  One four-question Jev call and final semantic verification were retained.
+  This is a controlled functionality test, not an A/B task speed comparison.
+- Isolated before/after benchmark, ../.runtime/latency-audit-benchmark.json:
+  Four metadata requests, each with injected 150 ms latency: 602.54 -> 153.78 ms.
+  Same uncertain selection result; no candidate skipped. Not live arXiv timing.
+  Whole-task review, same 3812x1898 screenshot, mocked System One, median of five
+  measured repetitions after warmup: 902.93 -> 301.70 ms. Measures local evidence
+  preparation/encoding only; not Jev inference or task latency.
+
+Remaining opportunities, intentionally not weakened here
+
+- BrowserSession._settle still waits networkidle (up to 4 s), followed by screen
+  stability (up to 2 s). Polling sites/animations can consume these budgets.
+  Replace with action-specific readiness only after delayed navigation, loading
+  overlays, PDF rendering, persistent requests and tab changes are tested. Simply
+  reducing sleep can recreate blank-frame and premature-keypress failures.
+- Jev four questions share an HTTP request, but the supplied server protocol
+  describes per-question forwards. Client threading cannot accelerate a serial
+  service. Server-side batching/shared image-prefix work needs server profiling;
+  no unmeasured inference-speed claim is made.
+- Transition next_mode describes the reviewed goal; pre-decision mode selection
+  describes the actual current queue goal. Do not delete/reuse across changed
+  goals. A common request would require equivalent evidence and explicit goal
+  scope, not substituting one question for another.
+- Initial planner remains dependent on initial page/workspace/source evidence.
+  Existing client initialization/task classification already overlap browser
+  setup. Speculative planning before observation would need a repair pass and can
+  waste more time than it saves. Output length and provider queue variance still
+  dominate the short paper task.
+- Profile shows image encoding, deep copies and durable event externalization
+  have measurable overhead (roughly sub-second per short run on this host).
+  Larger traces may benefit from immutable evidence objects/content-addressed
+  serialization. Do not drop crash-safe event writes or cache mutable evidence
+  globally just to reduce these numbers.
+- Files are reread multiple times for durable evidence. In the profiled 2.2 MB
+  download, 14 integrity reads took about 25 ms: not the main bottleneck. Sharing
+  a scoped verification snapshot is a future option; final revalidation must
+  still detect deletion/change during model review and observation callbacks.
+
+The Linux headless harness does not measure Windows desktop startup, dual-screen
+capture or application activation. Model deployments and public-network latency
+vary. Compare equivalent tasks with repeated runs before asserting overall gain.

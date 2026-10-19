@@ -1,0 +1,12 @@
+# 用户维护的领域知识。可直接编辑，也可在前端「知识库」中维护。
+# aliases 写任务中习惯使用的称呼；keywords 至少命中两个才单独召回。
+# 示例默认停用；请替换网址和内容后启用。不要存放密码或登录令牌。
+version: 1
+entries:
+  - id: campus-example
+    title: 校园官网
+    aliases: [学校官网, 校内门户]
+    keywords: [校园, 通知公告]
+    url: https://campus.example.org
+    content: 请替换为实际校园网址。可以填写通知公告入口、校内系统名称和访问前提。
+    enabled: false

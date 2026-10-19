@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+from ..model.grounding_usage import completion
+
 import re
 from typing import Optional
 
@@ -63,6 +65,7 @@ class RealUItarsGrounding(Grounding):
         return self._client
 
     def locate(self, screenshot, target: str):
+        self.last_calls = []
         from ..model.decision_model import encode_image
         import os
         if isinstance(screenshot, os.PathLike):
@@ -85,7 +88,7 @@ class RealUItarsGrounding(Grounding):
         last_err = None
         for attempt in range(3):
             try:
-                resp = self._get_client().chat.completions.create(
+                resp = completion(self,
                     model=self.model, messages=messages, max_tokens=128)
                 out = (resp.choices[0].message.content or "").strip()
                 point = _extract_coords(out)

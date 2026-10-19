@@ -1,0 +1,36 @@
+Mac 连接命令（在 Mac 终端执行）
+
+将最新版项目复制到 Mac，进入包含 mac_connect.command 的框架目录：
+
+    bash mac_connect.command
+
+按提示填写你平时连接当前 Linux 服务器的 SSH 地址，如 chenyuning@服务器IP。
+不要填写 Mac 自己的 IP。此处无法确定服务器对你 Mac 可达的 IP，所以不预填。
+也可一次指定：
+
+    bash mac_connect.command chenyuning@服务器IP
+
+脚本检查 Mac 的框架是否已启动；未启动时使用项目的 .venv-mac 或 .venv 启动。
+项目目录可以叫 framework，不必手动改名。Python 环境须预先装好 requirements-mac.txt。
+如果没有环境，可在框架目录先执行（需要已安装 Python 3.12）：
+
+    python3.12 -m venv .venv-mac
+    .venv-mac/bin/python -m pip install -r requirements-mac.txt
+
+本机 .env 配置模型密钥；决策/定位仍用 Qwen，Jev 地址在前端填原来的 51 服务。
+还需要已安装 Google Chrome。浏览器 CDP 无需屏幕录制权限；桌面截图/操作需要
+系统设置中的“屏幕录制”和“辅助功能”权限。
+
+自定义环境/端口示例：
+
+    MAC_PYTHON=/绝对路径/python MAC_STUDIO_PORT=8090 MAC_SSH_PORT=22 bash mac_connect.command
+
+若默认 8088 被 Linux 转发或其他服务占用，脚本会保留它，自动选用 8090–8099 的空闲端口启动 Mac 框架。
+若显式指定 MAC_STUDIO_PORT 且已被其他服务占用，则停止并提示换端口。
+需要 Mac 上有完整项目和 Python 环境，单独复制此脚本不能把 Linux 项目变成本地 Mac 服务。
+若远端 18088 端口被占用，可指定 MAC_TUNNEL_PORT=18089，并告知助手实际端口。
+连接成功后告诉助手“Mac 隧道已连接”。服务器通过 http://127.0.0.1:18088
+访问 Mac 框架；/runtime/info 应返回 platform=darwin，再开始真实任务。
+SSH 仅转发框架服务，不开放 Mac 的终端登录。隧道使服务器本机用户能访问 Mac
+的任务接口，应只连接你信任的服务器。按 Ctrl+C 即关闭隧道，不会删除文件。
+如果 SSH 报 forwarding disabled，需要服务器允许 TCP 转发；脚本不会修改 SSH 配置。

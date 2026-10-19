@@ -1,15 +1,13 @@
-"""共享的、有界的「观察 → prompt」编译器（浏览器和桌面共用）。
-
-解决「上下文受得了吗」：不是把整棵 AX-Tree 塞进 prompt，而是：
-- 用 tokenizer（或 UTF-8 字节保守估算）精确计数；
-- 对结构观察（browser AX snapshot）按相关性排序选节点，预算内保留祖先链；
-- 分层预算：memory / auxiliary（工具结果）/ structure（页面结构）各占一份，超预算抛异常。
-"""
+"""Bounded observation compiler: complete browser controls, compact result rows, and selected context."""
 from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from .config import ContextConfig
+from .browser_results import paper_result_cards
+from .paper_resolver import query_matches_title
+from .scholar_search import is_scholar, scholar_result_cards
 
 
 class ContextBudgetError(ValueError):
@@ -21,7 +19,7 @@ class ObservationIncompleteError(ValueError):
 
 
 class PromptCompiler:
-    version = "2.1"
+    version = "2.2"
 
     def __init__(self, config=None):
         self.config = config or ContextConfig()
@@ -51,7 +49,7 @@ class PromptCompiler:
                 hi = mid - 1
         return text[:lo] + marker if self.count(marker) <= budget else ""
 
-    def structure(self, blocks, query, budget):
+    def structure(self, blocks, query, budget, paper_query=""):
         """Select complete nodes, retain ancestry and original reading order."""
         sections, exposed, metadata = [], [], []
         query_terms = set(re.findall(r"[\w\u4e00-\u9fff]+", query.lower()))
@@ -67,11 +65,32 @@ class PromptCompiler:
                 ensure_ascii=False, separators=(",", ":"))
             nodes = block.get("nodes", [])
             by_ref = {n["ref"]: n for n in nodes}
+            children = {}
+            for node in nodes:
+                children.setdefault(node.get("parent"), []).append(node)
+
+            def select_options(node):
+                # Native select options are usually behind an AX MenuListPopup.
+                # Include their labels with the control so a compact observation
+                # still contains the exact operand required by select().
+                pending = list(children.get(node["ref"], ()))
+                labels = []
+                while pending and len(labels) < 30:
+                    child = pending.pop(0)
+                    if child.get("role") == "option" and child.get("name"):
+                        labels.append(str(child["name"])[:120])
+                    else:
+                        pending.extend(children.get(child["ref"], ()))
+                return labels
 
             def line(n):
                 out = {k: n[k] for k in ("ref", "parent", "role", "name", "value", "states",
                                         "id", "href", "tag", "in_viewport", "direct", "modal_context") if k in n}
                 out = {k: v for k, v in out.items() if v not in (None, "", {}) and not (k == "direct" and not v)}
+                if n.get("tag") == "select":
+                    options = select_options(n)
+                    if options:
+                        out["options"] = options
                 return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
 
             def rank(n):
@@ -79,34 +98,149 @@ class PromptCompiler:
                 relevance = sum(1 for term in query_terms if term in text)
                 parent = by_ref.get(n.get("parent"), {})
                 important = n.get("role") in ("alert", "dialog", "status") or parent.get("role") in ("alert", "dialog", "status")
-                return (min(relevance, 3) * 8 + 8 * bool(n.get("states", {}).get("focused"))
+                navigation_control = (n.get("direct") and n.get("role") in ("button", "link", "textbox", "combobox")
+                                      and n.get("name", "").strip().lower() in {"search", "search term or terms", "sort results by", "next", "go"})
+                visible_input = (n.get("direct") and n.get("in_viewport")
+                                 and n.get("role", "").lower() in {"textbox", "searchbox", "combobox"})
+                return (min(relevance, 3) * 8 + 160 * bool(n.get("states", {}).get("focused"))
                         + 60 * important
                         + 1000 * bool(n.get("modal_context"))
+                        + 80 * bool(navigation_control)
+                        + 100 * bool(visible_input)
                         + 6 * (n.get("role") in ("alert", "dialog", "status", "heading"))
                         + 30 * bool(n.get("direct")) + 3 * bool(n.get("in_viewport")))
 
             chosen = set()
             used = self.count(header) + 32
             if used > remaining:
+                if any(node.get('direct') for node in nodes):
+                    raise ObservationIncompleteError('AX 快照头部超出结构预算；停止决策而不隐藏节点')
                 metadata.append({"snapshot_id": block.get("snapshot_id"), "total": len(nodes), "selected": 0})
                 continue
+            cards = paper_result_cards(block) if paper_query else []
+            source = 'arxiv'
+            if paper_query and not cards and is_scholar(block.get('url', '')):
+                source = 'google_scholar'
+                cards = [{'position': i, 'title': item['title'], 'abs_ref': item['ref'],
+                          'abs_url': item['href'],
+                          'pdf_ref': item['pdf_links'][0]['ref'] if item['pdf_links'] else None}
+                         for i, item in enumerate(scholar_result_cards(block), 1)]
+            card_lines, card_refs = [], set()
+            if cards:
+                key = ' '.join(unicodedata.normalize('NFKC', paper_query).casefold().split())
+                def compact_href(href):
+                    origin = block.get('url', '').split('/search/', 1)[0]
+                    return href[len(origin):] if origin and href.startswith(origin + '/') else href
+                card_rows = []
+                for card in cards:
+                    card_rows.append(json.dumps([card['position'], card['title'], card['abs_ref'],
+                        compact_href(card['abs_url']), card['pdf_ref']], ensure_ascii=False,
+                        separators=(",", ":")))
+                    card_refs.add(card['abs_ref'])
+                    if card['pdf_ref']:
+                        card_refs.add(card['pdf_ref'])
+                matches = [{'position': card['position'],
+                            'match_kind': 'full_title' if ' '.join(unicodedata.normalize(
+                                'NFKC', card['title']).casefold().split()) == key else 'leading_alias'}
+                           for card in cards if query_matches_title(paper_query, card['title'])]
+                # Preserve the legacy field while using the same complete-title /
+                # colon-leading-alias rule as official identity resolution.
+                exact_positions = [match['position'] for match in matches]
+                summary = json.dumps({"kind": "paper_results", "query_title": paper_query,
+                                      "columns": ["rank", "title", "abs_ref", "abs_href", "pdf_ref"] if source == 'arxiv' else
+                                                 ["rank", "title", "result_ref", "href", "pdf_ref"],
+                                      "total": len(cards), "shown": len(card_rows), "omitted": 0,
+                                      "exact_title_positions": exact_positions,
+                                      "title_matches": matches, "source": source,
+                                      "match_rule": "complete_title_or_leading_alias",
+                                      "identity_verified": False},
+                                     ensure_ascii=False, separators=(",", ":"))
+                cost = self.count(summary) + sum(self.count(row) + 1 for row in card_rows)
+                if cost <= remaining - used:
+                    card_lines = [summary, *card_rows]
+                    used += cost
+                else:
+                    card_refs.clear()
+            indexed_lines, indexed_refs = [], set()
+            direct = [n for n in nodes if n.get('direct') and n.get('ref') not in card_refs]
+            role_code = {'link': 'L', 'button': 'B', 'textbox': 'T', 'searchbox': 'T',
+                         'combobox': 'C', 'checkbox': 'X', 'radio': 'R', 'option': 'O'}
+            prefix = json.dumps({'kind': 'interactive_index',
+                                 'format': 'ref|role|name|href_or_id|value',
+                                 'roles': role_code, 'total': len(direct),
+                                 'note': '每行一个可操作 AX 节点；作者搜索 href 省略但保留在原始快照中，ref 可直接操作'},
+                                ensure_ascii=False, separators=(',', ':'))
+            def compact_index(node, width):
+                href = str(node.get('href') or '')
+                if 'searchtype=author' in href:
+                    href = ''  # Name and ref suffice; the raw AX still retains its URL.
+                elif href.startswith('https://arxiv.org/'):
+                    href = href[len('https://arxiv.org'):]
+                elif href.startswith('https://www.arxiv.org/'):
+                    href = href[len('https://www.arxiv.org'):]
+                row = [str(node['ref']), role_code.get(node.get('role'), '?'),
+                       str(node.get('name') or '')[:width]]
+                if href or node.get('id') or node.get('value'):
+                    row.append((href or ('#' + str(node['id']) if node.get('id') else ''))[:width])
+                if node.get('value'):
+                    row.append(str(node['value'])[:width])
+                if node.get('tag') == 'select':
+                    options = select_options(node)
+                    if options:
+                        row.append('options=' + ';'.join(options)[:width * 2])
+                if (node.get('states') or {}).get('focused'):
+                    row.append('focused')
+                return '|'.join(str(part).replace('\\', '\\\\').replace('|', '\\|')
+                                .replace('\n', ' ').replace('\r', ' ') for part in row)
+
+            # Keep every direct ref before spending a byte on descriptive containers.
+            # Shorten labels uniformly if the page is unusually large; never silently
+            # drop the tail of the interaction list because of viewport or rank.
+            prefix_cost = self.count(prefix) + 1
+            index_rows = []
+            # Very dense search pages can expose hundreds of author links.
+            # Keep every actionable ref even when the fixed structure slice is
+            # tight; result-card titles above retain the full paper identity.
+            for width in (240, 160, 100, 64, 32, 24, 16, 8):
+                rows = [compact_index(node, width) for node in direct]
+                if used + prefix_cost + sum(self.count(row) + 1 for row in rows) <= remaining:
+                    index_rows = rows
+                    break
+            if direct and not index_rows:
+                raise ObservationIncompleteError(
+                    f"当前 AX 有 {len(direct) + len(card_refs)} 个可操作节点，完整索引超出结构预算；停止决策而不隐藏节点")
+            if direct:
+                indexed_lines = [prefix, *index_rows]
+                indexed_refs = {node['ref'] for node in direct}
+                used += prefix_cost + sum(self.count(row) + 1 for row in index_rows)
+            # Containers and static prose help orientation, but must not spend
+            # the budget needed for the next step's memory. The complete
+            # interactive index and all compact result rows above take priority.
+            extra_limit = used + min(1200, max(0, remaining - used))
             for node in sorted(nodes, key=rank, reverse=True):
+                if node.get('ref') in indexed_refs or node.get('ref') in card_refs:
+                    continue
                 needed, current, visited = [], node, set()
                 while current and current["ref"] not in chosen and current["ref"] not in visited:
                     visited.add(current["ref"])
                     needed.append(current)
                     current = by_ref.get(current.get("parent"))
                 cost = sum(self.count(line(n)) + 1 for n in needed)
-                if used + cost <= remaining:
+                if used + cost <= extra_limit:
                     chosen.update(n["ref"] for n in needed)
                     used += cost
             selected = [n for n in nodes if n["ref"] in chosen]
-            rendered = header + "\n" + "\n".join(line(n) for n in selected)
+            rendered = header + "\n" + "\n".join([*card_lines, *indexed_lines, *(line(n) for n in selected)])
             sections.append(rendered)
             remaining -= self.count(rendered)
-            exposed.extend(chosen)
+            exposed.extend(chosen | card_refs | indexed_refs)
             metadata.append({"snapshot_id": block.get("snapshot_id"), "total": len(nodes),
-                             "selected": len(selected), "omitted": len(nodes) - len(selected)})
+                             "selected": len(selected), "omitted": len(nodes) - len(selected),
+                             "interactive_total": len(direct) + len(card_refs),
+                             "interactive_shown": len(indexed_refs) + len(card_refs),
+                             "interactive_omitted": len(direct) - len(indexed_refs),
+                             "paper_results_total": len(cards),
+                             "paper_results_shown": len(card_lines) - 1 if card_lines else 0})
         return "\n".join(sections), exposed, metadata
 
     def recent_lines(self, text, budget):
@@ -150,13 +284,21 @@ class PromptCompiler:
         available = limit - fixed - len(images) * cfg.image_tokens - 1280  # reserve one bounded format retry
         if available < 0:
             raise ContextBudgetError("任务、计划和当前截图超过输入预算；保留必需输入，停止本轮决策")
+        from .task_specs import infer_paper_spec
+        inferred = infer_paper_spec(task) or {}
+        paper_goals = [check for check in inferred.get('checks', []) if check.get('kind') == 'paper_download']
+        paper_query = str(paper_goals[0].get('query') or paper_goals[0].get('title') or '') if len(paper_goals) == 1 else ''
+        # The AX index is lossless for every actionable ref. Allocate it before
+        # optional memory/tool text so a dense search page does not turn into a
+        # false "screenshot unavailable" failure after a successful capture.
+        structure, refs, selection = self.structure(blocks, task + " " + focus + " " + memory[-600:],
+                                                    min(cfg.structure_tokens, available), paper_query=paper_query)
+        available -= self.count(structure)
         memory_budget = min(cfg.memory_tokens, available // 3)
         mem = self.recent_lines(memory, memory_budget) if recent_memory else self.clip(memory, memory_budget)
         available -= self.count(mem)
         aux = self.clip(auxiliary, min(cfg.auxiliary_tokens, available // 4))
         available -= self.count(aux)
-        structure, refs, selection = self.structure(blocks, task + " " + focus + " " + mem[-600:],
-                                                    min(cfg.structure_tokens, available))
         user = base
         if mem:
             user += f"\n\n## {memory_title}\n{mem}"

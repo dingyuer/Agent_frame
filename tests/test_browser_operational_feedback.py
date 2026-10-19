@@ -7,7 +7,8 @@ import pytest
 from PIL import Image, ImageDraw
 
 from osworld_agent.actions import Action
-from osworld_agent.browser_feedback import active_paper, operational_facts, paper_action_error, same_paper
+from osworld_agent.browser_feedback import (active_paper, operational_facts, paper_action_error,
+                                           paper_download_preflight_error, same_paper)
 from osworld_agent.browser_session import BrowserOptions, BrowserSession
 from osworld_agent.env import Observation
 from osworld_agent.memory import StructuredMemory
@@ -77,6 +78,29 @@ def test_wrong_link_rejected_before_dispatch_and_sample_kept():
     assert not p.env.actions and action.args == {'target': 'PDF link', 'target_ref': 'bad'}
     good = Action('goto', {'url': 'https://arxiv.org/pdf/' + IDENTIFIER})
     assert not paper_action_error(good, obs, active_paper(p.completion))
+
+
+def test_different_formal_title_can_be_inspected_but_unbound_pdf_cannot_download():
+    verifier = CompletionVerifier('搜索论文WorldGUI并下载')
+    obs = observation('https://scholar.google.com/scholar?q=WorldGUI')
+    obs.context[0]['nodes'] = [
+        {'ref': 'title', 'role': 'link', 'direct': True,
+         'name': 'Interactive Desktop Automation from Any Starting Point',
+         'href': 'https://arxiv.org/abs/2502.08047'},
+        {'ref': 'pdf', 'role': 'link', 'direct': True, 'name': '[PDF]',
+         'href': 'https://arxiv.org/pdf/2502.08047'}]
+    env = Env()
+    p = pipe(env)
+    p.completion = verifier
+    state = StepState(task='搜索论文WorldGUI并下载', obs=obs)
+    inspected = Action('click', {'target': 'Interactive Desktop Automation from Any Starting Point',
+                                'target_ref': 'title'})
+    grounded = p.ground(inspected, state)
+    assert state.route['channel'] == 'browser_dom'
+    assert p.execute(grounded, state).info['dispatched'] is True
+    assert len(env.actions) == 1
+    assert paper_download_preflight_error(Action('click', {'target': '[PDF]', 'target_ref': 'pdf'}),
+                                         obs, verifier, {'target_ref': 'pdf'})
 
 
 def test_wrong_viewer_save_guard_and_versions():

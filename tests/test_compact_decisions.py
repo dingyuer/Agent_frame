@@ -11,6 +11,7 @@ from osworld_agent.decision_context import current_brief, selected_memory
 from osworld_agent.execution_queue import ExecutionQueue, MAX_PLAN_STEPS
 from osworld_agent.memory import StructuredMemory
 from osworld_agent.pipeline import Pipeline, StepState
+from osworld_agent.actions import Action
 from osworld_agent.trajectory import build_trajectory
 from test_pipeline_completion import Model, Env, observation
 
@@ -112,3 +113,38 @@ def test_actual_image_sizes_are_recorded_without_resizing():
         images=shots, require_image=True)
     assert len(images) == 1 and images[0][1] is shots[-1][1]
     assert metadata['image_sizes'] == [[2560, 1440]] and metadata['image_resize'] == 'none_client_side'
+
+
+def test_compact_browser_observation_keeps_native_select_options():
+    compiler = PromptCompiler(ContextConfig())
+    block = {'kind': 'browser_ax', 'snapshot_id': 's', 'nodes': [
+        {'ref': '1', 'role': 'combobox', 'name': 'Sort results by', 'tag': 'select', 'value': 'Newest', 'direct': True},
+        {'ref': '2', 'parent': '1', 'role': 'MenuListPopup'},
+        {'ref': '3', 'parent': '2', 'role': 'option', 'name': 'Newest'},
+        {'ref': '4', 'parent': '2', 'role': 'option', 'name': 'Relevance'},
+    ]}
+    rendered, exposed, _ = compiler.structure([block], 'sort results', 1000)
+    assert 'options=Newest;Relevance' in rendered
+    assert '1' in exposed
+
+
+def test_policy_receives_every_pdf_candidate_without_repeated_snapshot_fields():
+    obs = observation()
+    obs.info['download_candidates'] = [
+        {'url': f'https://arxiv.org/pdf/2601.{index:05d}', 'page_id': 'same-page',
+         'document_id': 5, 'snapshot_id': 'same-snapshot', 'source': 'anchor', 'label': 'pdf'}
+        for index in range(50)]
+    pipe = Pipeline(model=Model([]), env=Env(), grounding=None, system_prompt='test')
+    messages = pipe.build_input(StepState(task='搜索论文并下载', obs=obs))
+    text = messages[-1]['content']
+    assert '2601.00049' in text and '2601.00000' in text
+    assert 'download_candidates_omitted' not in text
+    assert 'same-snapshot' not in text and 'same-page' not in text
+
+
+def test_operation_mode_uses_route_before_jev_review():
+    mode = Pipeline._operation_mode
+    assert mode(Action('click', {'target': '12'}), {'channel': 'browser_dom'}) == 'dom'
+    assert mode(Action('click', {'target': 'PDF toolbar'}), None) == 'gui'
+    assert mode(Action('goto', {'url': 'https://arxiv.org/abs/1706.03762'}), {'channel': 'reobserve'}) == 'blocked'
+    assert mode(Action('request_finish', {'answer': 'done'}), None) == 'framework'

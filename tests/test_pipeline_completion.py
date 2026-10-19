@@ -199,6 +199,18 @@ def test_visual_recovery_is_bounded_and_uses_fresh_screenshot(code, dispatched, 
     assert env.reset_count == 0
 
 
+def test_invalid_dom_select_does_not_fall_back_to_gui():
+    env = Env()
+    env.execute_routed = lambda action, route: StepResult(env.obs, info={
+        'status': 'rejected', 'dispatched': False, 'error_code': 'not_found',
+        'error': 'Select option is absent; available: Relevance'})
+    p = pipeline(Model([]), env, grounding=SimpleNamespace(locate=lambda *_: pytest.fail('GUI fallback')))
+    state = StepState(obs=env.obs, memory=StructuredMemory(), route={'channel': 'browser_dom'})
+    result = p.execute(Action('select', {'target': 'Sort results by', 'option': 'Relevance (best match)'}), state)
+    assert result.info['error_code'] == 'not_found'
+    assert not env.actions
+
+
 def test_environment_evaluator_is_authoritative_and_called_once():
     env = Env()
     env.evaluation_available = True

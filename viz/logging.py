@@ -20,6 +20,7 @@ _session = None
 _step = [0]                  # 当前步（每次决策调用递增）
 _next_log_id = [0]           # 全局 log id 计数器（pending→response 匹配）
 _results_dir = None          # 历史截图落盘目录（runner 设置）
+_results_prefix = ''         # 同一天平铺保存多次任务，避免覆盖
 _decisions = []              # 采集决策调用：{step, response, screenshot_file, elapsed}
 _groundings = []             # 采集 grounding 调用：{step, query, coord, elapsed}
 _log_queue = queue.Queue(maxsize=64)
@@ -38,9 +39,10 @@ def reset_collected() -> None:
     _groundings.clear()
 
 
-def set_results_dir(path: str) -> None:
-    global _results_dir
+def set_results_dir(path: str, prefix: str = '') -> None:
+    global _results_dir, _results_prefix
     _results_dir = path
+    _results_prefix = prefix + '_' if prefix else ''
 
 
 def _log_worker_main(pending) -> None:
@@ -51,6 +53,7 @@ def _log_worker_main(pending) -> None:
         try:
             if _session is None:
                 _session = requests.Session()
+                _session.trust_env = False
             _session.post(f"{SERVER_URL}/log", json=payload, timeout=(0.3, 0.7))
         except Exception:
             pass
@@ -120,10 +123,16 @@ def _extract_last_user(messages) -> tuple:
     return text, screenshot
 
 
-def _classify_mtype(text: str, screenshot) -> str:
+def _classify_mtype(text: str, screenshot, messages=None) -> str:
     """给一次模型调用分类（供前端展示）。区分决策/格式重试/完成验证/反思/真子Agent，
     避免把「无截图的辅助调用」统统标成 code_agent（子Agent）。"""
     t = text or ""
+    if any(m.get('role') == 'user' and '你是任务规划器' in str(m.get('content', ''))
+           for m in (messages or [])):
+        return 'planner'
+    if any(m.get('role') == 'user' and '## 当前观察' in str(m.get('content', ''))
+           for m in (messages or [])) and not screenshot:
+        return 'format_retry'
     if "独立步骤核查" in t or "任务完成度核对" in t:
         return "verify"
     if screenshot:
@@ -159,7 +168,7 @@ class LoggingChatModel:
 
     def chat(self, messages, retries: int = 2, json_mode: bool = False) -> str:
         text, screenshot = _extract_last_user(messages)
-        mtype = _classify_mtype(text, screenshot)
+        mtype = _classify_mtype(text, screenshot, messages)
         # 主决策的第一步（system+user 两条消息且带截图）才递增步号并发 step 事件；
         # 重试（消息数 >2）、子 Agent（无截图）、Finish 验证等不算新步。
         is_new_step = (mtype == "decision" and len(messages) == 2)
@@ -184,7 +193,7 @@ class LoggingChatModel:
         if mtype == "decision":
             _decisions.append({
                 "step": step, "response": response,
-                "screenshot_file": f"step_{step}.png",
+                "screenshot_file": f"{_results_prefix}step_{step}.png",
                 "elapsed": round(time.time() - start, 3),
             })
         if screenshot and _results_dir and mtype == "decision":
@@ -194,15 +203,19 @@ class LoggingChatModel:
     def build_vision_message(self, text: str, images=None) -> dict:
         return self.inner.build_vision_message(text, images)
 
+    def chat_stream(self, messages, on_delta, timeout=None):
+        # Reporter events are emitted by the pipeline, not counted as actions.
+        return self.inner.chat_stream(messages, on_delta=on_delta, timeout=timeout)
+
     @staticmethod
     def _save_shot(screenshot_b64: str, step: int) -> None:
         try:
             import base64
-            path = os.path.join(_results_dir, f"step_{step}.png")
+            path = os.path.join(_results_dir, f"{_results_prefix}step_{step}.png")
             with open(path, "wb") as f:
                 f.write(base64.b64decode(screenshot_b64))
             if step == 1:  # 第一次决策的截图即初始截图，供历史"step_0.png"
-                with open(os.path.join(_results_dir, "step_0.png"), "wb") as f:
+                with open(os.path.join(_results_dir, f"{_results_prefix}step_0.png"), "wb") as f:
                     f.write(base64.b64decode(screenshot_b64))
         except Exception:
             pass

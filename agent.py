@@ -22,8 +22,13 @@ class Agent:
                  enable_reflection: bool = True, early_stop_repeat: int = 3,
                  code_agent_budget: int = 20, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
-                 planner_model=None, event_path=None, run_manifest=None, max_replans=1,
-                 wait_config=None, verifier_model=None, progress_config=None, decision_judge=None):
+                 planner_model=None, event_path=None, run_manifest=None, max_replans=3,
+                 wait_config=None, verifier_model=None, progress_config=None, decision_judge=None, mode_prompts=None, knowledge_method="all", knowledge_jev_url=""):
+        from .prompt_settings import validate_mode_prompts
+        self.mode_prompts = validate_mode_prompts(mode_prompts)
+        from .knowledge_selection import validate_method
+        self.knowledge_method = validate_method(knowledge_method)
+        self.knowledge_jev_url = knowledge_jev_url
         self.model = decision_model
         self.grounding = grounding
         self.env = env
@@ -60,6 +65,8 @@ class Agent:
             grounding=self.grounding,
             env=self.env,
             system_prompt=self.system_prompt,
+            mode_prompts=self.mode_prompts,
+            knowledge_method=self.knowledge_method, knowledge_jev_url=self.knowledge_jev_url,
             code_agent=self.code_agent,
             max_steps=budget,
             max_retries=self.max_retries,
@@ -78,4 +85,8 @@ class Agent:
             event_path=self.event_path if event_path is None else event_path,
             run_id=run_id, run_manifest=self.run_manifest,
         )
-        return pipeline.run(task)
+        try:
+            return pipeline.run(task)
+        finally:
+            if pipeline.decision_judge is not None:
+                pipeline.decision_judge.close()

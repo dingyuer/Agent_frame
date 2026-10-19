@@ -1,4 +1,4 @@
-﻿"""Windows 本地手动任务运行器：自由文本任务 → Agent + WindowsEnvironment。
+"""Windows 本地手动任务运行器：自由文本任务 → Agent + WindowsEnvironment。
 
 跑一个本地 GUI 任务（重点：浏览器任务），逐步回放 + 落盘轨迹/截图。
 
@@ -6,10 +6,10 @@
     python run_windows_local.py --task "用谷歌学术(scholar.google.com)搜索 'attention is all you need'，告诉我第一个搜索结果"
 
 说明：
-- 会自动启动一个带 remote-debugging 的无痕 Chrome（端口 9222），仅复用已确认的无痕实例；
-- 模型默认走 189 的决策(9028) + grounding(8001)，可用 --model-url / --ground-url 覆盖；
-- 屏幕分辨率自动检测（grounding 按它换算坐标），也可用 --width/--height 覆盖；
-- 运行时会【真】控制你的鼠标键盘，跑的时候别动鼠标。
+- 自动启动本任务专用的 remote-debugging Chrome，结束时只清理该实例；
+- 决策默认使用 DashScope 多模态 API，Windows grounding 默认使用 UI-Venus；可用命令行或 Studio 模型预设覆盖；
+- 屏幕分辨率自动检测，也可用 --width/--height 覆盖；
+- 浏览器页面优先走 CDP/DOM；桌面接管时才使用本机鼠标键盘。
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -145,6 +146,18 @@ def _owned_endpoint_pids(port: int, profile: str):
     return owners
 
 
+def _cdp_ready(port: int) -> bool:
+    """Chrome CDP can be ready before any tab exists."""
+    try:
+        import httpx
+        with httpx.Client(trust_env=False, timeout=0.6) as client:
+            response = client.get(f'http://127.0.0.1:{int(port)}/json/version')
+            response.raise_for_status()
+            return bool(response.json().get('webSocketDebuggerUrl'))
+    except (OSError, ValueError, httpx.HTTPError):
+        return False
+
+
 def _close_owned_cdp(port: int, profile: str) -> bool:
     owners = _owned_endpoint_pids(port, profile)
     if not owners:
@@ -190,7 +203,15 @@ def _remove_profile(port: int, profile: str) -> bool:
         return False
 
 
-def ensure_chrome(port: int, chrome_path: str):
+def _lifecycle_status(payload):
+    """Telemetry must never prevent browser cleanup, including on failures."""
+    try:
+        log_status(payload)
+    except Exception:
+        pass
+
+
+def ensure_chrome(port: int, chrome_path: str, *, pdf_downloads=False):
     """确保可连接无痕 Chrome，返回 (是否新建, 本次专用 profile 目录)。"""
     from osworld_agent.utils import cdp_pages_are_incognito, list_cdp_pages
     port = int(port)
@@ -205,27 +226,29 @@ def ensure_chrome(port: int, chrome_path: str):
         return False, None
     if not os.path.isfile(chrome_path):
         raise FileNotFoundError(f"找不到 Chrome：{chrome_path}（可用 --chrome 指定路径）")
-    print(f"[chrome] 启动带 remote-debugging 的无痕 Chrome（端口 {port}）...")
+    print(f"[chrome] 启动专用 remote-debugging Chrome（端口 {port}）...")
     user_data_dir = tempfile.mkdtemp(prefix=f"{_PROFILE_PREFIX}{port}_",
                                     dir=os.path.realpath(tempfile.gettempdir()))
     proc = None
     try:
+        if pdf_downloads:
+            from osworld_agent.browser_profile import prepare_pdf_download_profile
+            prepare_pdf_download_profile(user_data_dir)
         proc = subprocess.Popen([
             chrome_path,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={user_data_dir}",
-            "--incognito", "--new-window",
+            "--incognito", "--no-startup-window", "--lang=en-US",
             "--no-first-run", "--no-default-browser-check",
             "--disable-session-crashed-bubble", "--disable-infobars",
-            "about:blank",
+            "--lang=en-US", "--accept-lang=en-US,en",
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(30):
             time.sleep(0.5)
-            if (list_cdp_pages("localhost", port) and cdp_pages_are_incognito("localhost", port)
-                    and _owned_endpoint_pids(port, user_data_dir)):
-                print("[chrome] 无痕 Chrome 已就绪")
+            if _cdp_ready(port) and _owned_endpoint_pids(port, user_data_dir):
+                print("[chrome] 专用 Chrome 已就绪；任务窗口由隔离上下文创建")
                 return True, user_data_dir
-        raise RuntimeError(f"端口 {port} 的 Chrome 未就绪或无法确认无痕模式，已停止本次启动。")
+        raise RuntimeError(f"端口 {port} 的专用 Chrome 未就绪或无法确认进程归属，已停止本次启动。")
     except BaseException:
         if proc is not None and proc.poll() is None:
             try:
@@ -275,19 +298,33 @@ def _live_step(step_no, decision, execution, state):
         print(f"         结果: {str(execution.outcome)[:200]}", flush=True)
 
 
-def main() -> int:
+def main(platform: str = 'windows') -> int:
     # 行缓冲：即使被后台 subprocess 捕获，也逐行 flush，避免"看似卡住"（上次就是这个坑）
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:  # noqa: BLE001
         pass
 
-    parser = argparse.ArgumentParser(description="Windows 本地手动任务运行器")
+    if platform not in {'windows', 'mac'} and not (platform == 'linux' and '--cli-only' in sys.argv):
+        raise ValueError(f'不支持的本机平台: {platform}')
+    previous_sigterm = None
+    if platform == 'mac' or '--cli-only' in sys.argv:
+        # Studio 的“停止”向子进程发送 SIGTERM；转成 Python 退出才能执行下方 finally。
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: (_ for _ in ()).throw(SystemExit(143)))
+    parser = argparse.ArgumentParser(description=f"{platform} 本地手动任务运行器")
     from osworld_agent.model.decision_judge import add_judge_arguments, judge_config_from_args
     add_judge_arguments(parser)
+    from osworld_agent.knowledge_selection import add_knowledge_arguments
+    add_knowledge_arguments(parser)
+    parser.add_argument('--judge-selection-policy', choices=['threshold', 'maximum_probability'],
+                        default='maximum_probability', help='Jev 标签选择：默认直接采用最高概率；threshold 使用阈值与分差')
+    parser.add_argument("--cli-only", action="store_true", help="只使用后台文件和终端，不启动浏览器或桌面输入")
     parser.add_argument("--task", required=True, help="自由文本任务描述")
     parser.add_argument("--model", default="Qwen3.6-27B")
-    parser.add_argument("--model-url", default="http://10.44.101.62:8094/v1")
+    parser.add_argument("--model-url", default="http://7.246.80.237:48888/v1")
+    parser.add_argument("--model-api-key", default="EMPTY",
+                        help="决策模型密钥或 env:环境变量名（默认从 DASHSCOPE_API_KEY/.env 读取）")
     parser.add_argument("--planner-model", help="可选独立规划模型；默认使用决策模型")
     parser.add_argument("--planner-url", help="独立规划端点；默认沿用 --model-url")
     parser.add_argument("--verifier-model", help="独立核查模型；默认使用决策模型同端点的独立会话")
@@ -298,9 +335,13 @@ def main() -> int:
     parser.add_argument("--processor-revision", default="")
     parser.add_argument("--chat-template-revision", default="")
     parser.add_argument("--ground-model", default="UI-Venus-2-9B")
-    parser.add_argument("--ground-type", choices=["ui-venus2", "ui-tars"], default="ui-venus2")
+    parser.add_argument("--ground-type", choices=["qwen-plus", "ui-venus2", "ui-tars"],
+                        default="qwen-plus" if platform == 'mac' else "ui-venus2")
     parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
+    parser.add_argument("--ground-api-key", default="EMPTY" if platform == 'mac' else "EMPTY")
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="决策/规划采样温度，默认0以减少重复演示中的随机变化")
     parser.add_argument("--operation-timeout", type=float, default=300, help="下载等操作等待上限（秒），自动等待不消耗决策步数")
     parser.add_argument("--download-max-mib", type=int, default=50, help="单个下载的资源上限（MiB），0 表示不限大小；不用于论文身份判断")
     parser.add_argument("--task-timeout", type=float, default=1800, help="任务总时间预算（秒）")
@@ -308,14 +349,38 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
-    parser.add_argument("--chrome", default=CHROME_DEFAULT)
+    parser.add_argument("--browser-session-mode", choices=['isolated', 'persistent'], default='persistent',
+                        help="persistent 保留固定任务配置的持久 Cookie 和站点存储；isolated 每次使用独立临时会话")
+    parser.add_argument("--browser-profile-dir", default=None,
+                        help="固定任务配置的绝对目录；缺省使用 AgentFrame 专用目录，不能接管日常 Chrome 配置")
+    parser.add_argument("--browser-start-url", default=None,
+                        help="可选初始浏览器页面；仅设置环境起点，不作为任务或论文身份信息")
+    if platform == 'mac':
+        from osworld_agent.mac_chrome import CHROME_DEFAULT as MAC_CHROME_DEFAULT
+        chrome_default = MAC_CHROME_DEFAULT
+    else:
+        chrome_default = CHROME_DEFAULT
+    parser.add_argument("--chrome", default=chrome_default)
     parser.add_argument("--workspace-dir", "--download-dir", dest="download_dir", default=None,
-                        help="默认工作目录根路径（兼容 --download-dir）；每次运行创建固定的独立子目录")
-    parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省不落盘）")
+                        help="默认工作目录根路径（兼容 --download-dir）；当天任务共用日期子目录")
+    parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录；默认使用程序 local_runs 下的独立运行目录")
+    parser.add_argument("--run-prefix", default=None, help="同日平铺日志的唯一文件名前缀")
     parser.add_argument("--completion-spec", help="可信任务验收条件 JSON 文件；模型不能修改")
     parser.add_argument("--private-completion-spec", help="私有评测条件 JSON；不会发送给模型")
     parser.add_argument("--task-id", help="数据集任务标识；缺省按任务文本生成")
+    parser.add_argument('--mode-prompts-file', help='Studio 保存的各模式决策提示词 JSON')
     args = parser.parse_args()
+    from osworld_agent.prompt_settings import load_mode_prompts
+    mode_prompts = load_mode_prompts(args.mode_prompts_file)
+    if args.result_dir is None:
+        from osworld_agent.workspace_config import allocate_local_result_dir
+        args.result_dir = allocate_local_result_dir()
+    if args.run_prefix is None and os.path.basename(os.path.normpath(args.result_dir)) == time.strftime('%Y-%m-%d'):
+        import uuid
+        args.run_prefix = 'ui_' + time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8]
+    if args.result_dir:
+        os.makedirs(args.result_dir, exist_ok=True)
+    log_name = lambda name: f"{args.run_prefix}_{name}" if args.run_prefix else name
     completion_spec = None
     private_completion_spec = None
     if args.completion_spec:
@@ -325,70 +390,145 @@ def main() -> int:
         with open(args.private_completion_spec, encoding="utf-8") as f:
             private_completion_spec = json.load(f)
     from osworld_agent.verifiers import CompletionVerifier
-    CompletionVerifier(args.task, completion_spec, private_completion_spec)
+    task_completion = CompletionVerifier(args.task, completion_spec, private_completion_spec)
+    from osworld_agent.paper_sources import default_paper_start_url
+    from osworld_agent.task_specs import task_profile
+    args.browser_start_url = default_paper_start_url(args.task,
+        is_paper_download=task_profile(args.task, task_completion.public_spec)['kind'] == 'paper_download',
+        browser_start_url=args.browser_start_url)
 
     # 0) 屏幕分辨率：grounding 按它换算坐标，必须和真实屏幕一致
-    import pyautogui
-    sw, sh = pyautogui.size()
+    if args.cli_only:
+        sw, sh = 1280, 800  # unused: no screenshots/grounding in CLI-only mode
+    else:
+        import pyautogui
+        sw, sh = pyautogui.size()
     width = args.width or sw
     height = args.height or sh
     print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
 
-    # 1) 确保 Chrome 带 remote debugging 且运行在无痕模式
-    started_chrome, chrome_profile = ensure_chrome(args.browser_port, args.chrome)
+    startup_started = time.perf_counter()
+    try:
+        log_status({"event": "task_start", "mode": "local", "instruction": args.task, "max_steps": args.max_steps})
+        log_status({"event": "phase_timing", "phase": "browser_startup", "phase_id": "startup", "step": 0,
+                    "status": "running", "started_at": time.time()})
+    except Exception:
+        pass  # Early telemetry cannot prevent the browser lifecycle from starting.
+    # 1) 启动专用 CDP Chrome；macOS 延后到隔离任务上下文创建可见窗口。
+    if platform == 'mac':
+        from osworld_agent.mac_chrome import ensure_chrome as start_chrome, close_test_chrome as stop_chrome
+        from osworld_agent.adapters.mac_env import MacEnvironment as LocalEnvironment
+    else:
+        start_chrome, stop_chrome = ensure_chrome, close_test_chrome
+        LocalEnvironment = WindowsEnvironment
+    from concurrent.futures import ThreadPoolExecutor
+    from osworld_agent.parallel_work import measured_call, prepare_client_dependencies
+    # SDK import can take seconds on first use. It needs neither the browser
+    # nor credentials; overlap it with Chrome startup, without any generation.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix='agent-sdk') as pool:
+        dependencies = pool.submit(measured_call, prepare_client_dependencies)
+        if args.cli_only:
+            from osworld_agent.adapters.cli_env import CLIEnvironment
+            LocalEnvironment = CLIEnvironment
+            started_chrome, chrome_profile = False, None
+        elif args.browser_session_mode == 'persistent':
+            from osworld_agent.persistent_chrome import ensure_persistent_chrome, close_persistent_chrome
+            started_chrome, chrome_profile = ensure_persistent_chrome(args.browser_port, args.chrome,
+                profile_dir=args.browser_profile_dir, platform=platform)
+            stop_chrome = close_persistent_chrome
+            print(f'[chrome] 固定任务配置（持久存储）：{chrome_profile}')
+        elif args.browser_profile_dir:
+            parser.error('--browser-profile-dir 仅用于 persistent 模式')
+        # A temporary isolated profile can select native PDF download behavior.
+        # Persistent profiles keep the operator's own PDF and other preferences.
+        elif task_completion.paper_goals():
+            started_chrome, chrome_profile = start_chrome(args.browser_port, args.chrome, pdf_downloads=True)
+        else:
+            started_chrome, chrome_profile = start_chrome(args.browser_port, args.chrome)
+        dependency_report, dependency_ms = dependencies.result()
+    _lifecycle_status({"event": "client_dependencies_ready", **dependency_report,
+                "elapsed_ms": dependency_ms, "overlap": "browser_startup"})
     env = None
     try:
-        time.sleep(2.0)  # 等 Chrome 窗口稳定
+        # Chrome starters already wait for the CDP endpoint. The adapter owns
+        # page/window readiness; an unconditional two-second sleep adds no evidence.
 
         # 2) 模型（Logging 实时推送到 viz server）
-        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key="EMPTY",
+        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key=args.model_api_key, temperature=args.temperature,
             capture_rollout=args.capture_rollout, policy_revision=args.policy_revision,
             tokenizer_revision=args.tokenizer_revision, processor_revision=args.processor_revision,
             chat_template_revision=args.chat_template_revision)))
         planner = (LoggingChatModel(ChatModel(ModelConfig(name=args.planner_model,
-            url=args.planner_url or args.model_url, api_key="EMPTY"))) if args.planner_model else None)
+            url=args.planner_url or args.model_url, api_key=args.model_api_key, temperature=args.temperature))) if args.planner_model else None)
         verifier = (ChatModel(ModelConfig(name=args.verifier_model or args.model,
-            url=args.verifier_url or args.model_url, api_key="EMPTY", temperature=0, max_tokens=768,
+            url=args.verifier_url or args.model_url, api_key=args.model_api_key, temperature=0, max_tokens=768,
             timeout=45)) if args.verifier_model or args.verifier_url else None)
-        ground_cls = RealUItarsGrounding if args.ground_type == "ui-tars" else UIVenus2Grounding
-        grounding = LoggingGrounding(ground_cls(url=args.ground_url, api_key="EMPTY",
+        if args.ground_type == "qwen-plus":
+            from osworld_agent.adapters.qwen_grounding import QwenPlusGrounding as ground_cls
+        else:
+            ground_cls = RealUItarsGrounding if args.ground_type == "ui-tars" else UIVenus2Grounding
+        grounding = LoggingGrounding(ground_cls(url=args.ground_url, api_key=args.ground_api_key,
                                                        model=args.ground_model, width=width, height=height))
 
         # 3) 环境
-        env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
-                                 downloads_dir=args.download_dir, window_timeout_s=args.window_timeout)
+        env_kwargs = {'browser_port': args.browser_port, 'width': width, 'height': height,
+                      'downloads_dir': args.download_dir, 'window_timeout_s': args.window_timeout,
+                      'browser_start_url': args.browser_start_url,
+                      'browser_session_mode': args.browser_session_mode}
+        env = LocalEnvironment(**env_kwargs)
 
+        log_status({"event": "phase_timing", "phase": "browser_startup", "phase_id": "startup", "step": 0,
+                    "status": "completed", "elapsed_ms": round((time.perf_counter()-startup_started)*1000, 2)})
         # 4) 组装 + 跑，保留 1010 的规划流水线
-        agent = Agent(decision_model=model, grounding=grounding, env=env,
+        agent = Agent(decision_model=model, grounding=grounding, env=env, mode_prompts=mode_prompts,
+                      knowledge_method=args.knowledge_method, knowledge_jev_url=args.knowledge_jev_url,
                       max_steps=args.max_steps, enable_reflection=False,
                       wait_config={"operation_timeout_s": args.operation_timeout, "task_timeout_s": args.task_timeout, "download_max_bytes": args.download_max_mib * 1024 * 1024},
                       step_callback=_live_step, completion_spec=completion_spec,
                       private_completion_spec=private_completion_spec, planner_model=planner,
                       verifier_model=verifier,
-                      decision_judge=judge_config_from_args(args),
-                      event_path=os.path.join(args.result_dir, "events.jsonl") if args.result_dir else None)
+                      decision_judge={**judge_config_from_args(args), 'selection_policy': args.judge_selection_policy},
+                      event_path=os.path.join(args.result_dir, log_name("events.jsonl")) if args.result_dir else None)
         if args.result_dir:
-            set_results_dir(args.result_dir)
+            set_results_dir(args.result_dir, args.run_prefix or '')
         reset_collected()
-        log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps})
         print(f"\n===== 任务开始 =====\n{args.task}\n")
         result = agent.run(args.task)
+        # Report the verdict immediately, while keeping the run busy until
+        # cleanup finishes. Cleanup is not part of semantic verification.
+        _lifecycle_status({"event": "verification_complete", "success": bool(result.success),
+                    "answer": result.final_answer or "",
+                    "termination_reason": getattr(result, 'termination_reason', '')})
     finally:
+        cleanup_started = time.perf_counter()
+        _lifecycle_status({"event": "phase_timing", "phase": "cleanup", "phase_id": "cleanup",
+                    "status": "running", "started_at": time.time()})
         try:
             if env is not None:
                 env.close()
         finally:
             # 初始化、运行或环境关闭失败时，仍清理本次创建的实例。
-            if started_chrome:
-                close_test_chrome(args.browser_port, chrome_profile)
+            try:
+                if started_chrome:
+                    stop_chrome(args.browser_port, chrome_profile)
+            finally:
+                if previous_sigterm is not None:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                _lifecycle_status({"event": "phase_timing", "phase": "cleanup", "phase_id": "cleanup",
+                    "status": "completed", "elapsed_ms": round((time.perf_counter()-cleanup_started)*1000, 2)})
 
     # 通知前端任务结束（带结果），否则前端收不到 task_end 会把"已完成"误判成"异常终止"
+    termination_reason = getattr(result, 'termination_reason', '')
+    planning_calls = getattr(result, 'planning_calls', []) or []
     log_status({
         "event": "task_end",
         "result": result.score,
         "steps": result.steps,
         "success": bool(result.success),
         "answer": result.final_answer or "",
+        "termination_reason": termination_reason,
+        "validation_error": next((str(c.get('validation_error')) for c in reversed(planning_calls)
+                                  if c.get('validation_error')), '') if termination_reason == 'planning_failed' else '',
     })
 
     # 5) 逐步回放
@@ -416,7 +556,7 @@ def main() -> int:
         for step_no, shot in result.screenshots.items():
             try:
                 if hasattr(shot, "save"):
-                    shot.save(os.path.join(args.result_dir, f"step_{step_no}.png"))
+                    shot.save(os.path.join(args.result_dir, log_name(f"step_{step_no}.png")))
             except Exception:  # noqa: BLE001
                 pass
         # 原始每步记录（含解析失败的 raw 输出），供归因。剔除 base64 图避免膨胀（图已在 assets/ 去重）。
@@ -433,14 +573,14 @@ def main() -> int:
 
         raw_lines = [_json.dumps(_strip_images(s), ensure_ascii=False)
                      for s in result.trajectory if isinstance(s, dict)]
-        with open(os.path.join(args.result_dir, "traj_raw.jsonl"), "w", encoding="utf-8") as _f:
+        with open(os.path.join(args.result_dir, log_name("traj_raw.jsonl")), "w", encoding="utf-8") as _f:
             _f.write("\n".join(raw_lines))
         from osworld_agent.trajectory import build_trajectory, dump_trajectory
         import hashlib
         task_id = args.task_id or "local-" + hashlib.sha256(args.task.encode()).hexdigest()[:16]
-        traj = build_trajectory(task_id=task_id, domain="windows",
+        traj = build_trajectory(task_id=task_id, domain=platform,
                                 instruction=args.task, result=result)
-        dump_trajectory(os.path.join(args.result_dir, "trajectory.json"), traj)
+        dump_trajectory(os.path.join(args.result_dir, log_name("trajectory.json")), traj)
         print(f"\n轨迹与截图已保存到: {args.result_dir}")
     flush_logs(timeout=1.0)
     return 0

@@ -35,7 +35,7 @@ def test_scenarios_are_explicitly_synthetic_and_not_real_run():
     response = TestClient(app).get('/jev/demo/scenarios')
     assert response.status_code == 200
     assert response.json()['synthetic_observations'] is True
-    assert len(response.json()['scenarios']) == 5
+    assert len(response.json()['scenarios']) == 7
 
 
 def test_replay_never_calls_a_model_or_invents_scores(monkeypatch):
@@ -64,6 +64,20 @@ def test_live_uses_real_review_compilation_two_images_one_question(monkeypatch):
     assert 'replay' not in state and 'takeaway' not in state and 'narration' not in state
     assert state['image_order'] == ['before', 'after']
     assert 'demo-secret' not in json.dumps(data)
+
+
+def test_loading_uses_one_frame_fast_readiness_without_a_policy_step(monkeypatch):
+    calls = []
+    def handler(request):
+        data = json.loads(request.content)
+        calls.append(data)
+        return httpx.Response(200, json={'model': 'fixture-jev', 'answers': {'readiness': {
+            'type': 'choice', 'choice': 'waiting', 'probabilities': {'ready': .01, 'waiting': .97, 'unknown': .02}}}})
+    monkeypatch.setattr(jev_demo, 'DecisionJudge', lambda cfg: DecisionJudge(cfg, httpx.MockTransport(handler)))
+    result = TestClient(app).post('/jev/demo/evaluate', json=payload('loading_wait')).json()
+    assert result['outcome'] == 'pending' and result['source'] == 'live_jev'
+    assert len(calls) == 1 and len(calls[0]['images']) == 1
+    assert list(calls[0]['questions']) == ['readiness']
 
 
 def test_live_preserves_unexpected_model_output_instead_of_expected_script(monkeypatch):

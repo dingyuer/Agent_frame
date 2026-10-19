@@ -58,6 +58,21 @@ def pipeline(actions, steps, reviewer=None, **kwargs):
     return p, policy, env
 
 
+def test_automatic_observation_review_does_not_report_a_failed_undispatched_action():
+    from osworld_agent.pipeline import Execution
+    from osworld_agent.verifiers import CompletionVerifier
+    p, _, env = pipeline([], [step()])
+    p.completion = CompletionVerifier('任务')
+    state = StepState(task='任务', obs=env.obs, memory=StructuredMemory())
+    p._code_step_review = lambda *a, **k: (
+        {'method': 'code', 'status': 'passed', 'reason': 'state verified', 'checks': []}, {})
+    p._update_plan_progress(state, Execution(kind='framework_observation', obs=env.obs,
+        info={'status': 'observed', 'dispatched': False}))
+    assert state.step_review['action_scope'] == 'framework_observation'
+    assert state.step_review['action_effect']['status'] == 'not_applicable'
+    assert state.step_review['action_effect']['scope'] == 'observation'
+
+
 @pytest.mark.parametrize("name", ["download", "rename_artifact", "run_in_terminal", "call_code_agent", "set_cell_values", "save"])
 def test_non_basic_actions_cannot_reach_executor(name):
     assert name not in ACTION_REGISTRY
@@ -170,6 +185,10 @@ def test_rejected_action_cannot_advance_existing_state():
 
 def test_review_logging_does_not_treat_screenshot_as_a_decision():
     assert _classify_mtype("独立步骤核查\ncurrent state", "png") == "verify"
+    assert _classify_mtype("请修正规划后输出完整 JSON", None,
+                           [{'role': 'user', 'content': '你是任务规划器。创建计划'},
+                            {'role': 'assistant', 'content': '{}'},
+                            {'role': 'user', 'content': '请修正后输出完整 JSON'}]) == 'planner'
 
 
 def test_clone_reviewer_has_independent_client_and_sampling_config():

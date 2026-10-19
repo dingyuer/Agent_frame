@@ -59,6 +59,30 @@ def test_exact_input_effect_is_not_subtask_completion_and_ambiguous_inputs_absta
     assert effect_review(before, after, {**execution, 'dispatched': False})['status'] == 'failed'
 
 
+def test_link_click_select_enter_and_download_have_narrow_code_evidence():
+    before, after = observation(), observation()
+    before.context[0]['nodes'] = [{'ref': '1', 'role': 'link', 'name': 'Paper',
+                                   'href': 'https://arxiv.org/abs/2603.11558'}]
+    after.context[0]['url'] = 'https://arxiv.org/abs/2603.11558'
+    after.info['url'] = 'https://arxiv.org/abs/2603.11558'
+    assert effect_review(before, after, {'action': 'click', 'status': 'executed',
+        'args': {'target_ref': '1'}})['status'] == 'passed'
+
+    before.context[0]['nodes'] = [{'ref': '2', 'role': 'combobox', 'id': 'order', 'value': 'Newest'}]
+    after.context[0]['nodes'] = [{'ref': '3', 'role': 'combobox', 'id': 'order', 'value': 'Relevance'}]
+    assert effect_review(before, after, {'action': 'select', 'status': 'executed',
+        'args': {'target_ref': '2', 'option': 'Relevance'}})['status'] == 'passed'
+    assert effect_review(before, after, {'action': 'press', 'status': 'executed',
+        'args': {'key': 'Enter'}})['status'] == 'passed'
+
+    after.context[0]['url'] = before.context[0]['url']
+    after.info['url'] = (before.info or {}).get('url', before.context[0]['url'])
+    after.info['artifacts'] = [{'artifact_id': 'new', 'completed': True,
+                                'url': 'https://arxiv.org/pdf/2603.11558'}]
+    assert effect_review(before, after, {'action': 'click', 'status': 'executed',
+        'args': {'target_ref': '2'}})['status'] == 'passed'
+
+
 def test_progress_uses_one_forward_and_never_advances_queue():
     requests = []
     judge = judge_with(['progress'], requests)
@@ -67,6 +91,26 @@ def test_progress_uses_one_forward_and_never_advances_queue():
     assert report['step_outcome'] == 'progress' and report['status'] == 'unknown'
     assert report['action_effect']['method'] == 'decision_model' and report['action_effect']['status'] == 'passed'
     assert len(requests) == 1 and list(requests[0]['questions']) == ['step']
+    queue = ExecutionQueue({'steps': [copy.deepcopy(STEP)]})
+    assert not queue.accept_review({**report, 'plan_step_id': 'p0_1'}) and queue.cursor == 0
+
+
+@pytest.mark.parametrize('winner,expected_outcome', [('progress', 'progress'), ('passed', 'unknown')])
+def test_below_threshold_progress_is_a_hint_but_completion_still_abstains(winner, expected_outcome):
+    def handle(request):
+        question = json.loads(request.content)['questions']['step']
+        probabilities = {key: .003 for key in question['criteria']}
+        probabilities.update({winner: .714, 'failed': .155, 'unknown': .125})
+        if winner == 'passed':
+            probabilities['progress'] = .003
+        return httpx.Response(200, json={'model': 'd3-flash', 'answers': {'step': {
+            'type': 'choice', 'choice': winner, 'probabilities': probabilities}}})
+    judge = DecisionJudge(CONFIG, httpx.MockTransport(handle))
+    report = judge.review('搜索论文', STEP, observation(), observation(color='blue'),
+                          {'action': 'click', 'status': 'executed'}, {})
+    assert report['status'] == 'unknown' and report['step_outcome'] == expected_outcome
+    assert report['progress_hint'] is (winner == 'progress')
+    assert report['action_effect']['status'] == 'unknown'
     queue = ExecutionQueue({'steps': [copy.deepcopy(STEP)]})
     assert not queue.accept_review({**report, 'plan_step_id': 'p0_1'}) and queue.cursor == 0
 

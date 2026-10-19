@@ -1,0 +1,70 @@
+运行统计、领域知识库与重规划改进 — 2026-10-18
+
+已交付
+1. 本机列表/详情统一显示运行跨度与输入/输出 token，分规划/决策/核查/定位汇总。
+   前端启动的新任务通过 run_timing.json 保存进程启动至退出的完整时间；停止后不继续计时。
+   标准轨迹 outcome.run_metrics 保存 pipeline 起止跨度、去重用量和缺失标记。
+   旧日志以事件跨度估算，中断日志只显示截至最后事件的时间，不伪造完整总时长。
+   Qwen 粗定位和细定位、UI-TARS/UI-Venus 应用层重试分别记录规范 model_call；不增加模型调用。
+2. 独立 YAML：knowledge/user_knowledge.yaml，前端知识库编辑、启停、保存、检索预览。
+   本地别名/域名匹配或至少两个关键词；最多 4 条、6000 字符；保留条目完整边界。
+   未命中不注入；称呼对应多个网址会标记歧义，用户任务中的明确要求优先。
+   一次运行固定知识快照，轨迹存储选中内容、命中词与版本；模型不会自动把推测写入知识库。
+3. 重规划增加失败证据摘要和 strategy_change 字段。
+   已完成阶段、最近动作、失败记录、执行器/核查反馈保留；拒绝原样剩余计划及原样受阻首步。
+   失败的规划最多重试一次，恢复仍有预算；实际动作、Jev 核查与最终验收保持启用。
+   策略解释不是成功证明，也不保证语义上换一种说法就真的有效。
+
+验证
+215 项定向单元/回归测试通过。
+真实 Chromium UI：新增知识、保存、重新加载、检索预览、历史列表、详情统计均通过。
+生产前端 http://127.0.0.1:8088/ 已重启并复查，无 JavaScript 页面错误。
+真实 Qwen 规划协议验证：初始观察为空白页，能使用知识网址；受阻证据为两次点击被弹窗遮挡时，
+重规划增加关闭弹窗并给出具体策略变化。本项只验证规划输出，不代表执行了该恢复方案。
+真实 Qwen + Jev + Chromium 完整任务：模型自主导航到知识库映射的校园页面，服务端记录核对到达路径。
+
+完整任务结果：{
+  "success": true,
+  "steps": 1,
+  "metrics": {
+    "input_tokens": 24283,
+    "output_tokens": 187,
+    "total_tokens": 24470,
+    "calls": 7,
+    "reported_calls": 7,
+    "missing_usage_calls": 0,
+    "input_reported_calls": 7,
+    "output_reported_calls": 7,
+    "elapsed_s": 8.308,
+    "timing_source": "monotonic",
+    "complete": true,
+    "by_role": {
+      "verifier": {
+        "input_tokens": 18883,
+        "output_tokens": 0,
+        "calls": 5,
+        "missing_usage_calls": 0
+      },
+      "planner": {
+        "input_tokens": 2927,
+        "output_tokens": 108,
+        "calls": 1,
+        "missing_usage_calls": 0
+      },
+      "decision": {
+        "input_tokens": 2473,
+        "output_tokens": 79,
+        "calls": 1,
+        "missing_usage_calls": 0
+      }
+    },
+    "usage_complete": true
+  }
+}
+
+完整轨迹：/data1/chenyuning/osworld_agent_framework_and_2trajectories/framework/local_runs/live_paper_20261018_102810_knowledge_20261018
+测试日志与 UI 截图：/data1/chenyuning/osworld_agent_framework_and_2trajectories/.runtime/improvements-20261018
+
+限制：词项检索不是向量语义检索，遗漏的同义词需补充别名；多网址歧义仍需任务或现场证据消解。
+重规划的重复拦截是结构与文本约束，模型改写后的真实有效性仍依赖执行核查，不能承诺绝对无循环。
+完整实测为可控本地网站，未使用用户的真实校园或内网系统；示例知识保持停用。

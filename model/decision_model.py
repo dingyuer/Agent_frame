@@ -1,4 +1,4 @@
-﻿"""决策模型层：可插拔注册表 + OpenAI 兼容客户端（支持视觉）。
+"""决策模型层：可插拔注册表 + OpenAI 兼容客户端（支持视觉）。
 
 换决策模型只改两处之一：
 1. 改 config.yaml 里的 model.name（对应 MODEL_REGISTRY 的键）；
@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ..config import ModelConfig
+from ..config import ModelConfig, resolve_secret
 
 
 @dataclass
@@ -84,9 +84,13 @@ class ChatModel:
             from openai import OpenAI
             import httpx
             self._client = OpenAI(
-                base_url=self.cfg.url, api_key=self.cfg.api_key, max_retries=0,
+                base_url=self.cfg.url, api_key=resolve_secret(self.cfg.api_key), max_retries=0,
                 http_client=httpx.Client(trust_env=False, timeout=self.cfg.timeout))
         return self._client
+
+    def prepare_client(self):
+        """Local SDK/client setup; callers join preparation before chat()."""
+        self._get_client()
 
     def close(self):
         if self._client is not None:
@@ -102,7 +106,9 @@ class ChatModel:
         json_mode=True 时加 response_format=json_object，用 vLLM 约束解码强制输出合法
         JSON 对象（减少非 JSON、格式漂移）；这是「约束前移」，仍保留调用方的执行前校验。
         """
+        call_started = time.perf_counter()
         client = self._get_client()
+        setup_ms = (time.perf_counter() - call_started) * 1000
         normalized = [self._to_message_dict(m) for m in messages]
         self.last_call = {"messages": copy.deepcopy(normalized),
                           "model": resolve_model_name(self.cfg.name), "attempts": [],
@@ -142,6 +148,8 @@ class ChatModel:
                     "finish_reason": getattr(resp.choices[0], "finish_reason", None),
                     "usage": resp.usage.model_dump() if getattr(resp, "usage", None) else None,
                     "latency_ms": latency_ms,
+                    "client_setup_ms": round(setup_ms, 2),
+                    "wall_time_ms": round((time.perf_counter() - call_started) * 1000, 2),
                 })
                 self.last_call["attempts"].append({"status": "ok", "latency_ms": latency_ms,
                                                    "generation": copy.deepcopy(generation),
@@ -156,15 +164,71 @@ class ChatModel:
                     "status": "error", "error_type": type(exc).__name__,
                     "generation": copy.deepcopy(self.last_call.get("generation", {})),
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
-                # 若因 extra_body 不被支持而报错，去掉 extra_body 重试一次
-                if self.disable_thinking and "extra_body" in str(exc).lower():
+                status = getattr(exc, 'status_code', None)
+                error_text = str(exc).lower()
+                compatible_error = status in (None, 400, 422)
+                adjusted = False
+                # Changing unsupported request options needs no outage backoff.
+                if compatible_error and self.disable_thinking and "extra_body" in error_text:
                     self.disable_thinking = False
+                    adjusted = True
                 # 若 json_mode 不被支持，降级为无约束重试
-                if json_mode and ("response_format" in str(exc).lower() or "json" in str(exc).lower()):
+                if compatible_error and json_mode and "response_format" in error_text:
                     json_mode = False
-                if attempt < retries:
+                    adjusted = True
+                if isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 429) and not adjusted:
+                    self.last_call['attempts'][-1]['retry_policy'] = 'permanent_http_error'
+                    break
+                if adjusted:
+                    self.last_call['attempts'][-1]['retry_policy'] = 'request_option_adjusted'
+                elif attempt < retries:
                     time.sleep(1.5 * (attempt + 1))
+        self.last_call["client_setup_ms"] = round(setup_ms, 2)
+        self.last_call["wall_time_ms"] = round((time.perf_counter() - call_started) * 1000, 2)
         raise RuntimeError(f"模型调用失败({self.cfg.name}): {last_err}")
+
+    def chat_stream(self, messages, on_delta, timeout=None):
+        """Stream a user deliverable once; partial output is never retried/duplicated."""
+        normalized = [self._to_message_dict(m) for m in messages]
+        started = time.perf_counter()
+        kwargs = dict(model=resolve_model_name(self.cfg.name), messages=normalized,
+                      temperature=self.cfg.temperature, max_tokens=self.cfg.max_tokens,
+                      stream=True, stream_options={'include_usage': True})
+        if self.disable_thinking:
+            kwargs['extra_body'] = {'chat_template_kwargs': {'enable_thinking': False}}
+        self.last_call = {'messages': copy.deepcopy(normalized), 'model': kwargs['model'],
+                          'generation': {k: v for k, v in kwargs.items() if k not in {'messages', 'model'}},
+                          'attempts': [], 'streaming': True}
+        client = self._get_client()
+        if timeout is not None:
+            client = client.with_options(timeout=min(float(timeout), self.cfg.timeout))
+        parts, finish_reason, usage, response_id, first = [], None, None, None, None
+        try:
+            with client.chat.completions.create(**kwargs) as stream:
+                for chunk in stream:
+                    response_id = getattr(chunk, 'id', None) or response_id
+                    if getattr(chunk, 'usage', None):
+                        usage = chunk.usage.model_dump()
+                    for choice in chunk.choices:
+                        finish_reason = choice.finish_reason or finish_reason
+                        text = getattr(choice.delta, 'content', None)
+                        if text:
+                            if first is None:
+                                first = round((time.perf_counter() - started) * 1000, 2)
+                            parts.append(text)
+                            on_delta(text)
+            if finish_reason == 'length':
+                raise RuntimeError('report_output_truncated')
+            self.last_call['attempts'].append({'status': 'ok'})
+            return ''.join(parts)
+        except Exception as exc:
+            self.last_call['attempts'].append({'status': 'error', 'error_type': type(exc).__name__})
+            raise
+        finally:
+            self.last_call.update(response=''.join(parts), response_id=response_id, usage=usage,
+                                  finish_reason=finish_reason, first_token_ms=first,
+                                  latency_ms=round((time.perf_counter()-started)*1000, 2),
+                                  wall_time_ms=round((time.perf_counter()-started)*1000, 2))
 
     def _capture_rollout(self, response):
         """Accept actual server tokens, with explicit revision attestation.

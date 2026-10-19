@@ -21,6 +21,9 @@ html{font-size:14px}body{padding-left:var(--sidebar);font-family:Inter,-apple-sy
 
 .execution-warning{background:#fbf5e8;color:#a48244;margin:0 12px 12px;padding:9px!important;border:1px solid #efe1c1;border-radius:5px}
 
+.workspace-picker{display:flex;gap:8px;min-width:0}.workspace-picker input{flex:1;min-width:0}.workspace-picker button{flex:none;font-size:11px;padding:8px 11px}.workspace-picker button svg{width:15px;height:15px}#local-workspace-status.error{color:#ad584f}
+@media(max-width:520px){.workspace-picker{flex-wrap:wrap}.workspace-picker input{flex-basis:100%}.workspace-picker button{width:100%}}
+
 /* Evidence-driven queue and review, shared by live and history views. */
 .review-card { border-left: 3px solid var(--border); }
 .review-passed { border-left-color: #399d78; }
@@ -35,3 +38,11 @@ html{font-size:14px}body{padding-left:var(--sidebar);font-family:Inter,-apple-sy
 .queue-steps .queue-doing { font-weight: 600; }
 .queue-steps .queue-doing span { color: #587fc4; }
 .queue-steps .queue-done span { color: #399d78; }
+
+/* Wall-clock stages are distinct from individual model requests. */
+.phase-timing-panel {padding:14px 18px; margin-bottom:16px; font-size:12px;}
+.phase-timing-panel summary {cursor:pointer; font-weight:600; color:var(--text);}
+.phase-timing-rows {margin:10px 0;}
+.phase-timing-row {display:grid;grid-template-columns:minmax(130px,1fr) minmax(100px,1fr) minmax(110px,1fr);gap:12px;padding:5px 0;}
+.phase-timing-row small,.phase-timing-panel>small {color:var(--dim);line-height:1.6;}
+@media(max-width:700px){.phase-timing-row{grid-template-columns:1fr 1fr}.phase-timing-row small{grid-column:1/-1}}

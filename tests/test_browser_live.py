@@ -1,6 +1,7 @@
 """Opt-in local Chromium tests. No public website or model endpoint is used."""
 import threading
 import time
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -15,6 +16,7 @@ from test_paper_completion import pdf_file
 
 PAGE = b"""<!doctype html><meta charset=utf-8><title>Paper fixture</title>
 <h1>AAA</h1>
+<select id=order aria-label="Sort results by"><option>Newest</option><option>Relevance</option></select>
 <a id=pdf href=/paper.pdf download>Download AAA PDF</a>
 <a id=slow href=/slow.pdf download>Slow download</a>
 <a id=stream href=/stream.pdf download>Streaming download</a>
@@ -69,7 +71,9 @@ def live_browser(request, tmp_path, monkeypatch):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
-            if path != "/no-cookie":
+            # Subresources such as /favicon.ico must not re-authenticate the
+            # fresh context after the isolation test navigates to /no-cookie.
+            if path == "/":
                 self.send_header("Set-Cookie", "session=test-session; Path=/")
             self.end_headers()
             if path == '/pdf/render-fixture':
@@ -92,7 +96,13 @@ def live_browser(request, tmp_path, monkeypatch):
                              downloads_dir=str(tmp_path / "downloads"))
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True, args=[f"--remote-debugging-port={port}"])
+            launch_kwargs = {}
+            if not os.path.exists(playwright.chromium.executable_path):
+                system_chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+                if os.path.exists(system_chrome):
+                    launch_kwargs['executable_path'] = system_chrome
+            browser = playwright.chromium.launch(headless=True, args=[f"--remote-debugging-port={port}"],
+                                                 **launch_kwargs)
             try:
                 session.begin_episode(viewport={"width": 900, "height": 700})
                 assert session.goto(base + "/")["status"] == "executed"
@@ -117,6 +127,22 @@ def click(session, element_id):
     route = session.route(action, obs)
     assert route and route["channel"] == "browser_dom", (element_id, route)
     return session.execute(action, route)
+
+
+def test_native_select_uses_exact_dom_option_without_gui_fallback(live_browser):
+    session, _ = live_browser
+    obs = observe(session)
+    ref = next(node['ref'] for node in obs.context[0]['nodes'] if node.get('id') == 'order')
+    wrong = Action('select', {'target_ref': ref, 'option': 'Relevance (best match)'})
+    rejected = session.execute(wrong, session.route(wrong, obs))
+    assert rejected['status'] == 'rejected' and rejected['error_code'] == 'not_found'
+    assert 'Relevance' in rejected['error']
+    obs = observe(session)
+    ref = next(node['ref'] for node in obs.context[0]['nodes'] if node.get('id') == 'order')
+    correct = Action('select', {'target_ref': ref, 'option': 'Relevance'})
+    result = session.execute(correct, session.route(correct, obs))
+    assert result['status'] == 'executed' and result['channel'] == 'browser_dom'
+    assert next(node['value'] for node in observe(session).context[0]['nodes'] if node.get('id') == 'order') == 'Relevance'
 
 
 def wait_for(session, predicate, timeout=4):
@@ -153,18 +179,30 @@ def test_real_javascript_dialog_has_explicit_recovery(live_browser):
     assert not obs.info.get("dialog") and obs.screenshot is not None
 
 
-def test_real_popup_requires_explicit_switch_then_returns_to_parent(live_browser):
+def test_real_popup_follows_clicked_link_then_returns_to_parent(live_browser):
     session, base = live_browser
     original = next(tab["tab_id"] for tab in session.list_tabs()["tabs"] if tab["active"])
     assert click(session, "popup")["status"] == "executed"
     wait_for(session, lambda o: len(o.info.get("tabs", [])) == 2)
     tabs = session.list_tabs()["tabs"]
     child = next(tab["tab_id"] for tab in tabs if tab["url"] == base + "/child")
-    assert next(tab["tab_id"] for tab in tabs if tab["active"]) == original
-    assert session.switch_tab(child)["status"] == "executed"
+    assert next(tab["tab_id"] for tab in tabs if tab["active"]) == child
     assert observe(session).info["url"] == base + "/child"
+    assert observe(session).info['page_id'] == child
     assert session.close_tab(child)["status"] == "executed"
     assert next(tab["tab_id"] for tab in session.list_tabs()["tabs"] if tab["active"]) == original
+
+
+def test_visual_click_also_follows_its_new_tab(live_browser):
+    session, base = live_browser
+    obs = observe(session)
+    node = next(n for n in obs.context[0]['nodes'] if n.get('id') == 'popup')
+    x, y, width, height = node['bounds']
+    scroll_x, scroll_y = obs.info['scroll_offset']
+    action = Action('click', {'x': x + width / 2 - scroll_x, 'y': y + height / 2 - scroll_y})
+    assert session.execute_viewport_action(action, metadata=obs.info)['status'] == 'executed'
+    child = wait_for(session, lambda o: o.info.get('url') == base + '/child')
+    assert child.info['page_id'] == next(tab['tab_id'] for tab in child.info['tabs'] if tab['active'])
 
 
 def test_real_ui_download_shares_browser_session(live_browser):
@@ -202,7 +240,7 @@ def test_real_episode_reset_isolates_session_and_downloads(live_browser):
     second = session.begin_episode(viewport={"width": 900, "height": 700})
     assert first["initial_state_id"] == second["initial_state_id"]
     assert first["context_id"] != second["context_id"]
-    assert first["downloads_dir"] != second["downloads_dir"]
+    assert first["downloads_dir"] == second["downloads_dir"]
     obs = observe(session)
     assert not obs.info.get("artifacts") and obs.info["url"] == "about:blank"
     assert len(session.list_tabs()["tabs"]) == 1
@@ -213,30 +251,35 @@ def test_real_episode_reset_isolates_session_and_downloads(live_browser):
     assert verifier.evaluate()["status"] == "failed"  # No cookie leaked into the new context.
 
 
-def test_real_pipeline_recovers_modal_and_verifies_paper(live_browser, tmp_path, monkeypatch):
+def test_real_pipeline_recovers_modal_and_verifies_exact_download(live_browser, tmp_path, monkeypatch):
     from osworld_agent.adapters.windows_env import WindowsEnvironment
     from osworld_agent.config import ModelConfig
     from osworld_agent.model.decision_model import ChatModel
     from osworld_agent.pipeline import Pipeline
     from osworld_agent.training_events import read_events
     from test_pipeline_completion import Model
-    from test_pipeline_training import paper_plan
+    import hashlib
 
-    session, _ = live_browser
+    session, base = live_browser
     env = WindowsEnvironment(width=900, height=700)
     env._browser_session = session
     env._episode_prepared = True
     env.initial_state = dict(session.initial_state)
     monkeypatch.setattr("osworld_agent.pipeline._viz_log_status", None)
+    plan = {'steps': [{'goal': '下载当前页面 AAA 的 PDF 文件', 'expected_evidence': '浏览器完成文件传输',
+                      'check_ids': ['file'], 'verification': [{'kind': 'download_complete', 'check_id': 'file'}]}]}
+    contract = {'checks': [{'id': 'file', 'kind': 'download', 'url': base + '/paper.pdf',
+                           'sha256': hashlib.sha256((tmp_path / 'fixture.pdf').read_bytes()).hexdigest()}]}
     model = Model([{"type": "click", "element_id": target, "target": target}
                    for target in ("overlay", "pdf", "close", "pdf")] +
-                  [{"type": "request_finish", "answer": "请系统验收"}] * 2, paper_plan())
+                  [{"type": "request_finish", "answer": "请系统验收"}] * 2, plan)
     model.vision = True
     model.build_vision_message = ChatModel(ModelConfig()).build_vision_message
     result = Pipeline(model=model, env=env, grounding=None, system_prompt="test", max_steps=6,
-                      event_path=str(tmp_path / "events.jsonl")).run("请下载一篇叫做AAA的论文")
+                      completion_spec=contract,
+                      event_path=str(tmp_path / "events.jsonl")).run("下载当前网页的 PDF 文件")
     assert result.success and result.evaluation_available and result.score == 1.0
-    assert result.verification["checks"][0]["matched_title"] == "AAA"
+    assert result.verification['checks'][0]['status'] == 'passed'
     events = read_events(tmp_path / "events.jsonl")
     calls = [e["call"] for e in events if e["event_type"] == "model_call" and e["actor_role"] == "decision"]
     assert len(calls) >= 4
@@ -244,6 +287,28 @@ def test_real_pipeline_recovers_modal_and_verifies_paper(live_browser, tmp_path,
                    for m in c["messages"]) for c in calls)
     assert "先处理当前截图/AX中的遮挡" in str(calls[2]["messages"])
     assert events[-1]["event_type"] == "episode_end"
+
+
+def test_real_pipeline_does_not_click_pdf_before_official_paper_binding(live_browser, monkeypatch):
+    from osworld_agent.adapters.windows_env import WindowsEnvironment
+    from osworld_agent.browser_session import browser_thread
+    from osworld_agent.pipeline import Pipeline
+    from test_pipeline_completion import Model
+    from test_pipeline_training import paper_plan
+    session, _ = live_browser
+    evaluate = browser_thread(lambda owner, script: owner._pick_page(owner._connect()[1]).evaluate(script))
+    evaluate(session, "window.pdfClicks=0;document.getElementById('pdf').addEventListener('click',()=>pdfClicks++)")
+    env = WindowsEnvironment(width=900, height=700)
+    env._browser_session, env._episode_prepared = session, True
+    env.initial_state = dict(session.initial_state)
+    monkeypatch.setattr('osworld_agent.pipeline._viz_log_status', None)
+    model = Model([{'type': 'click', 'element_id': 'pdf', 'target': 'Download PDF'}], paper_plan())
+    result = Pipeline(model=model, env=env, grounding=None, system_prompt='test', max_steps=1).run(
+        '请下载一篇叫做AAA的论文')
+    assert not result.success
+    assert result.trajectory[0]['execution_info']['error_code'] == 'paper_identity_mismatch'
+    assert evaluate(session, 'window.pdfClicks') == 0
+    assert not session.event_metadata()['artifacts']
 
 
 def test_real_browser_delayed_pdf_content_wait_and_semantic_dom(live_browser, monkeypatch):

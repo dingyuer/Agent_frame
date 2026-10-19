@@ -1,0 +1,128 @@
+Pipeline responsibilities after the 2026-10-14 refactor
+
+The Pipeline class remains the public facade. Existing callers can still import
+WaitConfig, AgentResult, StepState, Decision and Execution from pipeline.py and
+call the original methods. No new model, retry, confidence or timeout policy is
+introduced by this extraction.
+
+Module boundaries
+- pipeline_types.py: existing runtime dataclasses and validation.
+- pipeline_format.py: pure action/coordinate/outcome formatting.
+- plan_compiler.py: proposal validation and existing plan refinements; it cannot
+  create or weaken trusted completion checks.
+- planning_service.py: existing prompt, model request and two-attempt repair loop.
+  An acceptance callback installs the plan in the facade and preserves events.
+- settlement.py: CDP download observation, PDF rendering and Jev readiness waits.
+  Explicit ports supply observation, cancellation, remaining time and recording.
+  Render caches and pending IDs remain in the caller's StepState.
+- review_service.py: code/visual review generation. Evidence refresh and queue
+  acceptance remain coordinated by Pipeline.
+- progress_controller.py: existing semantic failure accounting and clearing.
+  It does not advance the execution queue.
+- browser_interaction.py: read-only DOM hit testing and measured scroll effects.
+- decision_modes.py: validates fresh Jev mode choices against screenshot surface
+  and AX capabilities; page-density heuristics are fallback only.
+- decision_context.py: common policy contract + current-mode rules + relevant
+  task rules. The same mode-scoped menu is used for pre-dispatch validation.
+
+Mode-specific policy inputs
+Before each browser decision, Pipeline calls RuntimeDecisionJudge.select_mode
+with the current screenshot, complete interactive AX index and actual queue goal.
+Jev's valid DOM/GUI answer selects the prompt and menu before policy inference.
+The cache binds the exact screenshot, AX, page/document identity and queue goal;
+navigation, a changed frame or queue advancement triggers a new judgment.
+Hard constraints handle desktop, native dialog, invalid observations and dragging.
+Only unavailable/unknown Jev uses the old page-density/AX-presence fallback.
+An impossible DOM choice with no current enabled AX is rejected by capability.
+The next_mode in the older action-transition review stays advisory for the goal
+just reviewed and never overwrites the current evidence-bound choice.
+Browser GUI remains a primary targeting preference: its genuine AX controls
+can still use validated refs, and the recorded actual route remains authoritative.
+Unreferenced visual targets in a Jev-selected GUI prompt bypass semantic DOM
+resolution, so the executor cannot silently undo the model's mode selection.
+Cards show prompt mode/source/reason separately from the actual execution route.
+Current goals that explicitly require dragging select browser GUI without first
+capturing the desktop. Download/save goals keep ref-based right-click available.
+
+The policy menu does not include desktop application switching on DOM pages,
+browser tabs/source on desktop screenshots, or a visual native-select action.
+Native dropdown selection on mixed browser GUI pages still requires a real AX
+reference, an exact observed option and a separate submit action when present.
+Observation-switch actions remain available. Changing surfaces produces a new
+observation and a new policy prompt; a missing image still uses the existing
+bounded framework recapture behavior rather than bypassing image safety.
+
+prompt_metadata records prompt_profile, prompt_rules, selected_actions,
+system_bytes and system_estimate. The default compiler estimates tokens by
+UTF-8 bytes when no local tokenizer is configured; this is not measured Qwen
+token usage. Complete actionable AX, downloads, images, context limits and
+deterministic pre-download/completion checks retain their existing contracts.
+CODE is not an enabled mode or an executable policy capability. Adding it later
+requires explicit mode registration, action schemas and execution validation.
+The public static build_system_prompt compatibility entry describes the basic
+schema for callers without an observation; actual Pipeline inference always uses
+the freshly selected profile rather than that static menu.
+
+Ordering and ownership
+The existing action sequence is retained: execute -> follow opened tabs -> wait
+for downloads -> settle PDF rendering -> Jev readiness -> paper identity binding
+-> review and update queue -> record transition. Waits and Jev checks do not
+increment the policy-step counter. Queue advancement, artifact consumption,
+replanning, final fresh verification and event ordering remain in the facade.
+Services receive dependencies explicitly and never import the Pipeline class.
+There is no second copy of the execution queue or StepState in a service.
+
+Interaction feedback
+Multi-point inspection selects a safe point before sending one original action;
+it never retries a click at a second point after dispatch. Snapshot/document
+identity and layout stability checks remain required. Independent semantic
+controls and registered child input handlers are excluded from candidate hits.
+Arbitrary business branches inside a delegated event handler cannot be inferred
+from the listener inventory; this check is not a proof of all JavaScript behavior.
+
+scroll_feedback contains available, requested_delta, actual_delta, moved, noop,
+at_top, at_bottom, target_container and full container measurements. Missing or
+detached measurements remain unknown. The full diagnostic chain is recorded;
+Jev and the next decision receive a bounded summary. Measured scrolling is a
+local effect and cannot prove that the task's target has been found.
+
+Regression strategy
+Use offline episode comparisons against the frozen pre-refactor source to check
+model prompts, actions, queue state and event/trajectory order, ignoring only
+timings, random run IDs and the intentionally updated source fingerprint.
+Real local Chromium fixtures cover partial/full occlusion, nested controls,
+single-click dispatch, nested scroll containers and boundary measurements.
+
+High-coupling code deliberately retained
+Queue acceptance can automatically consume verified artifacts and advance later
+paper phases. Final verification can revoke an earlier success after evidence
+changes. Event IDs and trajectory completion depend on synchronous ordering.
+Those operations remain together rather than introducing multiple state writers.
+
+Paper search and asynchronous download updates
+PaperSearchRecovery uses the current real search control, submitted URL, result
+titles, native select operands and forward pagination links. The original name
+is unquoted by default; a colon-delimited leading alias can be a candidate.
+Candidates still require trusted official metadata and PDF content verification.
+Unobserved IDs/authors cannot replace search. Changed fields/sorting must be
+submitted through their actual form, and matching candidates are inspected before
+the query is rewritten. Failed metadata resolution is cached by semantic evidence,
+with bounded retries for transient failure or newly observed trusted metadata.
+
+Explicit paper-download tasks set Chrome's own external-PDF preference only in
+the newly allocated owned profile. A real UI link/navigation starts the transfer;
+CDP events and saved artifacts verify it. The framework never retrieves a PDF
+through a backend HTTP shortcut. Ordinary reading tasks retain the PDF viewer.
+Slow HTML/PDF rendering and downloads use bounded framework waits and fast Jev
+polls, without additional policy steps. After CDP establishes a transfer, later
+polls send the current image and event summary instead of repeating the before
+image. Completed transfers still need file identity verification.
+
+No-signal download clicks cannot be replayed at the same point on an unchanged
+page/document/image/AX. Actual content changes and recovery actions remain valid.
+Automatic reviews of existing facts use action_scope=framework_observation and
+action_effect=not_applicable; they cannot overwrite the actual action's evidence.
+The UI displays the actual typed request/images/response separately from the
+merged framework verdict. DOM, browser GUI and desktop GUI templates can each
+be inspected. History summaries are read in worker threads and cached by file
+mtime/size to avoid blocking live logs and WebSocket updates.

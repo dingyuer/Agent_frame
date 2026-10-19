@@ -8,6 +8,8 @@ from __future__ import annotations
 import copy
 import re
 
+from .paper_sources import paper_search_instruction
+
 TASK_ANALYSIS_VERSION = "intent-contract-v2"
 
 
@@ -96,6 +98,12 @@ def infer_paper_spec(task: str):
     if not tail:
         return {'checks': [goal]}
     remainder = re.sub(r'^[\s,，;；]*(?:并且|然后|并|再|后)?\s*', '', tail)
+    # The browser session creates a dedicated child of the selected default
+    # project folder. Keep this as an explicit artifact-path check, rather
+    # than dropping it or leaving the otherwise completed task unresolved.
+    if re.fullmatch(r'(?:PDF\s*)?到\s*默认(?:工程|工作|项目)(?:文件夹|目录)', remainder, re.I):
+        goal['workspace'] = 'default'
+        return {'checks': [goal]}
     rename = re.fullmatch(
         r'(?:(?:将|把)(?:下载的|下载后(?:的)?)?(?:论文|文件)(?:名)?\s*)?'
         r'(?:重命名|改名|命名|另存|保存)(?:为|成)\s*'
@@ -137,8 +145,8 @@ def task_profile(task: str, public_spec=None):
         "contract_available": bool(papers),
         "goals": papers,
         "workflow": [
-            {"phase": "search", "instruction": "确认浏览器可用；选择可访问的学术搜索入口（如 arXiv、Google Scholar 或出版机构），先按用户提供的短名或标题检索。"},
-            {"phase": "identify", "instruction": "由框架根据官方页面元数据绑定完整标题、作者和论文ID；用户短名不是完整标题。有歧义继续检索，模型不能自行改验收目标。"},
+            {"phase": "search", "instruction": paper_search_instruction(task) + "确认浏览器可用；在符合来源策略的入口，先按用户原名称不加引号检索。名称可能是简称，不能要求完整标题只等于简称，也不默认使用精确短语搜索；只有观察到完整标题且需要缩小范围时才考虑双引号。找不到候选时按原名称加paper等中性词，仅在来源策略允许时更换入口；来源受限时报告当前来源受阻。作者与论文ID必须来自实际观察。已有搜索框只有符合来源策略或调用方显式预载且不与用户来源冲突时才复用；框内已填好则直接提交，不重复追加输入。界面语言不影响AX引用。若用户给出精确URL/ID，可直接打开原任务指定页面核对；限流时不要反复刷新。"},
+            {"phase": "identify", "instruction": "由模型结合用户意图与实际观察到的标题、摘要、项目说明判断候选相关性；名称可能是简称、译名或主题描述，字面不相等不能拒绝打开详情。语义确认后由框架根据官方元数据绑定完整标题、作者、论文ID和下载链接；有歧义先补充观察，不能自行改验收目标。"},
             {"phase": "locate_fulltext", "instruction": "找到对应论文的 PDF 全文地址；不要将摘要页、引用记录、登录页当作全文。"},
             {"phase": "download", "instruction": "点击页面中已核对身份的 PDF/下载链接；查看器按钮不在 AX 时切到桌面截图定位。等待框架通过实际产物核实目标下载完成，不用截图猜测，也不重复下载。文件名不符时框架会安排后续界面改名步骤；禁止后台下载或直接改文件。"},
             {"phase": "verify", "instruction": "检查框架对实际文件、PDF 可解析性和论文身份的验收结果；未通过时根据证据继续处理。"},

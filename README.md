@@ -1,8 +1,11 @@
-# Agent_frame
+# 文鳐 Yaero · Agent_frame
 
-OSWorld GUI Agent 框架。
+支持 GUI、DOM 与 CLI 的智能体框架，提供实时监控、轨迹回看、知识库与 Jev 核查。
 
-当前版本：**0.2.0**（[v0.2.0 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.2.0)）。
+当前开发代码已更新至 2026-10-19；Windows 安装与更新请看 [Windows 快速开始](docs/windows-quickstart.md)。
+此仓库保留上游版本历史，下方 v0.2.0 是上游基线版本，不代表当前开发快照。
+
+上游基线：**0.2.0**（[v0.2.0 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.2.0)）。
 
 源码直接位于仓库根目录，不同版本通过 Git 标签保存。
 
@@ -16,7 +19,7 @@ OSWorld GUI Agent 框架。
 入口和测试使用 osworld_agent 包名。克隆时可将仓库目录命名为 osworld_agent：
 
 ~~~powershell
-git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
+git clone https://github.com/dingyuer/Agent_frame.git osworld_agent
 ~~~
 
 ## 浏览器执行与系统验收
@@ -26,7 +29,7 @@ git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
 
 任务必须先形成包含目标、操作前提和预期证据的计划。规划格式错误会修复重试一次；
 仍失败则返回 `planning_failed`，不开始操作。完整计划保存在框架执行队列中；每轮决策仅发送原始任务、
-当前子目标与本步骤预期、一条简短系统反馈、近期行动摘要、截图及按预算选择的 AX 节点。
+当前子目标与本步骤预期、一条简短系统反馈、近期行动摘要、截图及压缩后的 AX 结构。
 相邻步骤、完整队列、验收契约和核查证据保留在框架/核查员/前端/轨迹中，不再重复发给操作模型。
 仅在任务配置中给出的当前字段目标值/目标网址会转为简短操作参数，防止精简时丢失实际要填写的内容。
 规划按可独立核查的目标拆分，不要求固定数量；一个子目标允许多个动作。比如“输入框聚焦、输入关键词、
@@ -45,6 +48,9 @@ git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
 有 AX 结构时默认给操作模型 1 张当前图，纯视觉时最多 3 张；核查员独立取图。
 每步 `prompt_metadata.image_sizes` 记录实际发送尺寸，`image_resize=none_client_side` 标明客户端处理。
 `image_tokens=2048` 只是上下文预算估计，不是图片尺寸/真实视觉 token 数；服务端 processor 仍可能缩放，需查远程配置。
+
+浏览器 AX 与截图的覆盖范围不同：截图只有当前视口，AX 可包含同一已加载页面中视口外的节点。
+决策输入优先保留当前页**全部** `direct=true` 操作引用；搜索结果另汇总为标题、详情页引用、详情页地址和 PDF 引用，下载候选压成完整 ID 列表。非交互的文本和容器按相关性选取。全量操作索引若连压缩后也超出结构预算，编译器明确报观察不完整，不能默默只给前几个节点；这不代表已加载页面以外的分页结果也可见。`prompt_metadata.selection` 记录总量、展示量与遗漏量，`exposed_refs` 是本次可操作的引用集合。
 
 ### 基础动作、执行队列与逐步核查
 
@@ -108,6 +114,34 @@ URL 或“完成标准”写入可信合同。引用存在不证明语义正确�
 `agent.progress_config`。它用于触发重规划，不作为成功/失败训练标签；前端和轨迹保存
 `step_progress`，包括当前步骤、连续无进展次数、证据和最近尝试。
 
+### 耗时与下载验收
+
+实时监控的「阶段耗时明细」显示浏览器启动、规划、观察、选模、决策、派发、步骤核查和最终核查的墙钟时间。
+规划行另列模型请求累计耗时，准备、客户端初始化、修复重试等包含在阶段总耗时中。
+嵌套阶段不可相加；模型卡片不是从点击开始到动作完成的总时间。轨迹保留 `phase_timing` 事件，
+manifest 保留 `phase_timings`；模型调用记录新增 `client_setup_ms` 和 `wall_time_ms`。
+
+必要核查保持开启，通过依赖明确的并行缩短关键路径：
+- 本机启动 Chrome 时并行导入模型 SDK；规划前并行准备客户端、Jev 任务分类与初始环境，全部完成后再规划。客户端准备不发送预热生成请求。
+- 动作后代码核查与 Jev 四问并行，全部汇合后才推进队列；Jev 语义核查仍在需要它的代码结果之后执行，不同时向串行 Jev 服务堆叠请求。
+- 已有模型验收结果时，结束前的新观察与文件预检并行；合入新观察后仍重新检查文件，文件在并行期间被删除或改变也不能通过。
+- 截图稳定检测保留等待间隔和判据，但等待期间继续处理浏览器事件，避免阻塞下载。
+
+前端显示 `parallel_preparation`、`parallel_action_review` 和 `parallel_final_evidence` 的各分支耗时与墙钟时间，
+并将「验收通过/结束 · 正在清理」与任务最终结束分开。清理完成前服务仍保持运行中，不能启动冲突任务。
+并行只能隐藏互不依赖的开销，不能把规划模型本身的服务端排队、prefill 或生成时间消除；实际提速需用同环境任务复测。
+
+下载等待优先轮询浏览器事件，不通过模型猜传输状态；`wait_config.download_visual_assist` 默认开启，保留无事件时的 Jev 视觉辅助，
+已存在 pending 下载时仍只使用事件等待。Chrome 启动器已检查 CDP 就绪，去除其后的固定两秒睡眠。
+规划输出使用紧凑 JSON，可省略框架生成的序号、空 check_ids 和无额外限制的 actions；目标、参数和验收条件仍必须完整。
+
+确定性完成契约已满足时直接结束，不调用最终语义模型。通用内网任务的「下载已完成」由文件收据、字节和哈希核验，
+「是否选对目标并覆盖全部业务要求」仍可能需要一次语义核查，不能仅凭目录里多了文件就宣告整任务成功。
+对于严格识别的单个指定名称下载（含“打开 URL，去某区域中下载 名称”），若整任务语义核查已通过，
+代码重新读取的同一文件及来源未变，则复用该核查；下载提示消失不再触发第二次整任务模型调用。
+这仍标为 `verified_by_model`，不变成确定性 RL 奖励。包含改名、填写、发送等额外要求、名称不匹配、
+来源不符或文件改变的任务不使用这条复用路径。
+
 ### Decision 3.0 / Jev 调试与验证模型选择
 
 Jev 使用 `/v1/systemone`，不是生成文字的 `/chat/completions`。框架只调用远程服务，
@@ -117,30 +151,32 @@ Jev 使用 `/v1/systemone`，不是生成文字的 `/chat/completions`。框架�
 每张最多 9 MiB；建议按动作前、动作后的顺序上传，并在背景中描述图片顺序和系统证据。
 调试请求不执行动作，不进入运行轨迹或 SFT 数据。
 
-预填部署地址（均可修改；选择模型不会启动远程服务）：
+当前已验证的 GPU0 部署（地址可修改；选择模型不会启动远程服务）：
 
 | 型号 | System One 地址 |
 | --- | --- |
-| `vllm-sr/d3-flash`（9B） | `http://10.44.101.62:8007/v1/systemone` |
-| `vllm-sr/d3`（27B） | `http://10.44.101.62:8006/v1/systemone` |
+| `vllm-sr/d3-flash`（9B） | `http://114.212.10.51:8007/v1/systemone` |
 
 调试页的“检查服务与能力”读取 `/health` 和 `/v1/models`；实际模型以响应为准，
-请求中的 model 名称不会切换服务端权重。API Key 可在调试页面临时填写，不保存；
-运行任务时在 **框架服务进程** 中设置 `DECISION_JUDGE_API_KEY`。
-这是客户端凭据，需与 Jev 服务端的 `DECISION_API_KEY` 一致。
+请求中的 model 名称不会切换服务端权重。当前部署无需 Jev API Key；若将来启用服务端认证，
+可在调试页面临时填写，运行任务时在 **框架服务进程** 中设置 `DECISION_JUDGE_API_KEY`。
 
 运行任务时，在“连接模型 → 验证模型”选择：
 
 - **复用决策模型**：使用相同模型服务、独立审查上下文进行语义核查，不调用 Jev。
-- **Jev 9B（前端默认） / 27B（可选）**：代码核查优先，剩余步骤和最终语义要求由 Jev 核查。每次语义核查只问一个
+- **Jev 9B（前端默认）**：代码核查优先，剩余步骤和最终语义要求由 Jev 核查。每次语义核查只问一个
   `passed / progress / failed / pending / unknown` 选择题，减少前向次数。`progress` 表示动作有进展、
   子任务未完成，不推进队列。最终验收不提供 progress 选项。提供有效的动作前后截图、AX、
   文件/系统证据和代码核查结果；没有有效前图时明确标为 after_only。
 
-前端默认地址为 9B 的 `http://10.44.101.62:8007/v1/systemone`；保留原模型和 27B 的手动选择，
-不自动升级模型。Python/CLI 未配置 judge URL 时仍不启用远程 Jev。
+前端默认地址为 9B 的 `http://114.212.10.51:8007/v1/systemone`；如改用其他部署，可手动输入地址。
+Python/CLI 未配置 judge URL 时仍不启用远程 Jev。
 
-证据会按当前子任务、动作目标、变化节点和弹窗排序，每个观察最多 40 个 AX 节点、5 条文件记录。
+运行中的 Jev 参与任务环境分类、加载就绪轮询、决策前选模及步骤/最终语义核查。动作后四问诊断及下载无事件时的视觉辅助默认保留。**每次决策模型推理前**，框架用最新截图、完整可交互 AX 索引和实际当前子目标调用 Jev 的 `next_mode`；该结果直接选择 DOM/GUI 提示词与动作菜单。节点数量/比例只在 Jev 未启用、接口不可用、返回 unknown 或证据超出接口容量时兜底。桌面、原生对话框、失效截图、拖拽能力和 DOM 引用有效性仍由代码约束。相同证据与目标可复用结果，换页、AX/截图变化或队列推进后重新判断。卡片在实际执行模式旁显示 `Prompt DOM/GUI · Jev 选模/规则兜底/能力约束`，理由与原始输入输出可展开。
+
+`jev_transition` 是默认开启的**动作后诊断**（`decision_judge.transition_diagnostics=true`），回答动作是否稳定、局部效果是否正确、对刚审查目标的模式建议、是否建议重规划；其中的旧模式建议不会覆盖决策前针对当前目标的新判断，`replan` 目前仍是诊断建议。实际执行通道单独记录：GUI 模式下无 ref 的视觉目标走 grounding，不再暗中用语义匹配改回 DOM；明确提供的有效 AX ref 仍可操作。下载落盘、文件身份和默认工程目录仍由代码验收。
+
+步骤语义核查的证据按当前子任务、动作目标、变化节点和弹窗排序，每个观察最多 40 个 AX 节点、5 条文件记录；决策前选模单独提供全部当前可交互节点，不套用这个 40 节点上限。
 通过动作前的 DOM 引用提取目标身份，避免只截 AX 前部而漏掉真正目标。模型输入超过 24000 字符时
 优先删去低相关 AX 节点，保留原任务和验收要求；超过接口硬限制会保留 unknown。
 输入框值和目标 URL 的明确效果先由代码判断，动作生效与子任务完成分开显示。
@@ -155,8 +191,8 @@ exclusive 模式默认开启 `recheck_unknown: true`：每个子任务（含最�
 历史证据明确标注时间顺序；旧截图和旧模型结论不能替代当前 URL、文件等确定性验收。
 前端展示动作效果、子任务状态、证据选取数量、补证结果、历史检查点及耗时。
 
-Jev 默认要求最高选项分数 ≥ 0.90 且领先第二名 ≥ 0.15，前端可调整。
-低置信度、pending、超时、缺图和非法响应保留 unknown，不暗中调用另一种模型判成功。
+本机 CLI/Studio 默认使用最大概率标签，保留原概率与置信信息；可显式切回阈值模式（默认最高选项分数 ≥ 0.90 且领先第二名 ≥ 0.15）。旧核心 API 未指定策略时保留阈值默认。
+阈值模式下低置信度仍为 unknown；最高标签本身为 unknown、超时、缺图或非法响应不会伪造通过，不暗中调用另一种模型判成功。
 模型概率不是校准后的成功率；响应中的 confidence 是分布集中度，与最高选项概率分开保存。
 明确的代码失败不能由模型覆盖；下载落盘和文件身份、文件名等条件仍由框架检查。
 模型判 pending 不会凭空启动系统等待。最终语义检查覆盖原始任务的全部要求，
@@ -164,7 +200,7 @@ Jev 默认要求最高选项分数 ≥ 0.90 且领先第二名 ≥ 0.15，前端
 
 ```python
 agent = Agent(decision_model=model, grounding=grounding, env=env,
-    decision_judge={"url": "http://10.44.101.62:8007/v1/systemone",
+    decision_judge={"url": "http://114.212.10.51:8007/v1/systemone",
                     "model": "vllm-sr/d3-flash", "review_mode": "exclusive",
                     "threshold": 0.9, "margin": 0.15, "timeout": 120,
                     "revision": "YOUR_DEPLOYED_REVISION"})
@@ -174,6 +210,11 @@ CLI 支持 `--judge-url`、`--judge-model`、`--judge-revision`、`--judge-thres
 `--judge-margin`、`--judge-timeout`、`--judge-review-mode exclusive`；YAML 对应
 `agent.decision_judge`。旧配置未指定 review_mode 时保留 `assist` 兼容行为：Jev 辅助局部核查，
 不确定时回退原审查模型，最终语义验收用原审查模型。前端选择 Jev 会显式设置 exclusive。
+
+DOM 搜索支持一次决策连续输入并按 Enter：
+`{"next_action":{"type":"type","target":"Search","target_ref":"当前ref","text":"查询词","overwrite":true,"submit_key":"Enter"},"summary":"输入并提交搜索"}`。
+仅单行 text/search 输入框支持此可选参数；普通 type 不自动提交。执行器在输入后重新检查页面绑定、焦点与输入值，再发送一次 Enter，随后照常等待和核查结果。控件替换、焦点变化或输入值不符会中断后续按键，不做 GUI 连按回退。多字段表单、正文及联想选择仍应分步。
+该决策计一轮，`execution_info.compound_action.primitives` 分别记录 type/press 及其状态；原始模型输出仍原样存档，便于按“决策轮次”或“基础操作”分析 SFT/RL 轨迹。输入值出现不等于提交成功，组合结果仍走代码核查与 Jev 四问。
 
 运行卡片显示代码、原模型和 Jev 的核查耗时，Jev 调试页还显示请求中的计时。
 耗时包括客户端处理、网络和服务端排队，**不是纯 GPU 推理耗时**。默认 Jev 超时 120 秒，
@@ -269,12 +310,21 @@ Chromium 响应长度/下载进度超过上限时取消传输，保存完成后�
 ### 默认操作目录与桌面观察
 
 Windows 任务在规划前建立默认操作目录，`begin_episode` 沿用同一目录，整轮不会改变。
-默认根目录是项目下 `workspace/`；可在前端配置，或传入 `--workspace-dir PATH`
-（兼容 `--download-dir`），也可设置 `OSWORLD_WORKSPACE_DIR`。每次运行创建独立子目录，
-以免把上次运行的文件当成新成果；实际绝对路径写入 `initial_state.workspace_dir`、manifest、
-规划输入、操作反馈和前端。下载文件落在该目录，模型找文件、改名、另存默认使用该路径；
+根目录可在前端配置，或传入 `--workspace-dir PATH`（兼容 `--download-dir`），也可设置
+`OSWORLD_WORKSPACE_DIR`。同一天的任务共用根目录下的 `YYYY-MM-DD` 文件夹，只放下载和任务产生的文件。
+轨迹、事件日志和截图独立保存到程序目录的 `local_runs/ui_日期时间_随机ID/`，可通过
+`OSWORLD_LOCAL_RUNS_DIR` 设置日志根目录，或用 `--result-dir` 显式指定本次日志目录。旧工程目录的历史日志继续可读，
+不会自动移动或删除。下载归属仍按本次浏览器
+事件和文件指纹核对，目录里既有旧文件不算新下载。实际绝对路径写入 `initial_state.workspace_dir`、
+规划输入、操作反馈和前端。模型找文件、改名、另存默认使用该路径；
 原始任务明确指定其他文件或路径时才改用指定位置。这是操作默认值，不是文件系统沙箱。
 远程 VM 的控制器产物目录会标注为 `controller_host`，不能假设其在 VM 文件管理器里可见。
+
+本机和 Studio 运行器的 Jev 默认采用最高概率标签，配置为
+`--judge-selection-policy maximum_probability`；完整概率仍记录在轨迹中，明确的代码失败仍不能被模型覆盖。
+需要保守门槛时使用 `--judge-selection-policy threshold --judge-threshold 0.9 --judge-margin 0.15`。
+前端可切换“标签选择策略”，浏览器仅保存这些运行参数，不保存 Jev API Key。直接调用旧核心 API 未传
+`selection_policy` 时仍保留 threshold 默认行为；无需覆盖 Windows 已有的 `model/decision_judge.py`。
 
 后台浏览器继续使用 CDP 视口截图和虚拟输入，不依赖前台焦点，也不会在截图失败时自动截桌面。
 显式 `observe_desktop` 使用 Pillow 的 Windows `all_screens` 截图及 Win32 虚拟屏幕度量，
@@ -407,7 +457,44 @@ result = agent.run(task, max_steps=30)
 也可在 `agent.run(...)` 中覆盖 `completion_spec`、`private_completion_spec`、`event_path`、`run_id`。
 OSWorld 任务 JSON 的 `completion` 可提供公开合同；存在环境评测器时仍执行两者的联合判定。
 
+## 领域知识与运行统计
+
+前端侧栏的「知识库」可新增、编辑、停用条目，保存到独立的
+`knowledge/user_knowledge.yaml`。也可以直接编辑这个文件；设置
+`AGENT_KNOWLEDGE_PATH` 可换用另一个固定文件。默认提供一条**停用的示例**，
+请填入实际网址后启用，不要把登录凭据放进知识正文。
+
+每条知识包含 `id`、`title`、`aliases`（任务中常用的称呼）、`keywords`、
+`url`、`content`、`enabled`。例如把“校园官网”“学校官网”关联到实际校内入口，
+在正文中说明公告位置或 VPN 前提。前端「检索预览」使用当前草稿，不调用模型。
+
+规划前按别名、标题、域名或至少两个关键词筛选，最多选入 4 条、6000 字符，
+保留完整条目；无可靠匹配则不注入。相同称呼命中不同网址会显式报告歧义。
+这是可解释的词项检索，不是语义向量检索，未命中的同义说法应补充到别名中。
+任务中的明确要求优先，知识内容不构成完成证据。一次运行固定使用同一份检索结果，
+轨迹记录知识版本及实际选中内容，编辑在下次运行生效。
+
+本机轨迹列表和详情均显示耗时、输入/输出 token。前端启动的新任务另存
+`run_timing.json`，记录进程启动至退出的墙钟时间，包含浏览器准备、导出及清理；
+`trajectory.json` 的 `outcome.run_metrics` 保留执行与验收跨度及分角色用量。
+历史运行按已有事件时间估算，未完整结束的记录标注“截至最后事件”。
+token 只汇总规范 `model_call` 事件并按 `call_id` 去重，包括规划、决策、Jev
+和定位请求；服务未报告的用量标记为不完整，不以零替代未知用量。
+
+重规划会收到已完成步骤、受阻子目标、执行失败、最近动作和核查证据，必须返回
+`strategy_change` 说明失败原因、路径调整及预期新证据。框架拒绝原样重复的
+剩余计划，以及首步仍为原受阻方法的计划；校验失败仅允许有界重试。
+失败教训在本次任务内保留，原有进展监控、恢复预算和最终验收继续生效。
+策略说明是模型建议，不能证明新方法有效；改写措辞但实际无效的路径仍须由执行核查发现。
+知识检索与重规划依据均可在轨迹详情中查看。
+
 ## 连接远程模型运行
+
+默认决策模型使用阿里云百炼的多模态 `qwen3.7-flash`。将密钥放在仓库根目录的忽略文件
+`.env` 中（格式见 `.env.example`），或设置进程环境变量 `DASHSCOPE_API_KEY`。配置文件和
+Web 前端使用 `env:DASHSCOPE_API_KEY` 引用密钥，不会把真实值写入受版本控制的 YAML。
+旧版 `qwen-flash` 只适合纯文本调用；本框架默认会发送当前截图，因此应使用支持图片输入的
+Flash 型号。
 
 下列命令在 `osworld_agent` 的父目录运行，本机须有 Windows 浏览器运行依赖及带 remote debugging
 的 Chrome。模型均可位于其他机器；`AAA` 和模型名称、端点需替换为实际值。
@@ -415,6 +502,36 @@ OSWorld 任务 JSON 的 `completion` 可提供公开合同；存在环境评测�
 ```powershell
 python -m osworld_agent.run_windows_local --task "请下载一篇叫做AAA的论文" --model DECISION_MODEL --model-url http://MODEL_HOST:9028/v1 --planner-model PLANNER_MODEL --planner-url http://PLANNER_HOST:9028/v1 --ground-type ui-tars --ground-model UI-TARS-1.5-7B --ground-url http://GROUND_HOST:49999/v1 --max-steps 30 --result-dir ./runs/paper-001
 ```
+
+macOS 本机运行使用同一套决策、浏览器 CDP、下载与验收逻辑；`run_local` 根据运行主机自动选择
+macOS 或 Windows 适配器，Studio 的「本机任务」也自动选择，无须在前端手动指定平台。
+Studio 的「默认工程文件夹」可用系统文件夹选择器或绝对路径设置，选择会保存在本机；每天只在
+该目录下创建一个日期文件夹，当天任务的下载和运行日志都放在里面。浏览器通过 CDP 操作且不要求窗口固定位置，
+运行时可以拖动新启动的 Chrome 窗口。
+Windows 迁移时请保持解压后的目录名为 `osworld_agent`，在它的父目录打开 PowerShell，使用 Python 3.12 和已安装的 Google Chrome：
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r osworld_agent\requirements-windows.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+Copy-Item osworld_agent\.env.example osworld_agent\.env
+# 在 osworld_agent\.env 中填写本机的 DASHSCOPE_API_KEY
+powershell -ExecutionPolicy Bypass -File osworld_agent\start_studio_windows.ps1
+```
+
+打开 `http://127.0.0.1:8090`，先选择默认工程文件夹。普通任务可以直接输入“搜索论文 Attention is all you need 并下载 PDF 到默认工程文件夹”；“稳定演示：本地标题搜索回放 → 官方 PDF 下载”按钮会将这句话送给规划与决策模型，同时仅把已标注的本地搜索回放页设为浏览器初始状态。论文 ID、作者与 PDF 地址不作为预填任务条件，须从搜索结果和官方页面获得。本地回放可以演示操作与核验链路，但不能宣称 arXiv 在线搜索已通过。Windows 专用 Chrome 以无启动窗口方式连接 CDP，再由隔离任务上下文创建一扇可拖动的任务窗口；任务结束后关闭本次专用浏览器。
+在 macOS 安装依赖并运行（仍从 `osworld_agent` 的父目录执行）：
+
+```bash
+python3.12 -m venv osworld_agent/.venv-mac
+osworld_agent/.venv-mac/bin/python -m pip install -r osworld_agent/requirements-mac.txt
+osworld_agent/.venv-mac/bin/python -m osworld_agent.run_local --task "打开 example.org"
+```
+
+浏览器任务通过专用 Chrome 和 CDP 工作。要执行 `observe_desktop` 及桌面鼠标键盘操作，
+还需在 macOS「系统设置 → 隐私与安全性」给运行 Python 的终端或应用开启「屏幕录制」与
+「辅助功能」，然后重启该程序。缺少权限时桌面层会明确拒绝动作；浏览器 CDP 不依赖这两项权限。
+Mac 桌面截图把多显示器合成为逻辑点坐标，点击前会重新检查显示器布局和前台窗口。
 
 不传 `--planner-model` 时，规划使用决策模型。独立规划器在 RL 中明确视为固定 teacher；同一模型
 承担规划和决策时，两类采样都进入 on-policy 数据。两者均可导出经过筛选的规划 SFT 样本。

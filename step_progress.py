@@ -50,6 +50,7 @@ class StepProgressMonitor:
         self.idle = self.decisions = self.explorations = 0
         self.seen = set()
         self.attempts = []
+        self.collected_seen = set()
 
     def _fresh(self, key):
         key = json.dumps(key, sort_keys=True, ensure_ascii=False)
@@ -58,7 +59,7 @@ class StepProgressMonitor:
         self.seen.add(key)
         return True
 
-    def observe(self, step, review, before, after, action, info):
+    def observe(self, step, review, before, after, action, info, *, collected_sources=()):
         step_id = review.get('plan_step_id') or (step or {}).get('id', 'final')
         if step_id != self.step_id:
             self.step_id = step_id
@@ -115,6 +116,21 @@ class StepProgressMonitor:
                 if (novel_page or discovery) and self.explorations < self.config.exploration_allowance:
                     self.explorations += 1
                     evidence.append('发现新页面或滚动后新的结构内容（有界探索宽限）')
+            # Information gathering has durable page evidence, unlike arbitrary
+            # navigation. Require an independent progress judgment AND novel
+            # non-link text retained by the framework. Never grants completion.
+            if (successful and collected_sources and review.get('step_outcome') == 'progress'
+                    and not review.get('progress_hint')):
+                current = next((s for s in collected_sources if s.get('url') == _url(after)), None)
+                parents = {str(n.get('ref')): n for n in _nodes(after)}
+                facts = {str(n.get('name', '')).strip() for n in _nodes(after)
+                         if n.get('role') in {'StaticText', 'paragraph', 'cell'}
+                         and parents.get(str(n.get('parent')), {}).get('role') != 'link'
+                         and len(str(n.get('name', '')).strip()) >= 6}
+                new_facts = facts - self.collected_seen
+                if current and new_facts and sum(map(len, new_facts)) >= 12:
+                    self.collected_seen.update(facts)
+                    evidence.append('已保存新的网页正文证据，且独立核查确认采集有进展；尚未判定完成')
             effect = review.get('action_effect', {})
             fingerprint = effect.get('evidence_fingerprint')
             if (successful and effect.get('method') == 'decision_model' and effect.get('status') == 'passed'

@@ -1,10 +1,10 @@
-﻿# osworld_agent 示例配置
+# osworld_agent 示例配置
 # 换模型 = 改下面 model / grounding_model 的名字（对应 models.py 里的注册表）即可，不动代码。
 
 # ---------------- 决策模型 ----------------
 model:
-  name: "27b"                # 注册表里的名字，见 model/decision_model.py 的 MODEL_REGISTRY
-  url: "http://10.44.101.62:8094/v1"
+  name: "27b"                # 决策模型：Qwen3.6-27B（vLLM @ 7.246.80.237:48888）
+  url: "http://7.246.80.237:48888/v1"
   api_key: "EMPTY"
   temperature: 0.3
   max_tokens: 2048
@@ -24,7 +24,7 @@ agent:
   max_retries: 3             # 动作解析失败最多重试几次
   enable_reflection: true    # 是否开启反思（reflection）
   early_stop_repeat: 3       # 相同动作无进展阈值；重复执行失败会提前进入恢复
-  max_replans: 1
+  max_replans: 3
   wait_config:
     enabled: true
     poll_interval_s: 0.25

@@ -25,13 +25,19 @@ from .vmware_env import to_pyautogui
 
 
 class WindowsEnvironment(Environment):
+    cli_target = "local"
+
     """Windows 本机环境（GUI + browser use）。"""
 
     evaluation_available = False
 
     def __init__(self, browser_port: int = 9222, width: int = 1920, height: int = 1080,
                  downloads_dir: Optional[str] = None, workspace_dir: Optional[str] = None,
-                 window_timeout_s: float = 15.0):
+                 window_timeout_s: float = 15.0, browser_start_url: Optional[str] = None,
+                 browser_session_mode: str = "isolated"):
+        if not isinstance(browser_session_mode, str) or browser_session_mode not in {"isolated", "persistent"}:
+            raise ValueError('browser_session_mode must be isolated or persistent')
+        self.browser_session_mode = browser_session_mode
         if type(window_timeout_s) not in (int, float) or not math.isfinite(window_timeout_s) or window_timeout_s <= 0:
             raise ValueError('window_timeout_s must be finite and positive')
         self.window_timeout_s = window_timeout_s
@@ -48,6 +54,7 @@ class WindowsEnvironment(Environment):
         self.browser_only = True  # 浏览器专用：用精简 system prompt + 强化 DOM 定位
         self.downloads_dir = downloads_dir
         self.workspace_dir = workspace_dir
+        self.browser_start_url = browser_start_url
         if downloads_dir is not None and workspace_dir is not None:
             raise ValueError('workspace_dir 与 downloads_dir 不能同时指定')
         self._browser_session = None
@@ -67,8 +74,11 @@ class WindowsEnvironment(Environment):
     def begin_episode(self, task_id=None, isolated=True):
         session = self._get_browser_session()
         self.initial_state = session.begin_episode(task_id=task_id, isolated=isolated,
-            viewport={"width": self.width, "height": self.height})
-        if not self.initial_state.get("isolated"):
+            viewport={"width": self.width, "height": self.height}, start_url=self.browser_start_url)
+        if (not self.initial_state.get("isolated") and not
+                (self.browser_session_mode == "persistent"
+                 and self.initial_state.get("isolation_scope") == "task_tabs"
+                 and self.initial_state.get("session_mode") == "persistent")):
             raise RuntimeError("Browser episode isolation was not established")
         self.initial_state['workspace_location'] = 'target_desktop'
         session.initial_state = dict(self.initial_state)
@@ -118,6 +128,10 @@ class WindowsEnvironment(Environment):
         shot, self._desktop_capture = capture_virtual_desktop()
         return shot
 
+    def _runtime_state(self):
+        from ..desktop_state import windows_runtime_state
+        return windows_runtime_state()
+
     def _focus_is_browser(self) -> bool:
         """本机浏览器模式：以「CDP 有可用页面」为准，不依赖前台焦点。
 
@@ -141,7 +155,7 @@ class WindowsEnvironment(Environment):
             from ..browser_session import BrowserSession, BrowserOptions
             self._browser_session = BrowserSession(
                 options=BrowserOptions(endpoint=f"http://localhost:{self.browser_port}",
-                                       require_focus=False),
+                                       require_focus=False, session_mode=self.browser_session_mode),
                 foreground_check=None,
                 downloads_dir=self.downloads_dir,
                 workspace_dir=self.workspace_dir,
@@ -168,11 +182,10 @@ class WindowsEnvironment(Environment):
         截图仍是该浏览器页面的完整内容，不受遮挡/前台影响。
         """
         from ..model.grounding import screenshot_size
-        from ..scene import Scene
+        from ..scene import Scene, browser_scene
 
-        from ..desktop_state import windows_runtime_state
         from ..desktop_readiness import foreground, window_identity
-        desktop_before = windows_runtime_state() if self._observation_surface == 'desktop' else None
+        desktop_before = self._runtime_state() if self._observation_surface == 'desktop' else None
         screenshot, snapshot, metadata = None, None, {}
         error = ""
         if self._observation_surface == "browser":
@@ -199,12 +212,8 @@ class WindowsEnvironment(Environment):
 
         if screenshot is not None and metadata.get("screenshot_space") == "css_viewport":
             info = metadata
-            info["scene"] = Scene(
-                browser_use=1, structure_available=bool(snapshot),
-                mode="browser_dom" if snapshot else "visual",
-                reason="structured_page" if snapshot else "no_structured_page",
-                url=(snapshot or {}).get("url", metadata.get("url", "")),
-                page_id=metadata.get("page_id", ""),
+            info["scene"] = browser_scene(
+                snapshot, screenshot, page_id=metadata.get("page_id", ""),
                 snapshot_id=metadata.get("snapshot_id", ""),
             ).to_dict()
             context = [snapshot] if snapshot else []
@@ -241,7 +250,7 @@ class WindowsEnvironment(Environment):
         info["active_surface"] = "browser" if info.get("screenshot_space") == "css_viewport" else "desktop"
         info["requested_surface"] = self._observation_surface
         info['control_mode'] = 'background_browser' if info['active_surface'] == 'browser' else 'desktop_takeover'
-        info["runtime_state"] = windows_runtime_state()
+        info["runtime_state"] = self._runtime_state()
         if desktop_before is not None:
             before, after = foreground(desktop_before), foreground(info['runtime_state'])
             info['desktop_focus_stable'] = bool(before and after and window_identity(before) == window_identity(after))
@@ -250,13 +259,11 @@ class WindowsEnvironment(Environment):
         self._last_observation_info = dict(info)
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
-    def _derive_scene(self, snapshot):
-        """算显式场景：有快照→browser_dom；浏览器但无结构→visual；非浏览器→visual/desktop。"""
-        from ..scene import Scene
+    def _derive_scene(self, snapshot, screenshot=None):
+        """Derive browser mode from whether page content is actionable in AX."""
+        from ..scene import Scene, browser_scene
         if snapshot:
-            return Scene(browser_use=1, structure_available=True, mode="browser_dom",
-                         reason="structured_page", url=snapshot.get("url", ""),
-                         snapshot_id=snapshot.get("snapshot_id", "")).to_dict()
+            return browser_scene(snapshot, screenshot).to_dict()
         if self._focus_is_browser():
             return Scene(browser_use=1, structure_available=False, mode="visual",
                          reason="no_structured_page").to_dict()
@@ -305,6 +312,13 @@ class WindowsEnvironment(Environment):
             route = None
         if route is not None:
             return route  # browser_dom 或 reobserve
+        # A content-heavy AX snapshot may expose only navigation/filter controls.
+        # Do not resolve a card description against those unrelated controls;
+        # let screenshot grounding choose the card while explicit refs still work.
+        selected_mode = ((obs.info or {}).get('decision_mode') or {}).get('mode')
+        if ((selected_mode == 'gui' or (selected_mode is None and observation_scene(obs).get("mode") == "browser_gui"))
+                and action.action in {"click", "double_click", "right_click"}):
+            return None
         # 语义兜底：target 描述 → ref（仍在结构层）
         target = str(action.args.get("target") or "")
         if target:
@@ -448,6 +462,10 @@ class WindowsEnvironment(Environment):
         if self._window_wait_cancel.is_set() or (self._window_wait_remaining and self._window_wait_remaining() <= 0):
             return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
                 'channel': 'desktop', 'error_code': 'desktop_operation_cancelled', 'reason': '操作已取消或任务时间预算已耗尽'})
+        return self._step_desktop(action)
+
+    def _step_desktop(self, action: Action) -> StepResult:
+        name = action.action
         if name == 'switch_applications':
             from ..desktop_state import switch_windows_application, windows_application_process
             process = windows_application_process(action.args.get('app_code'))

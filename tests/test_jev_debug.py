@@ -93,7 +93,8 @@ def test_exclusive_jev_reviews_steps_and_whole_task_without_generative_fallback(
     pipeline, calls, reviewer = exclusive_pipeline(monkeypatch)
     result = pipeline.run('核对结果')
     assert result.success and not reviewer.calls
-    assert len(calls) == 3  # task classification, step review, whole task
+    assert len(calls) == 4  # classification, action assessment, step review, whole task
+    assert set(calls[1]['questions']) == {'settled', 'correct', 'next_mode', 'replan'}
     assert list(calls[-1]['questions']) == ['step']  # one forward per semantic review
     assert '原始任务的所有要求' in json.loads(calls[-1]['state'])['step']['expected_evidence']
     assert result.trajectory[0]['step_verification']['latency_ms'] >= 0
@@ -114,7 +115,7 @@ def test_exclusive_jev_cannot_override_failed_code(monkeypatch):
     pipeline.model.responses[0] = json.dumps({'steps': [{'goal': '打开网页', 'expected_evidence': '目标 URL',
         'verification': [{'kind': 'url_equals', 'url': 'https://target.invalid/'}]}]})
     result = pipeline.run('打开网页')
-    assert not result.success and len(calls) == 1 and not reviewer.calls
+    assert not result.success and len(calls) == 2 and not reviewer.calls
     assert result.trajectory[0]['step_verification']['method'] == 'code'
     assert result.trajectory[0]['step_verification']['latency_ms'] >= 0
 

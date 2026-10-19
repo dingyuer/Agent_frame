@@ -11,11 +11,14 @@ from osworld_agent.rl.credit import build_tree
 from osworld_agent.trajectory import iter_sft_records
 from osworld_agent.trajectory import build_trajectory
 from osworld_agent.pipeline import Pipeline
+from osworld_agent.browser_feedback import paper_download_preflight_error
+from osworld_agent.env import Observation
 
 from test_pipeline_completion import observation
 from test_pipeline_completion import Model, Env
 from test_pipeline_training import paper_plan
 from test_paper_completion import pdf_file
+from test_paper_resolver import fixture_selection
 from test_training_collection import trajectory, credit_rollout
 
 import pytest
@@ -66,7 +69,7 @@ def environment(tmp_path, url="https://arxiv.org/abs/2603.11558"):
 def test_short_query_and_filename_bind_identity_without_downloading(tmp_path):
     env = environment(tmp_path)
     verifier = CompletionVerifier("请下载一篇叫做Roboclaw的论文，并重命名为Roboclaw")
-    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=metadata_fetch))
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=metadata_fetch, identity_selector=fixture_selection))
     events = []
     result = workflow.advance(env.observe(), verifier, env, lambda name, **p: events.append((name, p)))
     assert not env._browser_session.calls
@@ -84,12 +87,61 @@ def test_selected_paper_does_not_mix_in_bibliography_links():
     assert observed_paper_urls(obs) == ["https://arxiv.org/abs/2603.11558"]
 
 
+def test_search_result_candidates_are_not_removed_by_literal_title_matching():
+    from test_browser_result_cards import result_block
+    block = result_block(exact=True)
+    obs = Observation(context=[block], info={'url': block['url']})
+    urls = observed_paper_urls(obs, 'Attention Is All You Need')
+    assert len(urls) == 50 and 'https://arxiv.org/abs/2601.00049' in urls
+    assert observed_paper_urls(obs, 'A Title Not Present') == urls
+
+
+def test_paper_download_requires_verified_identity_before_dispatch():
+    pdf = 'https://arxiv.org/pdf/2603.11558'
+    other = 'https://arxiv.org/pdf/2603.99999'
+    block = {'kind': 'browser_ax', 'url': 'https://arxiv.org/search/', 'nodes': [
+        {'ref': '1', 'role': 'link', 'name': 'pdf', 'href': pdf, 'direct': True},
+        {'ref': '2', 'role': 'link', 'name': 'A candidate paper',
+         'href': 'https://arxiv.org/abs/2603.99999', 'direct': True}]}
+    obs = Observation(context=[block], info={'url': block['url']})
+    class Goals:
+        def __init__(self, binding=None): self.binding = binding
+        def paper_goals(self): return [{'query': 'RoboClaw', 'binding': self.binding}]
+    pending = Goals()
+    assert paper_download_preflight_error(Action('click', {'target': 'pdf', 'target_ref': '1'}),
+                                          obs, pending, {'target_ref': '1'})
+    assert not paper_download_preflight_error(Action('click', {'target': 'A candidate paper', 'target_ref': '2'}),
+                                              obs, pending, {'target_ref': '2'})
+    assert paper_download_preflight_error(Action('goto', {'url': pdf}), obs, pending)
+    bound = Goals({'canonical_id': '2603.11558', 'pdf_url': pdf})
+    assert not paper_download_preflight_error(Action('goto', {'url': pdf}), obs, bound)
+    assert paper_download_preflight_error(Action('goto', {'url': other}), obs, bound)
+    viewer = Observation(info={'url': pdf, 'document_kind': 'pdf'})
+    assert not paper_download_preflight_error(Action('hotkey', {'keys': ['command', 's']}), viewer, bound)
+
+
+def test_current_official_page_metadata_binds_without_second_network_fetch(tmp_path):
+    env = environment(tmp_path)
+    obs = env.observe()
+    obs.info['url'] = 'https://arxiv.org/abs/2603.11558'
+    obs.info['paper_metadata'] = {
+        'source': 'observed_arxiv_meta', 'source_url': obs.info['url'],
+        'canonical_id': '2603.11558', 'title': TITLE, 'authors': ['Alice Smith'],
+        'pdf_url': URL}
+    verifier = CompletionVerifier('请下载一篇叫做Roboclaw的论文')
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates,
+        fetcher=lambda *_args, **_kw: pytest.fail('current page metadata should avoid fetch'),
+        identity_selector=fixture_selection))
+    workflow.advance(obs, verifier, env, lambda *a, **k: None)
+    assert verifier.bindings and not env._browser_session.calls
+
+
 def test_ambiguous_search_and_exhausted_time_never_download(tmp_path):
     env = environment(tmp_path, "https://arxiv.org/search/")
     obs = env.observe()
     obs.info["download_candidates"] = [{"url": URL}, {"url": "https://arxiv.org/pdf/2603.99999"}]
     verifier = CompletionVerifier("请下载一篇叫做Roboclaw的论文")
-    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=metadata_fetch))
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=metadata_fetch, identity_selector=fixture_selection))
     workflow.advance(obs, verifier, env, lambda *a, **k: None)
     assert not verifier.bindings and not env._browser_session.calls
     env = environment(tmp_path)
@@ -104,16 +156,102 @@ def test_unavailable_resolution_is_not_retried_each_decision(tmp_path):
         raise OSError("offline")
     env = environment(tmp_path)
     verifier = CompletionVerifier("请下载一篇叫做Roboclaw的论文")
-    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=offline))
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=offline, identity_selector=fixture_selection))
     for _ in range(3):
         workflow.advance(env.observe(), verifier, env, lambda *a, **k: None)
     assert len(calls) == 1 and not env._browser_session.calls
 
 
+def test_same_url_new_trusted_metadata_can_recover_failed_resolution(tmp_path):
+    env = environment(tmp_path)
+    calls = []
+    def offline(*args, **kwargs):
+        calls.append(args)
+        raise OSError('offline')
+    verifier = CompletionVerifier('请下载一篇叫做Roboclaw的论文')
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=offline, identity_selector=fixture_selection))
+    first = env.observe()
+    workflow.advance(first, verifier, env, lambda *a, **k: None)
+    assert not verifier.bindings and len(calls) == 1
+    first.info.update(url='https://arxiv.org/abs/2603.11558', captured_at=10,
+        paper_metadata={'source': 'observed_arxiv_meta', 'source_url': 'https://arxiv.org/abs/2603.11558',
+                        'canonical_id': '2603.11558', 'title': TITLE, 'authors': ['Alice Smith'], 'pdf_url': URL})
+    workflow.advance(first, verifier, env, lambda *a, **k: None)
+    assert verifier.bindings and len(calls) == 1
+    assert workflow._resolution_rounds == 2 and not env._browser_session.calls
+    first.info['captured_at'] = 11
+    workflow.advance(first, verifier, env, lambda *a, **k: None)
+    assert workflow._resolution_rounds == 2
+
+
+def test_transient_retry_has_cooldown_and_per_evidence_and_total_limits(tmp_path, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr('osworld_agent.paper_workflow.time.monotonic', lambda: now[0])
+    calls = []
+    def offline(*args, **kwargs):
+        calls.append(args)
+        raise OSError('offline')
+    env = environment(tmp_path)
+    verifier = CompletionVerifier('请下载一篇叫做Roboclaw的论文')
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=offline, identity_selector=fixture_selection), retry_delay_s=2,
+                             max_transient_retries=1, max_resolution_rounds=3)
+    obs = env.observe()
+    for _ in range(5):
+        workflow.advance(obs, verifier, env, lambda *a, **k: None)
+    assert len(calls) == 1
+    now[0] = 3
+    workflow.advance(obs, verifier, env, lambda *a, **k: None)
+    now[0] = 10
+    workflow.advance(obs, verifier, env, lambda *a, **k: None)
+    assert len(calls) == 2
+    for identifier in ('2603.99998', '2603.99999'):
+        changed = observation('https://arxiv.org/abs/' + identifier)
+        workflow.advance(changed, verifier, env, lambda *a, **k: None)
+    assert len(calls) == 3 and workflow._resolution_rounds == 3
+    assert not verifier.bindings and not env._browser_session.calls
+
+
+def test_confirmed_title_mismatch_without_new_evidence_is_not_retried(tmp_path, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr('osworld_agent.paper_workflow.time.monotonic', lambda: now[0])
+    env = environment(tmp_path)
+    calls = []
+    def unrelated(url, **kwargs):
+        calls.append(url)
+        return {'url': url, 'text': metadata_fetch(url)['text'].replace(TITLE, 'A Different Paper')}
+    verifier = CompletionVerifier('请下载一篇叫做Roboclaw的论文')
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=unrelated, identity_selector=fixture_selection))
+    for clock in (0, 3, 30):
+        now[0] = clock
+        workflow.advance(env.observe(), verifier, env, lambda *a, **k: None)
+    assert len(calls) == 1 and not verifier.bindings and not env._browser_session.calls
+
+
+def test_new_capture_timestamp_does_not_count_as_new_metadata_semantics(tmp_path):
+    env = environment(tmp_path)
+    verifier = CompletionVerifier('请下载一篇叫做Roboclaw的论文')
+    obs = env.observe()
+    obs.info.update(url='https://arxiv.org/abs/2603.11558', captured_at=10,
+        paper_metadata={'source': 'observed_arxiv_meta', 'source_url': 'https://arxiv.org/abs/2603.11558',
+                        'canonical_id': '2603.11558', 'title': 'A Different Paper',
+                        'authors': ['Alice Smith'], 'pdf_url': URL})
+    calls = []
+    def resolver(*args, **kwargs):
+        calls.append(kwargs['metadata'])
+        return resolve_arxiv_candidates(*args, **kwargs,
+            fetcher=lambda *_a, **_k: pytest.fail('metadata must be used'))
+    workflow = PaperWorkflow(resolver=resolver)
+    workflow.advance(obs, verifier, env, lambda *a, **k: None)
+    obs.info['captured_at'] = 20
+    workflow.advance(obs, verifier, env, lambda *a, **k: None)
+    assert len(calls) == workflow._resolution_rounds == 1
+    assert not verifier.bindings and not env._browser_session.calls
+
+
 def test_pending_or_uncertain_execution_never_triggers_another_transfer(tmp_path):
     env = environment(tmp_path)
     verifier = CompletionVerifier("请下载一篇叫做Roboclaw的论文")
-    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=metadata_fetch))
+    workflow = PaperWorkflow(resolver=partial(resolve_arxiv_candidates, fetcher=metadata_fetch, identity_selector=fixture_selection))
     workflow.advance(env.observe(), verifier, env, lambda *a, **k: None, allow_download=False)
     assert verifier.bindings and not env._browser_session.calls
     env._browser_session.event_metadata = lambda: {"pending_downloads": [
@@ -125,7 +263,7 @@ def test_pending_or_uncertain_execution_never_triggers_another_transfer(tmp_path
 def test_stale_click_cannot_trigger_automatic_download_or_positive_sft(tmp_path, monkeypatch):
     monkeypatch.setattr("osworld_agent.pipeline._viz_log_status", None)
     monkeypatch.setattr("osworld_agent.paper_workflow.resolve_arxiv_candidates",
-                        partial(resolve_arxiv_candidates, fetcher=metadata_fetch))
+                        partial(resolve_arxiv_candidates, fetcher=metadata_fetch, identity_selector=fixture_selection))
     browser = environment(tmp_path)
     env = Env()
     env._browser_session = browser._browser_session
@@ -133,8 +271,9 @@ def test_stale_click_cannot_trigger_automatic_download_or_positive_sft(tmp_path,
     env.observe = browser.observe
     env.route_action = lambda action, obs: {"channel": "reobserve", "reason": "invalid ref", "error_code": "stale"}
     model = Model([{"type": "click", "target": "Download PDF", "target_ref": "1000,17"}], paper_plan())
-    result = Pipeline(model=model, env=env, grounding=None, system_prompt="test", max_steps=1).run(
-        "请下载一篇叫做Roboclaw的论文，并重命名为Roboclaw")
+    pipeline = Pipeline(model=model, env=env, grounding=None, system_prompt="test", max_steps=1)
+    pipeline.paper_identity_selector = SimpleNamespace(calls=[], select=fixture_selection)
+    result = pipeline.run("请下载一篇叫做Roboclaw的论文，并重命名为Roboclaw")
     assert not result.success and result.steps == 1 and len(model.calls) == 2
     assert not browser._browser_session.calls
     assert result.trajectory[0]["execution_info"]["status"] == "rejected"

@@ -76,10 +76,15 @@ def test_reported_paper_task_plan_with_value_reaches_execution_on_first_attempt(
     assert len(result.planning_calls) == 1 and result.planning_calls[0]['valid_plan']
     assert result.planning_calls[0]['response'] == sampled_plan
     assert json.loads(sampled_plan)['steps'][0]['verification'][0]['value'] == 'scholar.google.com'
-    assert result.plan['steps'][0]['verification'] == [{'kind': 'url_host', 'host': 'scholar.google.com'}]
-    assert result.plan['steps'][1]['verification'] == [{'kind': 'text_present', 'text': 'roboclaw'}]
+    # The planner may suggest a site, but the paper search milestone must not
+    # require that site when the user did not request it.
+    assert result.plan['steps'][0]['verification'] == [
+        {'kind': 'search_results', 'query': 'roboclaw'}]
+    # Identity must be bound from official metadata; a planner's text guess
+    # is not a trusted identity predicate.
+    assert result.plan['steps'][1]['verification'] == [{'kind': 'visual'}]
     assert env.reset_count == 1 and len(env.actions) == 1
-    assert result.trajectory[0]['step_verification']['status'] == 'passed'
+    assert result.trajectory[0]['step_verification']['status'] != 'passed'
     assert not result.success  # Passing a navigation milestone is not a downloaded, renamed paper.
 
 

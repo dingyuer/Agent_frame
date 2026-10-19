@@ -15,6 +15,8 @@
     function update() {
       frame = 0;
       const active = buttons.find(button => button.classList.contains('active'));
+      indicator.hidden = !active;
+      buttons.forEach(button => describe(button, button === active));
       if (!active || !container.getClientRects().length) return;
       // Local layout offsets ignore entrance transforms on the parent view.
       const x = active.offsetLeft;
@@ -56,10 +58,5 @@
     });
   });
 
-  // The brand behaves like its #run destination, including the sliding indicator.
-  document.querySelector('#topnav .brand')?.addEventListener('click', event => {
-    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-    event.preventDefault();
-    document.getElementById('nav-run')?.click();
-  });
+
 })();

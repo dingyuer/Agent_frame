@@ -1,4 +1,4 @@
-﻿"""viz 服务器：前端启动 / 实时看过程 / 看历史。
+"""viz 服务器：前端启动 / 实时看过程 / 看历史。
 
 适配新框架（osworld_agent）：
 - 核心端点 /log /history /ws /run/* /runs /tasks 保留，契约与原 Agent-S3 viz 一致；
@@ -9,12 +9,16 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, Request
@@ -23,10 +27,53 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 app = FastAPI(title="osworld_agent Viz")
+
+
+@app.get('/runtime/info')
+async def runtime_info():
+    """Identify the actual executor host, including through an SSH tunnel."""
+    return {'service': 'yaero-studio', 'platform': sys.platform,
+            'local_execution': True}
+
+
 from .jev_debug import router as jev_router
 app.include_router(jev_router)
 from .jev_demo import router as jev_demo_router
+from .jev_compare import router as jev_compare_router
+app.include_router(jev_compare_router)
 app.include_router(jev_demo_router)
+from .paper_search_fixture import router as paper_search_router
+app.include_router(paper_search_router)
+from .workspace_picker import router as workspace_router
+app.include_router(workspace_router)
+from .knowledge import router as knowledge_router
+app.include_router(knowledge_router)
+
+
+@app.get('/browser/session')
+async def get_browser_session_settings():
+    from osworld_agent.persistent_chrome import browser_settings
+    return {'ok': True, **browser_settings()}
+
+
+@app.post('/browser/session')
+async def set_browser_session_settings(request: Request):
+    from fastapi import HTTPException
+    from osworld_agent.persistent_chrome import save_browser_settings
+    try:
+        value = await request.json()
+        if not isinstance(value, dict):
+            raise ValueError('浏览器设置必须为对象')
+        from osworld_agent.persistent_chrome import browser_settings
+        saved = browser_settings()
+        mode = value.get('browser_session_mode', 'persistent')
+        profile = value.get('browser_profile_dir', saved['browser_profile_dir'])
+        if mode == 'isolated' and not profile:
+            profile = saved['browser_profile_dir']
+        settings = save_browser_settings(mode, profile)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {'ok': True, **settings}
 
 # ---- 配置（环境变量覆盖）----
 _PKG = Path(__file__).resolve().parent.parent          # osworld_agent 包目录
@@ -83,6 +130,46 @@ def _detect_vm_path() -> str:
 MAX_LOGS = 200
 logs = []
 clients = []
+_workbench_cache = OrderedDict()
+_workbench_sequence = 0
+_workbench_run = None
+
+
+def _cache_workbench(payload):
+    """Latest reconstructable run state, independent of the 200 debug-log cap.
+
+    Reconnects replay only changed records, not every screenshot on each poll.
+    """
+    global _workbench_sequence, _workbench_run
+    event = payload.get('event')
+    if event == 'workbench_start':
+        _workbench_cache.clear()
+        _workbench_run = payload.get('run_id')
+    if not _workbench_run or payload.get('run_id') != _workbench_run:
+        return
+    relevant = {'workbench_start', 'workbench_record', 'execution_queue', 'step_verification',
+                'report_start', 'report_delta', 'report_complete', 'report_error', 'report_verification',
+                'run_metrics', 'live_frame', 'framework_wait', 'phase_timing'}
+    if event not in relevant:
+        return
+    key = event
+    if event == 'workbench_record':
+        record = payload.get('record') or {}
+        kind = record.get('event_type')
+        ident = ((record.get('call') or {}).get('call_id') if kind == 'model_call' else
+                 record.get('revision') if kind == 'plan_revision' else
+                 record.get('parent_decision_id') or record.get('step'))
+        key = (event, kind, ident or record.get('event_id'))
+    elif event == 'step_verification':
+        key = (event, payload.get('review_id'), payload.get('method'))
+    elif event == 'execution_queue':
+        key = (event, (payload.get('queue') or {}).get('revision'))
+    elif event == 'framework_wait':
+        key = (event, payload.get('step'))
+    _workbench_sequence += 1
+    payload['_wb_seq'] = _workbench_sequence
+    _workbench_cache[key] = dict(payload)
+
 
 # 内网模型端点直连，不走华为 HIS 代理
 _no_proxy = os.environ.get("NO_PROXY", "")
@@ -95,6 +182,7 @@ os.environ["no_proxy"] = _no_proxy
 _agent_state = {
     "status": "idle", "proc": None, "task_name": None, "config": None,
     "start_time": None, "output": [], "current_step": 0, "max_steps": 0, "task_total": 0,
+    "last_error": "",
 }
 
 # Human demonstrations use their own browser context and never invoke a model.
@@ -108,7 +196,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 atexit.register(collection.close)
 
 
-def _reader_thread(proc):
+def _reader_thread(proc, timing_path=None, started=None):
     try:
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -120,21 +208,108 @@ def _reader_thread(proc):
         pass
     finally:
         rc = proc.wait()
-        if _agent_state["status"] == "running":
+        elapsed = round(time.perf_counter() - started, 3) if started is not None else None
+        if timing_path and elapsed is not None:
+            try:
+                path = Path(timing_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix('.tmp')
+                temporary.write_text(json.dumps({'elapsed_s': elapsed, 'scope': 'process', 'exit_code': rc}))
+                os.replace(temporary, path)
+            except OSError:
+                pass
+        if _agent_state.get('proc') is proc:
+            _agent_state['elapsed_final'] = elapsed
+        if _agent_state.get('proc') is proc and _agent_state["status"] == "running":
             _agent_state["status"] = "done" if rc == 0 else "failed"
+            if rc != 0:
+                _agent_state["last_error"] = next(
+                    (line for line in reversed(_agent_state["output"])
+                     if re.match(r"^[\w.]+(?:Error|Exception):", line)),
+                    f"任务进程退出，代码 {rc}。可查看运行输出。")
 
 
 # ================= 实时日志 ================= #
+def _safe_jev_ui_value(value):
+    """Redact credentials, including JSON encoded inside SystemOne state text."""
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            normalized = re.sub(r'[^a-z0-9]', '', str(key).lower())
+            if (normalized in {'authorization', 'token', 'password', 'passwd', 'secret', 'cookie', 'setcookie'}
+                    or normalized.endswith(('apikey', 'password', 'token', 'clientsecret'))):
+                continue
+            result[key] = _safe_jev_ui_value(item)
+        return result
+    if isinstance(value, list):
+        return [_safe_jev_ui_value(item) for item in value]
+    if isinstance(value, str) and not value.startswith('data:image/'):
+        if value.lstrip().startswith(('{', '[')):
+            try:
+                return json.dumps(_safe_jev_ui_value(json.loads(value)), ensure_ascii=False)
+            except (ValueError, TypeError):
+                pass
+        value = re.sub(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+', 'Bearer [redacted]', value)
+        value = re.sub(r'\bsk-[A-Za-z0-9]{16,}', '[redacted]', value)
+    return value
+
+
+def _jev_call_for_ui(call):
+    request = call.get('request') if isinstance(call, dict) else None
+    if not isinstance(request, dict) or 'state' not in request or not isinstance(request.get('questions'), dict):
+        return None
+    return _safe_jev_ui_value(call)
+
+
+def _paper_identity_call_for_ui(call):
+    if (not isinstance(call, dict) or call.get('call_type') != 'paper_identity'
+            or not isinstance(call.get('selection_result'), dict)):
+        return None
+    return _safe_jev_ui_value({key: call[key] for key in (
+        'call_id', 'call_type', 'decision_step', 'model', 'messages', 'response',
+        'selection_result', 'latency_ms', 'status', 'error') if key in call})
+
+
+def _paper_identity_entry_for_ui(call):
+    call = _paper_identity_call_for_ui(call)
+    if call is None:
+        return None
+    query = ''
+    for message in call.get('messages') or []:
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        try:
+            payload = json.loads(message.get('content', ''))
+            if isinstance(payload, dict):
+                query = str(payload.get('original_query') or '')
+        except (TypeError, ValueError):
+            continue
+    return {'query': query, 'report': call['selection_result'], 'call': call}
+
+
 @app.post("/log")
 async def receive_log(request: Request):
     try:
         payload = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
+    if payload.get('event') == 'jev_call':
+        payload = {**payload, 'call': _jev_call_for_ui(payload.get('call'))}
+    elif payload.get('event') == 'paper_identity_review':
+        payload = _safe_jev_ui_value(payload)
+        if payload.get('call') is not None:
+            payload['call'] = _paper_identity_call_for_ui(payload['call'])
+        if isinstance(payload.get('calls'), list):
+            payload['calls'] = [call for item in payload['calls']
+                                if (call := _paper_identity_call_for_ui(item)) is not None]
     payload.setdefault("ts", time.time())
+    _cache_workbench(payload)
     stored = dict(payload)
     # 保留 screenshot：前端 poll() 从 /history 拿日志渲染，去掉截图会导致实时监控截图缺失
     # （poll 抢先消费事件、WebSocket 的有截图事件被 seenKeys 去重跳过）。
+    if payload.get('event') == 'live_frame':
+        # A preview is ephemeral; keep only the latest frame per active run.
+        logs[:] = [e for e in logs if not (e.get('event') == 'live_frame' and e.get('run_id') == payload.get('run_id'))]
     logs.append(stored)
     if len(logs) > MAX_LOGS:
         del logs[0:len(logs) - MAX_LOGS]
@@ -157,8 +332,11 @@ async def receive_log(request: Request):
 
 
 @app.get("/history")
-async def history():
-    return {"logs": logs}
+async def history(since: int = 0):
+    if _workbench_cache:
+        return {'logs': sorted((v for v in _workbench_cache.values() if v['_wb_seq'] > since), key=lambda v:v['_wb_seq']),
+                'cursor': _workbench_sequence}
+    return {"logs": logs, 'cursor': 0}
 
 
 @app.websocket("/ws")
@@ -264,48 +442,308 @@ async def list_runs():
     return {"runs": runs}
 
 
-# ================= 本地运行（Windows 本机任务，local_runs/ 目录）================= #
-@app.get("/local/runs")
-async def local_runs():
-    """列出 local_runs/ 下的本地运行（读 trajectory.json）。"""
-    runs = []
-    base = Path(LOCAL_RUNS_DIR)
-    if base.is_dir():
-        entries = sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-        for d in entries:
-            if not d.is_dir():
-                continue
-            traj_path = d / "trajectory.json"
-            if not traj_path.exists():
-                continue
-            instruction, score, steps, success = "", None, 0, None
-            try:
+# ================= 本地运行（独立 local_runs；兼容旧工程日期目录）================= #
+_LOCAL_SUMMARY_CACHE_LIMIT = 512
+_local_summary_cache = OrderedDict()
+_local_summary_cache_lock = threading.Lock()
+_TOKEN_CACHE_LIMIT = 512
+_token_cache = OrderedDict()
+_token_cache_lock = threading.Lock()
+
+
+def _local_run_summary_from_events(events_path):
+    """从运行中实时写入的 events.jsonl 提取摘要（失败/中断的运行没有 trajectory.json）。"""
+    empty = {"instruction": "", "score": None, "success": None, "steps": 0,
+             "termination_reason": "failed_no_log", "failure_reason": ""}
+    try:
+        task = ""
+        reason = ""
+        success = None
+        steps = 0
+        with open(events_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                t = ev.get("event_type")
+                if t == "episode_start":
+                    task = (ev.get("manifest") or {}).get("task", "")
+                elif t == "execution":
+                    steps += 1
+                elif t == "episode_end":
+                    o = ev.get("outcome") or {}
+                    reason = o.get("termination_reason") or ""
+                    success = o.get("success")
+                elif t == "episode_error":
+                    reason = ev.get('error_type') or 'episode_error'
+                    success = False
+        if not task and not reason and not steps:
+            return empty
+        return {"instruction": task, "score": None, "success": success,
+                "steps": steps, "termination_reason": reason or "interrupted",
+                "failure_reason": ""}
+    except Exception:  # noqa: BLE001
+        return empty
+
+
+def _events_path_for(traj_path, directory, prefix):
+    """给定轨迹路径，推导同一次运行的 events.jsonl 路径（平铺/子目录两种布局）。"""
+    if traj_path is None:
+        return None
+    if traj_path.name.endswith(".jsonl"):
+        return traj_path  # 已经是 events.jsonl（无 trajectory 的兜底记录）
+    return directory / (prefix + "events.jsonl")
+
+
+def _run_token_usage(events_path):
+    """One canonical event stream; missing usage remains explicitly partial."""
+    from ..run_metrics import summarize_events
+    if not events_path or not os.path.isfile(events_path):
+        return summarize_events([])
+    stat = os.stat(events_path)
+    key, version = str(os.path.abspath(events_path)), (stat.st_mtime_ns, stat.st_size)
+    with _token_cache_lock:
+        cached = _token_cache.get(key)
+        if cached and cached[0] == version:
+            return dict(cached[1])
+    def events():
+        with open(events_path, encoding='utf-8') as stream:
+            for line in stream:
+                try:
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        yield value
+                except ValueError:
+                    continue
+    result = summarize_events(events())
+    with _token_cache_lock:
+        _token_cache[key] = (version, dict(result))
+        _token_cache.move_to_end(key)
+        while len(_token_cache) > _TOKEN_CACHE_LIMIT:
+            _token_cache.popitem(last=False)
+    return result
+
+
+def _local_metrics(events_path, directory, prefix='', fallback=None):
+    metrics = _run_token_usage(events_path)
+    if (not events_path or not Path(events_path).exists()) and fallback:
+        metrics = dict(fallback)
+    # The launcher records the whole process span, including browser boot,
+    # export and cleanup. Pipeline time is retained as a separate scope.
+    try:
+        timing = json.loads((directory / (prefix + 'run_timing.json')).read_text())
+        elapsed = timing.get('elapsed_s')
+        if isinstance(elapsed, (int, float)) and 0 <= elapsed < 1e9:
+            metrics = {**metrics, 'pipeline_elapsed_s': metrics.get('elapsed_s'),
+                       'elapsed_s': elapsed, 'timing_source': 'process', 'complete': True}
+    except (OSError, ValueError, TypeError):
+        pass
+    return metrics
+
+
+
+_SUMMARY_HEAD_LIMIT = 4 * 1024 * 1024  # task/outcome 都很小且位于 steps 之前
+
+
+def _summary_head_parse(traj_path):
+    """只解析 trajectory.json 头部（version/task/outcome），跳过巨型 steps 数组。
+
+    trajectory.json 顶层顺序为 version, task, outcome, steps, ...；task/outcome 在
+    steps 之前且都很小。定位到顶层 "steps" 键即截断、补闭合并解析，避免对大文件做
+    整包 json.load。解析失败返回 None，调用方回退到完整解析。
+    """
+    try:
+        with open(traj_path, encoding="utf-8") as f:
+            head = f.read(_SUMMARY_HEAD_LIMIT)
+    except OSError:
+        return None
+    match = re.search(r'"steps"\s*:', head)
+    if not match or not head.lstrip().startswith('{'):
+        return None
+    prefix = head[:match.start()].rstrip().rstrip(',') + '}'
+    try:
+        return json.loads(prefix)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _local_run_summary(traj_path):
+    """Cache only small list metadata; a changed trajectory is read again."""
+    empty = {"instruction": "", "score": None, "success": None, "steps": 0,
+             "termination_reason": "", "failure_reason": ""}
+    if traj_path is None:
+        return {"instruction": "", "score": None, "success": False, "steps": 0,
+                "termination_reason": "failed_no_log", "failure_reason": ""}
+    try:
+        before = traj_path.stat()
+        path_key = str(traj_path.resolve())
+        version = (before.st_mtime_ns, before.st_size)
+        with _local_summary_cache_lock:
+            cached = _local_summary_cache.get(path_key)
+            if cached is not None and cached[0] == version:
+                _local_summary_cache.move_to_end(path_key)
+                return dict(cached[1])
+        if str(traj_path).endswith("events.jsonl"):
+            summary = _local_run_summary_from_events(traj_path)
+        else:
+            # 快路径：只读头部（version/task/outcome），避免整包解析巨型 steps
+            traj = _summary_head_parse(traj_path)
+            if traj is not None and (traj.get("outcome") or {}).get("num_steps") is None:
+                traj = None  # num_steps 缺失，需完整解析数步数
+            if traj is None:
                 with open(traj_path, encoding="utf-8") as f:
                     traj = json.load(f)
-                instruction = (traj.get("task") or {}).get("instruction", "")
-                outcome = traj.get("outcome") or {}
-                score = outcome.get("score")
-                success = outcome.get("success")
-                steps = len(traj.get("steps") or [])
-            except Exception:  # noqa: BLE001
-                pass
-            shots = len([f for f in os.listdir(d)
-                         if f.startswith("step_") and f.endswith(".png")])
-            runs.append({"id": d.name, "instruction": instruction, "score": score,
-                         "success": success, "steps": steps, "shots": shots,
-                         "mtime": d.stat().st_mtime})
+            outcome = traj.get("outcome") or {}
+            reason = outcome.get("termination_reason") or ""
+            num_steps = outcome.get("num_steps")
+            if num_steps is None:
+                num_steps = len(traj.get("steps") or [])
+            failure_reason = ""
+            if reason == "planning_failed":
+                if "planning_calls" not in traj:
+                    with open(traj_path, encoding="utf-8") as f:
+                        traj = json.load(f)
+                failure_reason = next((str(c.get("validation_error")) for c in reversed(
+                    traj.get("planning_calls") or []) if c.get("validation_error")), "")
+            summary = {"instruction": (traj.get("task") or {}).get("instruction", ""),
+                       "score": outcome.get("score"), "success": outcome.get("success"),
+                       "steps": num_steps,
+                       "termination_reason": reason,
+                       "failure_reason": failure_reason, "run_metrics": outcome.get("run_metrics", {})}
+        after = traj_path.stat()
+        if version == (after.st_mtime_ns, after.st_size):
+            with _local_summary_cache_lock:
+                _local_summary_cache[path_key] = (version, dict(summary))
+                _local_summary_cache.move_to_end(path_key)
+                while len(_local_summary_cache) > _LOCAL_SUMMARY_CACHE_LIMIT:
+                    _local_summary_cache.popitem(last=False)
+        return summary
+    except Exception:  # noqa: BLE001
+        # An in-progress or invalid JSON file must not poison the cache.
+        return empty
+
+
+def _read_local_runs():
+    runs, shots_by_directory = [], {}
+    for run_id, traj_path, directory, prefix in _local_run_files():
+        summary = _local_run_summary(traj_path)
+        summary["tokens"] = _local_metrics(_events_path_for(traj_path, directory, prefix), directory, prefix, summary.get("run_metrics"))
+        try:
+            mtime = (traj_path.stat().st_mtime if traj_path is not None
+                     else directory.stat().st_mtime)
+            if directory not in shots_by_directory:
+                shots_by_directory[directory] = [name for name in os.listdir(directory)
+                                                 if name.endswith(".png")]
+            shots = sum(name.startswith(prefix + "step_")
+                        for name in shots_by_directory[directory])
+        except OSError:
+            continue  # A run may be removed while the directory is being scanned.
+        runs.append({"id": run_id, **summary, "shots": shots, "mtime": mtime})
+    runs.sort(key=lambda item: item['mtime'], reverse=True)
     return {"runs": runs}
 
 
-def _local_traj_to_frontend(traj):
+@app.get("/local/runs")
+async def local_runs():
+    """列出独立运行日志，同时兼容工程日期目录中的旧轨迹。"""
+    return await asyncio.to_thread(_read_local_runs)
+
+
+def _local_run_files():
+    """Read new per-run logs and legacy flat workspace logs without moving files."""
+    from osworld_agent.workspace_config import default_workspace_root
+    root = Path(default_workspace_root())
+    if root.is_dir():
+        for day in root.iterdir():
+            if not day.is_dir() or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', day.name):
+                continue
+            for path in day.glob('ui_*_trajectory.json'):
+                run_id = path.name[:-len('_trajectory.json')]
+                if re.fullmatch(r'ui_\d{8}_\d{6}_[0-9a-f]{8}', run_id):
+                    yield run_id, path, day, run_id + '_'
+    legacy = Path(LOCAL_RUNS_DIR)
+    if legacy.is_dir():
+        for directory in legacy.iterdir():
+            if not directory.is_dir():
+                continue
+            standard = directory / 'trajectory.json'
+            if standard.is_file():
+                yield directory.name, standard, directory, ''
+                continue
+            candidates = sorted(directory.glob('*_trajectory.json'))
+            for path in candidates:
+                prefix = path.name[:-len('trajectory.json')]
+                run_id = directory.name if len(candidates) == 1 else directory.name + '__' + path.stem
+                yield run_id, path, directory, prefix
+            # 兜底：没有 trajectory.json 但写了 events.jsonl（stalled/中断的运行也保留）
+            events = directory / 'events.jsonl'
+            if events.is_file():
+                yield directory.name, events, directory, ''
+            # 更早失败（连 events.jsonl 都没写）也保留一条"失败"记录
+            elif not any(directory.iterdir()):
+                yield directory.name, None, directory, ''
+
+
+def _local_run_path(run):
+    if not isinstance(run, str) or '/' in run or '\\' in run or run in {'', '.', '..'}:
+        return None
+    for run_id, path, directory, prefix in _local_run_files():
+        if run_id == run:
+            return path, directory, prefix
+    return None
+
+
+def _local_traj_to_frontend(traj, prefix=''):
     """把标准 trajectory.json 的 steps 转成前端 traj.jsonl 格式（复用历史视图渲染）。"""
     lines = []
+    calls_by_step = {}
+    identity_by_step = {}
+    identity_diagnostics = {}
+    for event in traj.get('events') or []:
+        if not isinstance(event, dict):
+            continue
+        if event.get('event_type') == 'paper_identity_review' and isinstance(event.get('report'), dict):
+            parent = re.fullmatch(r'a_(\d+)', str(event.get('parent_decision_id') or ''))
+            step_id = parent.group(1) if parent else event.get('decision_step', event.get('step'))
+            if re.fullmatch(r'\d+', str(step_id or '')):
+                event_call = event.get('call') or next((call for call in reversed(event.get('calls') or [])
+                    if _paper_identity_call_for_ui(call) is not None), None)
+                identity_diagnostics.setdefault(str(int(step_id)), []).append(_safe_jev_ui_value({
+                    'query': event.get('query', ''), 'report': event['report'],
+                    'call': _paper_identity_call_for_ui(event_call)}))
+        if event.get('event_type') not in {'model_call', 'jev_call'}:
+            continue
+        identity = _paper_identity_entry_for_ui(event.get('call'))
+        if identity is not None:
+            parent = re.fullmatch(r'a_(\d+)', str(event.get('parent_decision_id') or ''))
+            step_id = parent.group(1) if parent else identity['call'].get('decision_step')
+            if re.fullmatch(r'\d+', str(step_id or '')):
+                identity_by_step.setdefault(str(int(step_id)), []).append(identity)
+        call = _jev_call_for_ui(event.get('call'))
+        if call is None:
+            continue
+        parent = re.fullmatch(r'a_(\d+)', str(event.get('parent_decision_id') or ''))
+        step_id = parent.group(1) if parent else call.get('decision_step')
+        if re.fullmatch(r'\d+', str(step_id or '')):
+            calls_by_step.setdefault(str(int(step_id)), []).append(call)
+    for call in traj.get('review_calls') or []:
+        identity = _paper_identity_entry_for_ui(call)
+        step_id = (identity or {}).get('call', {}).get('decision_step')
+        if identity is not None and re.fullmatch(r'\d+', str(step_id or '')):
+            identity_by_step.setdefault(str(int(step_id)), []).append(identity)
     for s in traj.get("steps") or []:
         action = s.get("action")
         action_str = json.dumps(action, ensure_ascii=False) if isinstance(action, dict) else str(action or "")
         reasoning = s.get("reasoning") or {}
         assessment = s.get("assessment") or {}
         grounding = s.get("grounding") or {}
+        resolved_action = s.get('resolved_action') or {}
+        if isinstance(resolved_action, str):
+            try:
+                resolved_action = json.loads(resolved_action)
+            except (TypeError, ValueError):
+                resolved_action = {}
         timing = s.get("timing_ms") or {}
         gs = []
         if grounding and grounding.get("coord"):
@@ -319,6 +757,35 @@ def _local_traj_to_frontend(traj):
             decision_elapsed = dc[-1].get("latency_ms")
         # 子 Agent 调用：从 execution_info 里提取 call_code_agent
         ei = s.get("execution_info") or {}
+        jev_calls, seen_calls = [], set()
+        for raw_call in [*(s.get('jev_calls') or []), *calls_by_step.get(str(s.get('step')), [])]:
+            call = _jev_call_for_ui(raw_call)
+            if call is None:
+                continue
+            ident = call.get('call_id') or json.dumps(call, ensure_ascii=False, sort_keys=True)
+            if ident not in seen_calls:
+                seen_calls.add(ident)
+                jev_calls.append(call)
+        identity_reviews, seen_identity_calls = [], set()
+        identity_entries = [*identity_by_step.get(str(s.get('step')), []),
+                            *(_paper_identity_entry_for_ui(call) for call in s.get('review_calls') or [])]
+        for identity in identity_entries:
+            if identity is None:
+                continue
+            call = identity['call']
+            ident = call.get('call_id') or json.dumps(call, ensure_ascii=False, sort_keys=True)
+            if ident not in seen_identity_calls:
+                seen_identity_calls.add(ident)
+                identity_reviews.append(identity)
+        for identity in identity_diagnostics.get(str(s.get('step')), []):
+            call = identity.get('call') or {}
+            if (call.get('call_id') in seen_identity_calls or any(
+                    old.get('query') == identity.get('query') and old.get('report') == identity.get('report')
+                    for old in identity_reviews)):
+                continue
+            if call.get('call_id'):
+                seen_identity_calls.add(call['call_id'])
+            identity_reviews.append(identity)
         subagent = None
         if ei.get("action") == "call_code_agent":
             subagent = {"task": ei.get("task", ""), "result": ei.get("result", "")}
@@ -329,13 +796,21 @@ def _local_traj_to_frontend(traj):
             "action": action_str,
             "reward": s.get("reward"),
             "done": bool(s.get("done", False)),
-            "screenshot_file": f"step_{s.get('step')}.png",
+            "screenshot_file": f"{prefix}step_{s.get('step')}.png",
             "grounding": gs,
+            "resolved_action": resolved_action,
             "routing": s.get("routing") or {},
+            "operation_mode": s.get("operation_mode"),
+            "prompt_metadata": s.get("prompt_metadata") or {},
+            "execution_info": {key: ei[key] for key in
+                               ("status", "dispatched", "channel", "resolved", "error_code", "reason", "coord", "coordinate_space")
+                               if key in ei},
             "outcome": (s.get("execution") or {}).get("outcome", ""),
             "assessment": assessment,
             "step_verification": s.get("step_verification"),
             "step_reviews": s.get("step_reviews", []),
+            "jev_calls": jev_calls,
+            "paper_identity_reviews": identity_reviews,
             "execution_queue": s.get("execution_queue"),
             "prompt": s.get("prompt_text", ""),
             "timing_ms": timing,
@@ -345,36 +820,123 @@ def _local_traj_to_frontend(traj):
     return lines
 
 
-@app.get("/local/traj")
-async def local_traj(run: str):
-    """返回某个本地运行的轨迹（前端格式 + 原始 trajectory）。"""
-    base = Path(LOCAL_RUNS_DIR) / run
-    traj_path = base / "trajectory.json"
-    if not traj_path.exists():
+def _read_local_traj(run):
+    found = _local_run_path(run)
+    if found is None:
         return {"ok": False, "error": "轨迹不存在"}
+    traj_path, directory, prefix = found
+    if traj_path.name.endswith('.jsonl'):
+        summary = _local_run_summary_from_events(traj_path)
+        from .workbench import project_event_workbench
+        from ..training_events import read_events
+        metrics = _local_metrics(traj_path, directory, prefix)
+        try:
+            workbench = project_event_workbench(read_events(traj_path), summary['instruction'], metrics)
+        except (OSError, ValueError):
+            return {'ok': False, 'error': '事件记录损坏，无法可靠重建轨迹'}
+        return {'ok': True, 'traj': [], 'instruction': summary['instruction'], 'workbench': workbench,
+                'outcome': {**summary, 'final_answer': '运行未导出完整轨迹；展示已落盘事件。'},
+                'tokens': metrics}
     try:
         with open(traj_path, encoding="utf-8") as f:
             traj = json.load(f)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"轨迹解析失败：{exc}"}
-    return {"ok": True, "traj": _local_traj_to_frontend(traj),
+    from .workbench import project_workbench
+    metrics = _local_metrics(_events_path_for(traj_path, directory, prefix), directory, prefix, (traj.get('outcome') or {}).get('run_metrics'))
+    workbench = project_workbench(traj)
+    workbench['metrics'] = metrics
+    return {"ok": True, "workbench": workbench, "traj": _local_traj_to_frontend(traj, prefix),
             "instruction": (traj.get("task") or {}).get("instruction", ""),
             "plan": traj.get("plan"),
-            "trajectory": traj}
+            "outcome": traj.get("outcome") or {},
+            "planning_errors": [{"attempt": i + 1, "reason": c.get("validation_error")}
+                                for i, c in enumerate(traj.get("planning_calls") or [])
+                                if c.get("validation_error")],
+            "tokens": metrics,
+            "knowledge_retrieval": (traj.get("run_manifest") or {}).get("knowledge_retrieval"),
+            "replans": [{"event": e.get("event_type"), **{k: e[k] for k in ("brief", "strategy_change", "revision") if k in e}}
+                        for e in traj.get("events", []) if e.get("event_type") in {"replan_context", "replan_strategy"}]}
+
+
+@app.get("/local/traj")
+async def local_traj(run: str):
+    """返回某个本地运行的轨迹；磁盘扫描与解析在后台线程执行。"""
+    return await asyncio.to_thread(_read_local_traj, run)
 
 
 @app.get("/local/shot")
 async def local_shot(run: str, filename: str):
     """返回某个本地运行的截图（step_N.png）。"""
     filename = os.path.basename(filename)  # 防目录穿越
-    if not filename.startswith("step_") or not filename.endswith(".png"):
+    found = _local_run_path(run)
+    if found is None:
         return Response(status_code=404)
-    shot = (Path(LOCAL_RUNS_DIR) / run / filename).resolve()
-    if not str(shot).startswith(str(Path(LOCAL_RUNS_DIR).resolve())):
+    _, directory, prefix = found
+    if not re.fullmatch(re.escape(prefix) + r'step_\d+\.png', filename):
         return Response(status_code=404)
+    shot = directory / filename
     if shot.is_file():
         return FileResponse(str(shot))
     return Response(status_code=404)
+
+
+@app.get('/local/jev-image')
+async def local_jev_image(run: str, filename: str):
+    """Serve only content-addressed screenshot assets from the selected run."""
+    if not re.fullmatch(r'assets/[0-9a-f]{64}\.(?:png|jpg|webp)', filename):
+        return Response(status_code=404)
+    found = _local_run_path(run)
+    if found is None:
+        return Response(status_code=404)
+    _, directory, _ = found
+    asset_root = (directory / 'assets').resolve()
+    path = (directory / filename).resolve()
+    if path.parent == asset_root and path.is_file():
+        return FileResponse(str(path))
+    return Response(status_code=404)
+
+
+@app.post("/local/delete")
+async def local_delete(request: Request):
+    """删除某个本地运行。local_runs 独立子目录整目录删；工程日期目录只删该 run 的文件。"""
+    import shutil
+    try:
+        cfg = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+    run = cfg.get("run")
+    if not isinstance(run, str) or not run:
+        return {"ok": False, "error": "missing run id"}
+    found = _local_run_path(run)
+    if found is None:
+        return {"ok": False, "error": "not found"}
+    _, directory, prefix = found
+    try:
+        try:
+            legacy_root = os.path.realpath(LOCAL_RUNS_DIR)
+            real_dir = os.path.realpath(directory)
+            in_legacy = real_dir != legacy_root and os.path.commonpath([legacy_root, real_dir]) == legacy_root
+        except (ValueError, OSError):
+            in_legacy = False
+        if in_legacy:
+            shutil.rmtree(directory)
+        elif prefix:
+            removed = 0
+            for p in directory.glob(prefix + '*'):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+            if not removed:
+                return {"ok": False, "error": "未找到可删除的文件"}
+        else:
+            return {"ok": False, "error": "无法识别的轨迹布局"}
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
 
 
 @app.get("/run/traj")
@@ -442,64 +1004,120 @@ async def delete_run(request: Request):
 @app.post("/run/test-connection")
 async def test_connection(request: Request):
     import base64
+    import io
+    import secrets
     import requests as req
+    from PIL import Image, ImageDraw
+    from osworld_agent.config import resolve_secret
     try:
         cfg = await request.json()
     except Exception:
         cfg = {}
     model = cfg.get("model", "Qwen3.6-27B")
-    url = cfg.get("model_url", "http://10.44.101.62:8094/v1")
-    api_key = cfg.get("model_api_key") or "EMPTY"
-    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
-    b64 = base64.b64encode(png).decode()
+    url = cfg.get("model_url", "http://7.246.80.237:48888/v1")
+    try:
+        api_key = resolve_secret(cfg.get("model_api_key") or "EMPTY")
+    except (RuntimeError, TypeError) as exc:
+        return {"ok": False, "status": -1, "error": str(exc)}
+    challenge = secrets.token_hex(3).upper()
+    image = Image.new("RGB", (260, 90), "white")
+    ImageDraw.Draw(image).text((35, 25), challenge, fill="black", stroke_width=1)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    b64 = base64.b64encode(buffer.getvalue()).decode()
     payload = {"model": model, "messages": [
         {"role": "user", "content": [
-            {"type": "text", "text": "回复两个字：正常"},
+            {"type": "text", "text": "读取图片里的六位字符，只输出 JSON 对象，字段名为 code。"},
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]},
-    ], "max_tokens": 32, "temperature": 0.0}
+    ], "max_tokens": 32, "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+        "chat_template_kwargs": {"enable_thinking": False}}
     try:
         r = req.post(f"{url}/chat/completions", json=payload,
                      headers={"Authorization": f"Bearer {api_key}"}, timeout=30,
                      proxies={"http": None, "https": None})
         if r.status_code == 200:
             content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            return {"ok": True, "status": 200, "content": content[:50], "visual_support": "带图请求成功"}
+            try:
+                recognized = str(json.loads(content).get("code") or "").strip().upper()
+            except (TypeError, ValueError, json.JSONDecodeError):
+                recognized = ""
+            if recognized != challenge:
+                return {"ok": False, "status": 200,
+                        "error": "接口可调用，但未正确读取随机图片内容；不能作为截图决策模型"}
+            return {"ok": True, "status": 200, "content": "视觉与 JSON 输出均通过",
+                    "visual_support": "随机图片内容识别通过"}
         return {"ok": False, "status": r.status_code, "error": r.text[:300]}
     except Exception as e:
         return {"ok": False, "status": -1, "error": str(e)[:300]}
 
 
-def _start_local(cfg: dict):
-    """启动 Windows 本机任务（run_windows_local.py），复用 _reader_thread + /log + /ws 实时显示。"""
+def _start_local(cfg: dict, viz_port: int | None = None):
+    """启动当前主机平台的本机任务，复用 _reader_thread + /log + /ws。"""
     task = str(cfg.get("task") or "").strip()
     if not task:
         return {"ok": False, "error": "请输入任务描述"}
     model = cfg.get("model", "Qwen3.6-27B")
-    model_url = cfg.get("model_url", "http://10.44.101.62:8094/v1")
+    model_url = cfg.get("model_url", "http://7.246.80.237:48888/v1")
+    model_api_key = cfg.get("model_api_key") or "EMPTY"
     ground_model = cfg.get("ground_model", "UI-Venus-2-9B")
     ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
+    ground_api_key = cfg.get("ground_api_key") or "EMPTY"
     max_steps = int(cfg.get("max_steps", 15))
-    result_dir = cfg.get("result_dir") or os.path.join(
-        LOCAL_RUNS_DIR, "ui_" + time.strftime("%Y%m%d_%H%M%S"))
+    from osworld_agent.persistent_chrome import browser_settings, save_browser_settings
+    saved_browser = browser_settings()
+    session_mode = cfg.get('browser_session_mode', saved_browser['browser_session_mode'])
+    profile_dir = cfg.get('browser_profile_dir', saved_browser['browser_profile_dir']) or ''
+    try:
+        if session_mode == 'isolated' and not profile_dir:
+            profile_dir = saved_browser['browser_profile_dir']
+        browser_choice = save_browser_settings(session_mode, profile_dir)
+    except ValueError as exc:
+        return {'ok': False, 'error': str(exc)}
+    try:
+        from osworld_agent.workspace_config import default_workspace_root, normalize_workspace_root
+        workspace = normalize_workspace_root(cfg.get('workspace_dir') or default_workspace_root())
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    from osworld_agent.workspace_config import allocate_local_result_dir
+    run_prefix = None
+    result_dir = cfg.get('result_dir') or allocate_local_result_dir(LOCAL_RUNS_DIR)
 
     cmd = [
-        _runner_python(), str(_PKG / "run_windows_local.py"),
+        _runner_python(), "-m", "osworld_agent.run_local",
         "--task", task,
         "--model", model,
         "--model-url", model_url,
+        "--model-api-key", model_api_key,
         "--ground-model", ground_model,
-        "--ground-type", str(cfg.get("ground_type", "ui-venus2")),
+        "--ground-type", str(cfg.get("ground_type", "qwen-plus")),
         "--ground-url", ground_url,
+        "--ground-api-key", ground_api_key,
         "--max-steps", str(max_steps),
+        "--browser-session-mode", session_mode,
         "--result-dir", result_dir,
     ]
+    if cfg.get('cli_only') is True:
+        cmd += ['--cli-only']
+    if session_mode == 'persistent' and profile_dir:
+        cmd += ['--browser-profile-dir', profile_dir]
+    cfg.update(browser_session_mode=session_mode, browser_profile_dir=profile_dir,
+               effective_profile_dir=browser_choice['effective_profile_dir'])
+    if run_prefix:
+        cmd += ['--run-prefix', run_prefix]
+    if cfg.get("browser_start_url"):
+        from urllib.parse import urlsplit
+        start_url = str(cfg["browser_start_url"])
+        parsed = urlsplit(start_url)
+        if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}
+                or parsed.path.rstrip("/") != "/demo/paper-search" or parsed.query or parsed.fragment):
+            return {"ok": False, "error": "演示起始页只能使用本机论文搜索回放页"}
+        cmd += ["--browser-start-url", start_url]
     try:
         cmd += _wait_cli_args(cfg)
-        if cfg.get('workspace_dir'):
-            workspace = cfg['workspace_dir']
-            if not isinstance(workspace, str) or any(ord(c) < 32 for c in workspace):
-                raise ValueError('默认工作目录必须是有效路径字符串')
-            cmd += ['--workspace-dir', workspace]
+        from osworld_agent.prompt_settings import prompt_cli_args
+        cmd += prompt_cli_args(cfg.get('mode_prompts'), Path(LOCAL_RUNS_DIR) / '.prompt_configs')
+        cmd += ['--workspace-dir', workspace]
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     if cfg.get("completion_spec") is not None:
@@ -509,14 +1127,15 @@ def _start_local(cfg: dict):
         except ValueError as exc:
             return {"ok": False, "error": f"验收条件无效：{exc}"}
         os.makedirs(result_dir, exist_ok=True)
-        contract_path = os.path.abspath(os.path.join(result_dir, "completion_spec.json"))
+        contract_name = (run_prefix + '_' if run_prefix else '') + 'completion_spec.json'
+        contract_path = os.path.abspath(os.path.join(result_dir, contract_name))
         with open(contract_path, "w", encoding="utf-8") as f:
             json.dump(contract, f, ensure_ascii=False, indent=2)
         cmd += ["--completion-spec", contract_path]
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
-    env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{os.getenv('AGENTS_VIZ_PORT', '8088')}"
+    env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{viz_port or os.getenv('AGENTS_VIZ_PORT', '8088')}"
     env["AGENTS_RESULTS_DIR"] = RESULTS_DIR
     env["NO_PROXY"] = "192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1"
     env["no_proxy"] = env["NO_PROXY"]
@@ -525,9 +1144,12 @@ def _start_local(cfg: dict):
     _agent_state["task_total"] = 1
     _agent_state["config"] = cfg
     _agent_state["output"] = []
+    _agent_state["last_error"] = ""
     _agent_state["current_step"] = 0
     _agent_state["max_steps"] = max_steps
     _agent_state["start_time"] = time.time()
+    _agent_state["started_monotonic"] = time.perf_counter()
+    _agent_state["elapsed_final"] = None
     _agent_state["status"] = "starting"
     logs.clear()
     try:
@@ -536,7 +1158,7 @@ def _start_local(cfg: dict):
                                 text=True, encoding="utf-8", errors="replace")
         _agent_state["proc"] = proc
         _agent_state["status"] = "running"
-        threading.Thread(target=_reader_thread, args=(proc,), daemon=True).start()
+        threading.Thread(target=_reader_thread, args=(proc, os.path.join(result_dir, "run_timing.json"), _agent_state["started_monotonic"]), daemon=True).start()
         return {"ok": True, "task": _agent_state["task_name"], "task_total": 1}
     except Exception as e:
         _agent_state["status"] = "failed"
@@ -545,7 +1167,8 @@ def _start_local(cfg: dict):
 
 def _wait_cli_args(cfg):
     import math
-    result = _judge_cli_args(cfg)
+    from osworld_agent.knowledge_selection import selection_cli_args
+    result = _judge_cli_args(cfg) + selection_cli_args(cfg)
     for field, flag, default in (("operation_timeout_s", "--operation-timeout", 300),
                                   ("task_timeout_s", "--task-timeout", 1800)):
         try:
@@ -571,15 +1194,23 @@ def _judge_cli_args(cfg):
         raise ValueError('Decision 评估器配置必须是对象')
     if data.get('api_key'):
         raise ValueError('Decision 认证请在服务端设置 DECISION_JUDGE_API_KEY')
+    explicit_selection = 'selection_policy' in data
+    data = dict(data)
+    selection_policy = data.pop('selection_policy', 'maximum_probability')
+    if not isinstance(selection_policy, str) or selection_policy not in {'threshold', 'maximum_probability'}:
+        raise ValueError('Jev 标签选择必须为 threshold 或 maximum_probability')
     try:
         value = DecisionJudgeConfig(**data)
     except (TypeError, ValueError) as exc:
         raise ValueError('Decision 评估器配置无效') from exc
     if not value.url:
         return []
+    # New runners default to maximum_probability. Legacy configurations without
+    # this extension remain parseable by the original base CLI argument helper.
+    selection_args = ['--judge-selection-policy', selection_policy] if explicit_selection else []
     return ['--judge-url', value.url, '--judge-model', value.model, '--judge-revision', value.revision,
             '--judge-threshold', str(value.threshold), '--judge-margin', str(value.margin), '--judge-timeout', str(value.timeout),
-            '--judge-review-mode', value.review_mode] + ([] if value.recheck_unknown else ['--judge-no-recheck'])
+            '--judge-review-mode', value.review_mode] + selection_args + ([] if value.recheck_unknown else ['--judge-no-recheck'])
 
 
 @app.post("/run/start")
@@ -593,8 +1224,13 @@ async def start_run(request: Request):
     except Exception:
         return {"ok": False, "error": "invalid json"}
 
+    from osworld_agent.prompt_settings import validate_mode_prompts
+    try:
+        cfg['mode_prompts'] = validate_mode_prompts(cfg.get('mode_prompts'))
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if cfg.get("mode") == "local":
-        return _start_local(cfg)
+        return _start_local(cfg, request.url.port)
 
     domain = cfg.get("domain", "all")
     task_id = cfg.get("task_id")
@@ -606,7 +1242,7 @@ async def start_run(request: Request):
         return {"ok": False, "error": "未配置 OSWORLD_DESKTOP_ENV_PATH（包含 desktop_env 的目录）"}
 
     model = cfg.get("model", "Qwen3.6-27B")
-    model_url = cfg.get("model_url", "http://10.44.101.62:8094/v1")
+    model_url = cfg.get("model_url", "http://7.246.80.237:48888/v1")
     model_api_key = cfg.get("model_api_key") or "EMPTY"
     ground_model = cfg.get("ground_model", "UI-Venus-2-9B")
     ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
@@ -632,6 +1268,8 @@ async def start_run(request: Request):
     ]
     try:
         cmd += _wait_cli_args(cfg)
+        from osworld_agent.prompt_settings import prompt_cli_args
+        cmd += prompt_cli_args(cfg.get('mode_prompts'), Path(LOCAL_RUNS_DIR) / '.prompt_configs')
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     vm_path = VM_PATH or _detect_vm_path()
@@ -641,7 +1279,7 @@ async def start_run(request: Request):
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
-    env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{os.getenv('AGENTS_VIZ_PORT', '8088')}"
+    env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{request.url.port or os.getenv('AGENTS_VIZ_PORT', '8088')}"
     env["AGENTS_RESULTS_DIR"] = RESULTS_DIR
     env["NO_PROXY"] = "192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1"
     env["no_proxy"] = env["NO_PROXY"]
@@ -652,9 +1290,12 @@ async def start_run(request: Request):
     _agent_state["task_total"] = 1
     _agent_state["config"] = cfg
     _agent_state["output"] = []
+    _agent_state["last_error"] = ""
     _agent_state["current_step"] = 0
     _agent_state["max_steps"] = max_steps
     _agent_state["start_time"] = time.time()
+    _agent_state["started_monotonic"] = time.perf_counter()
+    _agent_state["elapsed_final"] = None
     _agent_state["status"] = "starting"
     logs.clear()
     try:
@@ -663,7 +1304,7 @@ async def start_run(request: Request):
                                 text=True, encoding="utf-8", errors="replace")
         _agent_state["proc"] = proc
         _agent_state["status"] = "running"
-        threading.Thread(target=_reader_thread, args=(proc,), daemon=True).start()
+        threading.Thread(target=_reader_thread, args=(proc, None, _agent_state["started_monotonic"]), daemon=True).start()
         return {"ok": True, "task": _agent_state["task_name"], "task_total": 1}
     except Exception as e:
         _agent_state["status"] = "failed"
@@ -672,7 +1313,9 @@ async def start_run(request: Request):
 
 @app.get("/run/status")
 async def run_status():
-    elapsed = time.time() - _agent_state["start_time"] if _agent_state["start_time"] else 0
+    elapsed = _agent_state.get("elapsed_final")
+    if elapsed is None:
+        elapsed = time.perf_counter() - _agent_state["started_monotonic"] if _agent_state.get("started_monotonic") else 0
     return {
         "status": _agent_state["status"],
         "task": _agent_state["task_name"],
@@ -680,6 +1323,7 @@ async def run_status():
         "max_steps": _agent_state["max_steps"],
         "elapsed": round(elapsed, 1),
         "pid": _agent_state["proc"].pid if _agent_state["proc"] else None,
+        "error": _agent_state["last_error"],
     }
 
 
@@ -687,11 +1331,18 @@ async def run_status():
 async def stop_run():
     proc = _agent_state["proc"]
     if proc and proc.poll() is None:
-        try:
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=15)
-        except Exception:
+        if os.name == 'nt':
+            try:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               capture_output=True, timeout=15)
+            except Exception:
+                proc.terminate()
+        else:
             proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     _agent_state["status"] = "idle"
     _agent_state["proc"] = None
     _agent_state["task_name"] = None
@@ -726,11 +1377,16 @@ async def manual_eval():
 
 # ================= 实验/调试 stub（防止前端报错）================= #
 @app.get("/experiments/default-prompt")
-async def get_default_prompt(backend: str = "native", browser_only: bool = False):
+async def get_default_prompt(backend: str = "native", browser_only: bool = False, os_name: str = ''):
     try:
-        from osworld_agent.prompts import build_system_prompt
+        from osworld_agent.prompts import build_mode_system_prompts, build_editable_mode_prompts
+        os_name = os_name or ('windows' if sys.platform == 'win32' else 'mac' if sys.platform == 'darwin' else 'linux')
+        if os_name not in {'windows', 'mac', 'linux'}:
+            return {'ok': False, 'error': 'Unsupported operating system'}
+        templates = build_mode_system_prompts(os_name=os_name, browser_only=browser_only)
         return {"ok": True, "backend": "native",
-                "prompt": build_system_prompt(browser_only=browser_only)}
+                "os_name": os_name, "prompt": templates['dom'], "prompts": templates,
+                "editable_prompts": build_editable_mode_prompts(os_name=os_name, browser_only=browser_only)}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -889,13 +1545,27 @@ async def debug_chat(request: Request):
     except Exception:
         return {"ok": False, "error": "请求体不是合法 JSON"}
 
+    started = time.monotonic()
+    result = await asyncio.to_thread(_debug_chat_request, payload)
+    result["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
+    return result
+
+
+def _debug_chat_request(payload):
+    """Run blocking model transport outside the UI event loop."""
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "请求体必须是 JSON 对象"}
     engine = payload.get("engine") or {}
     engine_type = str(engine.get("engine_type") or "vllm").lower()
     model = str(engine.get("model") or "").strip()
     base_url = str(engine.get("base_url") or "").strip()
     messages = payload.get("messages") or []
     generation = payload.get("generation") or {}
-    api_key = payload.get("api_key") or "EMPTY"
+    from osworld_agent.config import resolve_secret
+    try:
+        api_key = resolve_secret(payload.get("api_key") or "EMPTY")
+    except (RuntimeError, TypeError) as exc:
+        return {"ok": False, "error": str(exc)}
 
     if not model:
         return {"ok": False, "error": "缺少模型名"}
@@ -932,9 +1602,16 @@ async def debug_chat(request: Request):
         last_err = None
         for attempt in range(2):
             try:
-                # proxies=None：直连内网端点，绕过 HIS 代理
+                # Empty strings explicitly disable inherited ALL_PROXY as well.
+                # Public DashScope can reuse this deployment's configured egress;
+                # private model endpoints remain direct unless explicitly configured.
+                from urllib.parse import urlsplit
+                proxy = os.getenv("AGENT_DEBUG_HTTP_PROXY", "")
+                host = urlsplit(base_url).hostname or ""
+                if not proxy and (host == "dashscope.aliyuncs.com" or host.endswith(".dashscope.aliyuncs.com")):
+                    proxy = os.getenv("AGENT_KNOWLEDGE_HTTP_PROXY", "")
                 r = req.post(url, json=body, headers=headers, timeout=300,
-                             proxies={"http": None, "https": None})
+                             proxies={"http": proxy, "https": proxy, "all": ""})
                 if r.status_code != 200:
                     return {"ok": False, "error": f"模型返回 HTTP {r.status_code}: {r.text[:300]}"}
                 data = r.json()
@@ -942,11 +1619,12 @@ async def debug_chat(request: Request):
                 # grounding 响应：解析坐标并在原图上画标注，返回可视化图
                 parsed = _extract_grounding_coords(content)
                 annotation = None
-                if parsed:
+                if parsed and payload.get("call_type") in (None, "grounding"):
                     # UI-TARS 返回像素坐标，UI-Venus-2 返回 [0,1000] 归一化
                     is_pixel = "tars" in model.lower() or "uitars" in model.lower()
                     annotation = _make_annotation_image(normalized, parsed[0], parsed[1], is_pixel=is_pixel)
-                return {"ok": True, "response": content, "annotation_image": annotation}
+                return {"ok": True, "response": content, "annotation_image": annotation,
+                        "usage": data.get("usage") or {}, "model": data.get("model") or model}
             except Exception as exc:  # noqa: BLE001
                 last_err = str(exc)
                 # 若端点不支持 chat_template_kwargs，去掉后重试一次
@@ -960,26 +1638,22 @@ async def debug_chat(request: Request):
 
 
 def _keep_model_warm():
-    """后台保活线程：用真实 system prompt warm 决策模型的 prefix cache，避免冷启动（78s）。
-
-    决策变慢的根因不是「模型被卸载」，而是 vLLM 第一次处理长 system prompt（+3 张截图）时
-    要计算全部 KV cache（prefix cache 冷启动）；纯文本 "ping" 无法 warm 这个 cache。
-    所以这里用 build_system_prompt(browser_only=True) 作为 system 前缀去 warm，
-    之后真实决策的 system 前缀命中 cache，只剩动态部分（任务/截图/AX树），快。
-    """
+    """可选的自托管模型保活；API 决策模型仅在显式给出 URL 时才保活。"""
     import requests as _req
     from osworld_agent.prompts import build_system_prompt
     sys_prompt = build_system_prompt(browser_only=True)
-    dec_url = os.getenv("OSWORLD_DECISION_URL", "http://10.44.101.62:8094/v1/chat/completions")
+    dec_url = os.getenv("OSWORLD_DECISION_URL", "")
+    dec_model = os.getenv("OSWORLD_DECISION_MODEL", "Qwen3.6-27B")
     grd_url = os.getenv("OSWORLD_GROUNDING_URL", "http://7.246.80.189:8001/v1/chat/completions")
     while True:
-        try:
-            _req.post(dec_url, json={"model": "Qwen3.6-27B",
-                                     "messages": [{"role": "system", "content": sys_prompt},
-                                                  {"role": "user", "content": "keepalive"}],
-                                     "max_tokens": 1}, timeout=120)
-        except Exception:  # noqa: BLE001
-            pass
+        if dec_url:
+            try:
+                _req.post(dec_url, json={"model": dec_model,
+                                         "messages": [{"role": "system", "content": sys_prompt},
+                                                      {"role": "user", "content": "keepalive"}],
+                                         "max_tokens": 1}, timeout=120)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             _req.post(grd_url, json={"model": "UI-Venus-2-9B",
                                      "messages": [{"role": "user", "content": "keepalive"}],

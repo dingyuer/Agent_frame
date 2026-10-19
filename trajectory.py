@@ -114,6 +114,7 @@ def build_trajectory(
             "decision_calls": s.get("decision_calls", []),
             "prompt_metadata": s.get("prompt_metadata", {}),
             "routing": s.get("routing", {}),
+            "operation_mode": s.get("operation_mode"),
             "resolved_action": s.get("resolved_action"),
             "execution_info": s.get("execution_info", {}),
             "framework_operations": copy.deepcopy(s.get("framework_operations", [])),
@@ -122,6 +123,9 @@ def build_trajectory(
             "step_progress": copy.deepcopy(s.get("step_progress", {})),
             "step_reviews": copy.deepcopy(s.get("step_reviews", [])),
             "execution_queue": copy.deepcopy(s.get("execution_queue", {})),
+            "plan_revision": s.get("plan_revision"),
+            "plan_step_id": s.get("plan_step_id"),
+            "plan_step": copy.deepcopy(s.get("plan_step", {})),
             "timing_ms": s.get("timing_ms", {}),
             "trainable": bool(s.get("policy_input") and s.get("policy_output") and s.get("valid_action", False)),
             "events": copy.deepcopy(s.get("events", [])),
@@ -145,6 +149,7 @@ def build_trajectory(
             "reward_source": getattr(result, "reward_source", "unavailable"),
             "termination_reason": getattr(result, "termination_reason", "unknown"),
             "verification": getattr(result, "verification", {}),
+            "run_metrics": copy.deepcopy(getattr(result, 'run_manifest', {}).get('run_metrics', {})),
         },
         "steps": steps,
         "plan": getattr(result, "plan", None),
@@ -267,7 +272,9 @@ def iter_sft_records(trajectory, require_success=True, *, actor_role="decision")
         if not _positive_step(step):
             continue
         calls = step.get("decision_calls") or []
-        if calls and calls[-1].get("finish_reason") == "length":
+        if calls and (calls[-1].get("finish_reason") == "length" or calls[-1].get('parser_normalization')):
+            # Preserve the raw rollout, but do not teach malformed shorthand as
+            # a positive SFT answer or rewrite it into unsampled model tokens.
             continue
         yield {"prompt": copy.deepcopy(step["policy_input"]),
                "completion": [{"role": "assistant", "content": step["policy_output"]}],
@@ -390,6 +397,8 @@ def iter_on_policy_records(trajectory, policy_revision):
             "loss_mask": [1] * len(ids), "finish_reason": call.get("finish_reason"),
             "step": step.get("step") if step else None, "attempt": attempt,
             "valid_action": bool(call.get("valid_action")) if role == "decision" else None,
+            "parser_normalization": call.get('parser_normalization'),
+            "parsed_action": copy.deepcopy(call.get('parsed_action')),
             "valid_plan": call.get("valid_plan") if role == "planner" else None,
             "episode_reward": outcome.get("reward", outcome.get("score")), "reward_valid": True,
             "reward_source": outcome.get("reward_source", "unspecified"),

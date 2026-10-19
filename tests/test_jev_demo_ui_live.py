@@ -26,12 +26,17 @@ def test_presentation_in_real_browser(request, tmp_path):
         if controls['fail']:
             return JSONResponse({'detail': 'fixture failure'}, status_code=503)
         await asyncio.sleep(.08)
-        state = json.loads(data['state'])
-        goal = state['step']['goal']
-        label = 'progress' if '显示搜索结果' in goal else 'failed' if '综述' in goal else 'passed'
-        keys = data['questions']['step']['criteria']
+        if 'readiness' in data['questions']:
+            key = 'readiness'
+            label = 'waiting' if len([c for c in calls if 'readiness' in c['questions']]) == 1 else 'ready'
+        else:
+            key = 'step'
+            state = json.loads(data['state'])
+            goal = state['step']['goal']
+            label = 'progress' if '显示搜索结果' in goal else 'failed' if '综述' in goal else 'passed'
+        keys = data['questions'][key]['criteria']
         return {'model': 'ui-fixture-9b', 'usage': {'input_tokens': 812, 'output_tokens': 0},
-                'answers': {'step': {'type': 'choice', 'choice': label,
+                'answers': {key: {'type': 'choice', 'choice': label,
                     'probabilities': {key: .97 if key == label else .03/(len(keys)-1) for key in keys}, 'confidence': .8}}}
     app.add_api_route('/__jev_demo_fixture/v1/systemone', fixture, methods=['POST'])
     with socket.socket() as sock:
@@ -49,13 +54,15 @@ def test_presentation_in_real_browser(request, tmp_path):
             except httpx.HTTPError:
                 time.sleep(.05)
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            system_chrome = Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+            browser = p.chromium.launch(headless=True,
+                **({'executable_path': str(system_chrome)} if system_chrome.is_file() else {}))
             page = browser.new_page(viewport={'width': 1600, 'height': 1100}, device_scale_factor=1)
             errors = []
             page.on('pageerror', lambda e: errors.append(str(e)))
             page.goto(base+'/#jev-demo')
             expect(page.locator('#view-jev-demo')).to_be_visible()
-            expect(page.locator('#jd-scenes button')).to_have_count(5)
+            expect(page.locator('#jd-scenes button')).to_have_count(7)
             page.locator('.jd-config').evaluate('e => e.open = true')
             page.locator('#jd-pace').select_option('0')
             page.locator('#jd-replay').click()
@@ -69,7 +76,7 @@ def test_presentation_in_real_browser(request, tmp_path):
                 page.locator('#jd-export').click()
             exported = json.loads(Path(download.value.path()).read_text())
             assert exported['mode'] == 'replay' and exported['synthetic_observations']
-            assert len(exported['results']) == 5 and not exported['trainable']
+            assert len(exported['results']) == 7 and not exported['trainable']
             assert all(r['model_latency_ms'] is None for r in exported['results'])
 
             page.locator('#jd-url').fill(base+'/__jev_demo_fixture/v1/systemone')
@@ -77,11 +84,11 @@ def test_presentation_in_real_browser(request, tmp_path):
             page.locator('#jd-live').click()
             expect(page.locator('#jd-summary')).to_be_visible(timeout=15000)
             expect(page.locator('#jd-mode')).to_contain_text('LIVE')
-            expect(page.locator('#jd-calls')).to_have_text('3')
+            expect(page.locator('#jd-calls')).to_have_text('5')
             expect(page.locator('#jd-code-count')).to_have_text('2 / 2')
-            expect(page.locator('#jd-chart .jd-chart-row')).to_have_count(3)
-            assert len(calls) == 3 and all(len(c['images']) == 2 for c in calls)
-            page.locator('#jd-scenes button').nth(1).click()
+            expect(page.locator('#jd-chart .jd-chart-row')).to_have_count(5)
+            assert len(calls) == 5 and [len(c['images']) for c in calls] == [1, 1, 2, 2, 2]
+            page.locator('#jd-scenes button').nth(3).click()
             expect(page.locator('#jd-outcome')).to_have_text('未通过')
             expect(page.locator('#jd-next-title')).to_have_text('纠正当前路径')
             expect(page.locator('#jd-probs .jd-prob-row')).to_have_count(5)
@@ -104,7 +111,7 @@ def test_presentation_in_real_browser(request, tmp_path):
             page.locator('.jd-config').evaluate('e => e.open = true')
             page.locator('#jd-pace').select_option('5000')
             page.locator('#jd-replay').click()
-            expect(page.locator('#jd-outcome')).to_have_text('有进展 · 尚未完成', timeout=10000)
+            expect(page.locator('#jd-outcome')).to_have_text('处理中 · 等待', timeout=10000)
             page.locator('#jd-stop').click()
             expect(page.locator('#jd-live')).to_be_enabled(timeout=1000)
             expect(page.locator('#jd-outcome')).to_have_text('已停止演示')

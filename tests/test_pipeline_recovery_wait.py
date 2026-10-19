@@ -112,7 +112,9 @@ def test_replan_occurs_on_second_rejection_and_never_on_last_slot():
         def chat(self, messages, **kwargs):
             self.calls.append(messages)
             if messages[0]["role"] == "user":
-                return json.dumps({"steps": [{"goal": "换一个路径", "expected_evidence": "页面改变"}]})
+                repair = "当前计划受阻" in messages[0]["content"]
+                return json.dumps({"steps": [{"goal": "先重新观察当前可操作元素再走详情入口" if repair else "换一个路径", "expected_evidence": "页面改变"}],
+                                   "strategy_change": "根据失败证据调整入口与观察方式，核查新的页面状态"})
             return json.dumps({"next_action": {"type": "click", "target": "Download PDF",
                                                  "target_ref": f"snapshot-{len(self.calls)}:1"}})
 
@@ -120,7 +122,8 @@ def test_replan_occurs_on_second_rejection_and_never_on_last_slot():
         env = Env()
         env.route_action = lambda action, obs: {"channel": "reobserve", "reason": "expired ref"}
         model = ReplanModel([])
-        return Pipeline(model=model, env=env, grounding=None, system_prompt="test", max_steps=steps).run("任务")
+        return Pipeline(model=model, env=env, grounding=None, system_prompt="test", max_steps=steps,
+                        max_replans=1).run("任务")
 
     result = run(8)
     assert result.steps == 4 and result.termination_reason == "stalled"
@@ -140,7 +143,9 @@ def test_fifteen_step_budget_recovers_after_failures_thirteen_and_fourteen():
         def chat(self, messages, **kwargs):
             self.calls.append(messages)
             if messages[0]["role"] == "user":
-                return json.dumps({"steps": [{"goal": "执行剩余目标", "expected_evidence": "目标网址出现"}]})
+                repair = "当前计划受阻" in messages[0]["content"]
+                return json.dumps({"steps": [{"goal": "依据刷新后的页面导航到目标网址" if repair else "执行剩余目标", "expected_evidence": "目标网址出现"}],
+                                   "strategy_change": "根据失败证据调整入口与观察方式，核查新的页面状态"})
             self.decisions += 1
             action = ({"type": "goto", "url": "https://example.test/done"} if self.decisions == 15 else
                       {"type": "click", "target": "Download PDF", "target_ref": f"snapshot-{self.decisions}:1"})
@@ -171,12 +176,14 @@ def test_parse_failures_refresh_and_have_bounded_replanning():
         def chat(self, messages, **kwargs):
             self.calls.append(messages)
             if messages[0]["role"] == "user":
-                return json.dumps({"steps": [{"goal": "恢复输出格式", "expected_evidence": "合法动作"}]})
+                repair = "当前计划受阻" in messages[0]["content"]
+                return json.dumps({"steps": [{"goal": "重新观察控件并生成合法动作" if repair else "恢复输出格式", "expected_evidence": "合法动作"}],
+                                   "strategy_change": "根据失败证据调整入口与观察方式，核查新的页面状态"})
             return "literal invalid policy output"
 
     env = Env()
     result = Pipeline(model=InvalidModel([]), env=env, grounding=None, system_prompt="test",
-                      max_steps=10, max_retries=2).run("任务")
+                      max_steps=10, max_retries=2, max_replans=1).run("任务")
     assert result.steps == 4 and result.termination_reason == "stalled"
     assert env.reset_count == 1 and env.observe_count == 4 and env.actions == []
     transitions = [t for t in result.trajectory if "policy_output" in t]
@@ -266,6 +273,65 @@ def test_no_download_signal_has_only_bounded_start_grace(clock):
     assert env.observe_count == 1 and env.event_reads == 3
     assert execution.info["framework_wait"]["status"] == "no_signal"
     assert state.memory.stall_count == 0 and not env.canceled
+
+
+def test_download_jev_checks_each_second_but_cannot_claim_file_without_cdp(clock):
+    class Judge:
+        last_call = {}
+        def __init__(self):
+            self.calls = []
+        def download_wait(self, before, after, action, events, *, remaining_s=None):
+            self.calls.append((clock.now, dict(events)))
+            return {'status': 'answered', 'latency_ms': 250,
+                    'answers': {'effect': {'label': 'not_started'}, 'next': {'label': 'inspect'}}}
+
+    env = EventEnv([metadata()])
+    pipe = make_pipeline(env, wait_config={'download_start_timeout_s': 2.0, 'download_visual_assist': True})
+    pipe.decision_judge = Judge()
+    state, decision = state_and_decision()
+    result = pipe._settle_execution(decision.action,
+        Execution(kind='browser_dom', obs=state.obs, info={'status': 'executed', 'dispatched': True}), state)
+    assert len(pipe.decision_judge.calls) == 2
+    assert [round(t - pipe.decision_judge.calls[0][0]) for t, _ in pipe.decision_judge.calls] == [0, 1]
+    assert result.info['framework_wait']['status'] == 'no_signal'
+    assert result.info['status'] == 'uncertain'
+    assert result.info['wait_error_code'] == 'download_not_confirmed'
+    assert not env.canceled
+
+
+def test_download_jev_wait_hint_extends_start_grace_but_is_bounded(clock):
+    class Judge:
+        last_call = {}
+        def __init__(self): self.calls = 0
+        def download_wait(self, *args, **kwargs):
+            self.calls += 1
+            return {'status': 'answered', 'latency_ms': 250,
+                    'answers': {'effect': {'label': 'unknown'}, 'next': {'label': 'wait'}}}
+
+    env = EventEnv([metadata()])
+    pipe = make_pipeline(env, wait_config={'download_start_timeout_s': 2.0, 'download_visual_assist': True})
+    pipe.decision_judge = Judge()
+    state, decision = state_and_decision()
+    result = pipe._settle_execution(decision.action,
+        Execution(kind='browser_dom', obs=state.obs, info={'status': 'executed', 'dispatched': True}), state)
+    assert 3 <= pipe.decision_judge.calls <= 9
+    assert sum(clock.sleeps) == 8.0
+    assert result.info['status'] == 'uncertain'
+
+
+def test_pdf_viewer_visual_click_without_download_signal_is_uncertain(clock, monkeypatch):
+    monkeypatch.setattr("osworld_agent.pipeline.is_pdf_observation", lambda obs: True)
+    env = EventEnv([metadata()])
+    pipe = make_pipeline(env, wait_config={"download_start_timeout_s": 0.5})
+    pipe.completion = CompletionVerifier("task")
+    state, _ = state_and_decision()
+    action = Action("click", {"target": "PDF viewer download icon", "x": 1335, "y": 30})
+    execution = Execution(kind="browser_dom", obs=state.obs,
+                          info={"status": "executed", "dispatched": True, "resolved": "visual"})
+    result = pipe._settle_execution(action, execution, state)
+    assert result.info["framework_wait"]["status"] == "no_signal"
+    assert result.info["status"] == "uncertain" and result.info["dispatched"] is True
+    assert "observe_desktop" in result.info["wait_reason"]
 
 
 def test_download_timeout_cancels_once_without_replay_or_policy_step(clock):

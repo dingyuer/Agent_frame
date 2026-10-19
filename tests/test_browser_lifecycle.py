@@ -30,6 +30,9 @@ class EventPage(FakePage):
         self.closed = True
         self.context.pages.remove(self)
 
+    def goto(self, url, **kwargs):
+        self.url = url
+
 
 class EventContext:
     def __init__(self, browser):
@@ -112,12 +115,35 @@ def test_episode_isolation_has_stable_initial_identity_and_unique_resources(sess
     assert first_context.closed
     assert session._owned_context is not first_context
     assert first['initial_state_id'] == second['initial_state_id']
-    assert first['downloads_dir'] != second['downloads_dir']
+    assert first['downloads_dir'] == second['downloads_dir']
     assert first['context_id'] != second['context_id']
     assert second['isolation_scope'] == 'browser_context'
     assert session.event_metadata()['artifacts'] == []
     assert session._owned_context.pages[0].url == 'about:blank'
     assert browser.created[-1][1]['accept_downloads'] is True
+
+
+def test_rehearsal_page_is_initial_environment_state_not_a_task_hint(session):
+    browser = EventBrowser()
+    session._connect = Mock(return_value=(None, browser))
+    url = 'http://127.0.0.1:8090/demo/paper-search'
+    initial = session.begin_episode(task_id='natural-language-paper-task', start_url=url)
+    assert session._owned_context.pages[0].url == url
+    assert initial['start_url'] == url
+    assert session._owned_context.pages[0].context is session._owned_context
+
+
+@pytest.mark.parametrize('error_name,status', [('TimeoutError', 'incomplete'), ('Error', 'failed')])
+def test_entry_navigation_failure_remains_observable_for_policy_recovery(session, monkeypatch, error_name, status):
+    from playwright import async_api
+    browser = EventBrowser()
+    session._connect = Mock(return_value=(None, browser))
+    monkeypatch.setattr(EventPage, 'goto', Mock(side_effect=getattr(async_api, error_name)('entry unreachable')))
+    initial = session.begin_episode(task_id='recover-entry', start_url='https://arxiv.org/search/')
+    assert initial['initial_navigation']['status'] == status
+    assert initial['initial_navigation']['requested_url'] == 'https://arxiv.org/search/'
+    assert session._owned_context.pages[0].url == 'about:blank'
+    assert not session._owned_context.closed
 
 
 def test_isolation_failure_does_not_reuse_an_existing_context(session):
@@ -396,3 +422,44 @@ def test_sync_event_subscription_runs_inside_owner_loop_including_nested_callbac
     wrapped = session._wrap_async(Page())
     owner_call(session, lambda: wrapped.on('page', lambda page: page.on('dialog', lambda _: None)))
     assert calls == ['page', 'dialog']
+
+
+@pytest.mark.parametrize('platform,native', [('darwin', True), ('win32', False), ('linux', False)])
+def test_episode_retains_native_mac_dpi_without_changing_other_platforms(monkeypatch, session, platform, native):
+    from osworld_agent import browser_session
+    monkeypatch.setattr(browser_session.sys, 'platform', platform)
+    browser = EventBrowser()
+    session._connect = Mock(return_value=(None, browser))
+    state = session.begin_episode(viewport={'width': 800, 'height': 600})
+    options = browser.created[-1][1]
+    if native:
+        assert options['no_viewport'] is True
+        assert 'viewport' not in options and 'device_scale_factor' not in options
+        assert state['profile']['viewport'] == 'browser_native'
+    else:
+        assert options['viewport'] == {'width': 800, 'height': 600}
+        assert 'no_viewport' not in options
+
+
+def test_mac_retina_capture_keeps_css_coordinates_without_browser_rescaling(monkeypatch, session):
+    import io
+    from osworld_agent import browser_session
+    monkeypatch.setattr(browser_session.sys, 'platform', 'darwin')
+    browser = EventBrowser()
+    context = browser.new_context()
+    page = context.new_page()
+    image = Image.new('RGB', (1600, 1200), 'white')
+    # Mark an actual CSS target at x=400,y=300 in physical pixels.
+    from PIL import ImageDraw
+    ImageDraw.Draw(image).rectangle((780, 580, 820, 620), fill='red')
+    stream = io.BytesIO()
+    image.save(stream, format='PNG')
+    page.screenshot = Mock(return_value=stream.getvalue())
+    session._connect = Mock(return_value=(None, browser))
+    shot, snapshot, info = session.collect_observation()
+    assert shot.size == (800, 600)
+    assert shot.getpixel((400, 300)) == (255, 0, 0)
+    assert info['screenshot_size'] == [800, 600]
+    assert info['screenshot_space'] == 'css_viewport'
+    page.screenshot.assert_called_once_with(full_page=False, scale='device')
+    page.bring_to_front.assert_not_called()

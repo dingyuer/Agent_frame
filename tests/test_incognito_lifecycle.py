@@ -70,9 +70,10 @@ def test_existing_normal_or_unconfirmed_browser_is_rejected(monkeypatch, mode):
 
 def test_new_sessions_use_incognito_flags_and_distinct_owned_profiles(monkeypatch, profile_root):
     calls = []
-    page_calls = iter([[], [{"id": "page"}], [], [{"id": "page"}]])
+    page_calls = iter([[], []])
     monkeypatch.setattr(utils, "list_cdp_pages", lambda *_args: next(page_calls))
     monkeypatch.setattr(utils, "cdp_pages_are_incognito", lambda *_args: True)
+    monkeypatch.setattr(runner, "_cdp_ready", lambda *_args: True)
     monkeypatch.setattr(runner.os.path, "isfile", lambda _path: True)
     monkeypatch.setattr(runner.subprocess, "Popen",
                         lambda args, **kwargs: calls.append((args, kwargs)) or Mock(poll=lambda: None))
@@ -88,10 +89,10 @@ def test_new_sessions_use_incognito_flags_and_distinct_owned_profiles(monkeypatc
     assert first[0] is True and second[0] is True
     assert first[1] != second[1]
     for (args, _kwargs), (_started, profile) in zip(calls, [first, second]):
-        assert "--incognito" in args and "--new-window" in args
+        assert "--incognito" in args and "--no-startup-window" in args
+        assert "--new-window" not in args and "about:blank" not in args
         assert "--remote-debugging-port=9222" in args
         assert f"--user-data-dir={profile}" in args
-        assert args[-1] == "about:blank"
         assert Path(profile).parent == profile_root
         assert runner._validated_profile(9222, profile) == os.path.realpath(profile)
 
@@ -133,6 +134,7 @@ def test_startup_without_confirmed_incognito_cleans_up_and_raises(monkeypatch, p
         return [{"id": "page"}] if pages_ready and page_calls[0] > 1 else []
     monkeypatch.setattr(utils, "list_cdp_pages", pages)
     monkeypatch.setattr(utils, "cdp_pages_are_incognito", lambda *_args: False)
+    monkeypatch.setattr(runner, "_cdp_ready", lambda *_args: False)
     monkeypatch.setattr(runner.os.path, "isfile", lambda _path: True)
     process = Mock()
     process.poll.return_value = None
@@ -404,7 +406,8 @@ def _stub_main(monkeypatch, profile, *, started=True, failing=None):
     def grounding(**_kwargs):
         checkpoint("grounding")
         return object()
-    monkeypatch.setattr(sys, "argv", ["run_windows_local.py", "--task", "test task"])
+    monkeypatch.setattr(sys, "argv", ["run_windows_local.py", "--task", "test task",
+                                    "--browser-session-mode", "isolated"])
     monkeypatch.setitem(sys.modules, "pyautogui", SimpleNamespace(size=lambda: (1280, 720)))
     monkeypatch.setattr(runner, "ensure_chrome", lambda *_args: (started, profile if started else None))
     cleanup = Mock(side_effect=lambda *_args: events.append("chrome_close"))

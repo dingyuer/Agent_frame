@@ -122,7 +122,7 @@ def test_studio_human_demonstration_from_buttons_to_dataset(request, tmp_path):
                 review_id:'fixture-r1',plan_step_id:'p0_1',decision_step:1,method:'model',status,
                 goal:'搜索目标论文',reason:'标题符合任务',evidence:['<script>bad()</script>'],ts:1});
             }""")
-            assert page.locator('[data-kind="review"]').count() == 2  # pending cards update in place
+            assert page.locator('[data-kind="review"]').count() == 1  # code precheck is replaced by final review
             assert page.locator('[data-kind="execution-queue"]').count() == 1
             assert page.locator('[data-diagnostic-id="task_analysis:task"]').count() == 1
             assert '代码核查 + 语义审查' in page.locator('[data-diagnostic-id="task_analysis:task"]').inner_text()

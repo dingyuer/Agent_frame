@@ -1,0 +1,69 @@
+输入后提交稳定性测试记录 — 2026-10-17
+
+范围：真实远程 Qwen3.7-flash + 51 服务器 Jev d3-flash 9B + 独立 Chromium。
+搜索为本机可控网页，规划和决策由真实模型生成，无脚本替代策略；论文下载访问真实 arXiv。
+搜索判据：框架报告成功、实际结果 DOM 正确、HTTP 查询记录恰好一次且内容完全匹配。
+下载判据：框架报告成功、仅一个落盘 PDF、PDF 魔数/首页标题/arXiv 编号符合预期。
+
+本轮修复：
+1. 将新标签页跟踪准备移到最终输入框校验之前，避免准备期间的焦点/值/禁用状态变化后仍发送 Enter。
+   拒绝发送 Enter 时清除未派发的标签页跟踪状态，保留已输入这一部分效果和两段原始动作记录。
+2. 带 submit_key 的 DOM 引用和名称冲突返回 target_mismatch，提供当前 name/id；提示词要求保留 AX 原文名称。
+   不放宽引用校验，不自动重试提交，不给普通 type 隐式加 Enter。
+
+修复前：{"cases": 12, "passed": 12, "decisions": 22, "median_run_s": 12.1325, "compound_actions": 12, "executed_actions": 15, "jev_four_question_calls": 22}
+case | passed | decisions | run_s | server submissions
+get_1 | True | 1 | 12.141 | 1
+prefilled_1 | True | 1 | 12.867 | 1
+chinese_1 | True | 2 | 12.124 | 1
+spa_1 | True | 5 | 26.947 | 1
+get_2 | True | 1 | 7.048 | 1
+prefilled_2 | True | 1 | 7.907 | 1
+chinese_2 | True | 3 | 18.236 | 1
+spa_2 | True | 1 | 10.083 | 1
+get_3 | True | 3 | 22.823 | 1
+prefilled_3 | True | 1 | 8.342 | 1
+chinese_3 | True | 2 | 14.029 | 1
+spa_3 | True | 1 | 11.291 | 1
+详细轨迹索引：/data1/chenyuning/osworld_agent_framework_and_2trajectories/.runtime/stability_suite/results.json
+
+修复后：{"cases": 12, "passed": 12, "decisions": 12, "median_run_s": 10.1465, "compound_actions": 12, "executed_actions": 12, "jev_four_question_calls": 12}
+case | passed | decisions | run_s | server submissions
+get_1 | True | 1 | 9.996 | 1
+prefilled_1 | True | 1 | 11.995 | 1
+chinese_1 | True | 1 | 12.248 | 1
+spa_1 | True | 1 | 9.915 | 1
+get_2 | True | 1 | 6.983 | 1
+prefilled_2 | True | 1 | 8.801 | 1
+chinese_2 | True | 1 | 13.598 | 1
+spa_2 | True | 1 | 11.063 | 1
+get_3 | True | 1 | 8.662 | 1
+prefilled_3 | True | 1 | 8.084 | 1
+chinese_3 | True | 1 | 11.808 | 1
+spa_3 | True | 1 | 10.297 | 1
+详细轨迹索引：/data1/chenyuning/osworld_agent_framework_and_2trajectories/.runtime/stability_suite_after/results.json
+
+真实论文下载：
+stability_download_1 | arXiv 1706.03762 | oracle=True | steps=2 | run_s=20.275 | verified_by_model
+轨迹：/data1/chenyuning/osworld_agent_framework_and_2trajectories/framework/local_runs/live_paper_20261017_133128_stability_download_1
+stability_download_2 | arXiv 1512.03385 | oracle=True | steps=2 | run_s=19.63 | verified_by_model
+轨迹：/data1/chenyuning/osworld_agent_framework_and_2trajectories/framework/local_runs/live_paper_20261017_133150_stability_download_2
+stability_download_3 | arXiv 1706.03762 | oracle=True | steps=2 | run_s=19.634 | verified_by_model
+轨迹：/data1/chenyuning/osworld_agent_framework_and_2trajectories/framework/local_runs/live_paper_20261017_133212_stability_download_3
+
+自动化回归：
+145 项单元回归通过：动作校验、上下文、传输、论文解析恢复、训练数据和轨迹导出。
+23 项合并输入相关真实浏览器用例通过，其中 8 个参数组合各重复 3 次提交；另有焦点变化、值变化、控件移除/禁用、联想展开、阻止提交、新标签页等边界。
+18 项已有浏览器交互回归通过（其中 8 项与上述 23 项重叠，不相加）。
+扩展路由回归：49 passed / 2 failed。用修复前的 BrowserSession.route 单独复跑，两项仍失败，属于已有实现与测试预期不一致，本轮未扩大修改。
+失败项：test_target_ref_semantic_mismatch_rejected、test_target_ref_semantic_substring_and_non_cjk_allowed。
+竞态故障注入修复前 3 项全部失败，修复后均通过；原始失败日志保留在 .runtime/stability_suite/late-change-before.log。
+
+复现命令（在 framework 下，使用项目虚拟环境 Python）：
+PYTHONPATH=.. python -m pytest -q --run-browser-integration tests/test_type_submit_stability_live.py tests/test_type_submit_live.py
+真实模型矩阵脚本：/data1/chenyuning/osworld_agent_framework_and_2trajectories/.runtime/stability_suite_after/run_matrix.py
+下载脚本：/data1/chenyuning/osworld_agent_framework_and_2trajectories/.runtime/stability_suite_after/run_downloads.py
+
+限制：这验证了限定输入框和任务样本，不代表任意网站稳定率。中文联想、未标注的自定义控件、反爬和实际网站变化仍需现场测试。
+模型耗时存在服务排队/网络波动，部分浏览器回归与矩阵重叠；修复前后耗时仅作运行记录，不作严格性能基准或保证。
+普通输入、复杂表单、需要选择联想项或中途观察的流程仍分步操作；保持 Jev 四问和最后验收。

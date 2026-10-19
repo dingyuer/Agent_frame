@@ -1,4 +1,4 @@
-﻿"""配置包：所有可调项 + 动作/skill 注册表文件的定位。
+"""配置包：所有可调项 + 动作/skill 注册表文件的定位。
 
 - Config 系列 dataclass：模型、grounding、agent 循环、环境的可调项。
 - ACTION_YAML / SKILLS_YAML：动作 / skill 注册表文件路径（随包分发，改这些 yaml 不动代码）。
@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -15,6 +17,44 @@ from typing import Any, Dict, Optional
 CONFIG_DIR = Path(__file__).parent
 ACTION_YAML = CONFIG_DIR / "action.yaml"
 SKILLS_YAML = CONFIG_DIR / "skills.yaml"
+_ENV_REFERENCE = re.compile(r"^(?:env:([A-Za-z_][A-Za-z0-9_]*)|\$\{([A-Za-z_][A-Za-z0-9_]*)\})$")
+
+
+def resolve_secret(value: str) -> str:
+    """Resolve ``env:NAME``/``${NAME}`` without putting credentials in tracked YAML.
+
+    Process environment variables take precedence.  For local development the
+    repository's ignored ``.env`` file is used as a small fallback, so the web
+    UI and subprocess runners can share one credential without exposing it in
+    command lines or model preset responses.
+    """
+    if not isinstance(value, str):
+        raise TypeError("secret reference must be a string")
+    match = _ENV_REFERENCE.fullmatch(value.strip())
+    if match is None:
+        return value
+    name = match.group(1) or match.group(2)
+    secret = os.getenv(name)
+    if secret:
+        return secret
+    dotenv = CONFIG_DIR.parent / ".env"
+    try:
+        lines = dotenv.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, candidate = line.split("=", 1)
+        if key.strip() != name:
+            continue
+        candidate = candidate.strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "\"'":
+            candidate = candidate[1:-1]
+        if candidate:
+            return candidate
+    raise RuntimeError(f"缺少环境变量 {name}（也未在本地 .env 中配置）")
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -32,8 +72,8 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 @dataclass
 class ModelConfig:
     """决策模型的连接配置。"""
-    name: str = "9b"
-    url: str = "http://10.44.101.62:8094/v1"
+    name: str = "Qwen3.6-27B"
+    url: str = "http://7.246.80.237:48888/v1"
     api_key: str = "EMPTY"
     temperature: float = 0.3
     max_tokens: int = 2048
@@ -65,10 +105,12 @@ class AgentConfig:
     max_retries: int = 3
     enable_reflection: bool = True
     early_stop_repeat: int = 3
-    max_replans: int = 1
+    max_replans: int = 3
     wait_config: Dict[str, Any] = field(default_factory=dict)
     progress_config: Dict[str, Any] = field(default_factory=dict)
     decision_judge: Dict[str, Any] = field(default_factory=dict)
+    knowledge_method: str = "all"
+    knowledge_jev_url: str = ""
 
 
 @dataclass
@@ -95,7 +137,7 @@ class ContextConfig:
     structured_max_images: int = 1
     memory_tokens: int = 2200
     auxiliary_tokens: int = 1200
-    structure_tokens: int = 5000
+    structure_tokens: int = 23000
     tokenizer_path: str = ""  # 本地 tokenizer；不填则按 UTF-8 字节保守预算
     require_current_image: bool = True
 

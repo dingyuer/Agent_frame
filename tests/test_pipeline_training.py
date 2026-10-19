@@ -26,7 +26,7 @@ def paper_plan(reverse=False):
                       for phase in phases], "keywords": ["AAA"]}
 
 
-def test_title_only_paper_task_completes_from_real_pdf_and_exports_both_actors(tmp_path):
+def test_title_only_paper_task_rejects_download_before_identity_binding(tmp_path):
     path = pdf_file(tmp_path / "download.bin", "AAA", "Alice Smith", "Abstract", "Paper content")
     env = Env()
     env.execute_routed = lambda a, r: StepResult(env.obs, info={"status": "executed", "action": "click",
@@ -34,13 +34,15 @@ def test_title_only_paper_task_completes_from_real_pdf_and_exports_both_actors(t
     model = Model([{"type": "click", "target": "PDF button"}], paper_plan())
     result = Pipeline(model=model, env=env, grounding=None, system_prompt="test",
                       event_path=str(tmp_path / "events.jsonl")).run("请下载一篇叫做AAA的论文")
-    assert result.success and result.verification["checks"][0]["matched_title"] == "AAA"
+    assert not result.success
+    assert result.trajectory[0]['routing']['error_code'] == 'paper_identity_mismatch'
+    assert not result.verification['checks'][0].get('matched_title')
     calls = [e["call"] for e in read_events(tmp_path / "events.jsonl") if e["event_type"] == "model_call"]
-    assert [c["actor_role"] for c in calls] == ["planner", "decision"]
+    assert [c["actor_role"] for c in calls][:2] == ["planner", "decision"]
     assert all(c["policy_trainable"] for c in calls)
     trajectory = build_trajectory("paper-AAA", "browser", result.task, result)
-    assert len(list(iter_sft_records(trajectory, actor_role="planner"))) == 1
-    assert len(list(iter_sft_records(trajectory))) == 1
+    assert len(list(iter_sft_records(trajectory, actor_role="planner"))) == 0
+    assert len(list(iter_sft_records(trajectory))) == 0
     assert read_events(tmp_path / "events.jsonl")[-1]["event_type"] == "episode_end"
 
 
@@ -132,7 +134,9 @@ def test_replanning_is_bounded_and_keeps_same_environment():
         def chat(self, messages, **kwargs):
             if "steps" in messages[0]["content"] and messages[0].get("role") == "user":
                 self.calls.append(messages)
-                return json.dumps({"steps": [{"goal": "换路径继续任务", "expected_evidence": "目标状态改变"}]})
+                repair = "当前计划受阻" in messages[0]["content"]
+                return json.dumps({"steps": [{"goal": "先检查阻碍，再进入详情继续任务" if repair else "换路径继续任务", "expected_evidence": "目标状态改变"}],
+                                   "strategy_change": "根据失败证据调整入口与观察方式，核查新的页面状态"})
             self.calls.append(messages)
             return json.dumps({"next_action": {"type": "click", "target": "Unresponsive button"},
                                "expected_effect": "状态更新", "state_update": {}})
