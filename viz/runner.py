@@ -53,7 +53,7 @@ def main() -> None:
     parser.add_argument("--ground-api-key", default="EMPTY")
     parser.add_argument("--ground-type", default="ui-venus2", choices=["ui-tars", "ui-venus2", "qwen-plus"],
                         help="grounding 模型类型：ui-tars / ui-venus2 / qwen-plus")
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--operation-timeout", type=float, default=300)
     parser.add_argument("--task-timeout", type=float, default=1800)
     parser.add_argument("--download-max-mib", type=int, default=50,

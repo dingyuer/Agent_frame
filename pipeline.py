@@ -105,7 +105,7 @@ class Pipeline:
     """主循环流水线。run() 只列 6 个阶段。"""
 
     def __init__(self, *, model: ChatModel, grounding: Grounding, env: Environment,
-                 system_prompt: str, code_agent=None, max_steps: int = 20,
+                 system_prompt: str, code_agent=None, max_steps: int = 25,
                  max_retries: int = 3, enable_reflection: bool = True,
                  early_stop_repeat: int = 3, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
@@ -748,7 +748,8 @@ class Pipeline:
         if facts != state.operation_facts:
             state.operation_facts = facts
             self._publish_diagnostic('operation_feedback', facts=facts)
-        required = current_brief(state, self.completion.public_spec.get('checks', []) if self.completion else [], facts)
+        required = current_brief(state, self.completion.public_spec.get('checks', []) if self.completion else [], facts,
+                                 knowledge=getattr(self, '_knowledge_selection', None))
         images = self._build_images(state) if getattr(self.model, "vision", True) and profile.mode != "cli" else []
         if observation_info.get("dialog"):
             # Native JS dialogs may block a new screenshot. Their fresh event
@@ -764,7 +765,7 @@ class Pipeline:
                         system_estimate=self.compiler.count(system), system_bytes=len(system.encode('utf-8')),
                          prompt_profile=copy.deepcopy((state.obs.info or {}).get('decision_mode', profile.to_dict())) if state.obs else profile.to_dict(),
                          prompt_rules=[name for name, _ in sections],
-                        context_mode="current_step_brief_v3")
+                        context_mode="current_step_brief_v4")
         state.prompt_metadata = metadata
         state.prompt_text = user_text
         if state.obs:

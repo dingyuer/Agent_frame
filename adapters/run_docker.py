@@ -54,7 +54,7 @@ def main() -> int:
     parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
     parser.add_argument("--ground-type", default="ui-venus2", choices=["ui-tars", "ui-venus2"],
                         help="grounding 模型类型：ui-tars / ui-venus2")
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--screen-width", type=int, default=1920)
     parser.add_argument("--screen-height", type=int, default=1080)
     args = parser.parse_args()

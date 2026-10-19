@@ -339,7 +339,7 @@ def main(platform: str = 'windows') -> int:
                         default="qwen-plus" if platform == 'mac' else "ui-venus2")
     parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
     parser.add_argument("--ground-api-key", default="EMPTY" if platform == 'mac' else "EMPTY")
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="决策/规划采样温度，默认0以减少重复演示中的随机变化")
     parser.add_argument("--operation-timeout", type=float, default=300, help="下载等操作等待上限（秒），自动等待不消耗决策步数")

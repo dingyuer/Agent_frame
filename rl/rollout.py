@@ -36,7 +36,7 @@ class RolloutResult:
     initial_state: dict = field(default_factory=dict)
 
 
-def run_rollout(agent, instruction: str, max_steps: int = 20, *, env_factory=None,
+def run_rollout(agent, instruction: str, max_steps: int = 25, *, env_factory=None,
                 completion_spec=None, private_completion_spec=None, output_dir=None, policy_revision=None):
     """A fresh factory environment is always closed, including setup failures."""
     original_env = agent.env
@@ -154,7 +154,7 @@ def _step_semantic(step):
     return semantic_action(action)
 
 
-def run_rollouts(agent, instruction, n, max_steps=20, **kwargs):
+def run_rollouts(agent, instruction, n, max_steps=25, **kwargs):
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise ValueError("n must be a positive integer")
     return [run_rollout(agent, instruction, max_steps, **kwargs) for _ in range(n)]
@@ -170,7 +170,7 @@ def main(argv=None):
     parser.add_argument("--tasks", required=True, help="JSONL objects: instruction and optional completion_spec")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--n", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--max-steps", type=int, default=25)
     parser.add_argument("--policy-revision", help="Validate on-policy metadata when reward is available")
     args = parser.parse_args(argv)
     module_name, separator, function_name = args.factory.partition(":")

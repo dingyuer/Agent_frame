@@ -517,7 +517,7 @@
             <textarea id="local-task" rows="6" placeholder="例如：搜索论文 Attention Is All You Need，找到原文并下载 PDF。"></textarea>
             <div class="field-tip">描述明确的目标、限制和期望结果。</div>
             <div class="form-two task-limits">
-              <div class="run-row"><label for="local-maxsteps">最大决策步数</label><input id="local-maxsteps" type="number" value="15" min="1" max="200"></div>
+              <div class="run-row"><label for="local-maxsteps">最大决策步数</label><input id="local-maxsteps" type="number" value="25" min="1" max="200"></div>
               <div class="run-row"><label for="local-task-timeout">任务时限（秒）</label><input id="local-task-timeout" type="number" value="1800" min="1"></div>
               <div class="run-row"><label for="local-operation-timeout">下载等待上限（秒）</label><input id="local-operation-timeout" type="number" value="300" min="1"></div>
               <div class="run-row"><label for="local-download-max-mib">下载上限（MiB，0 不限）</label><input id="local-download-max-mib" type="number" value="50" min="0" step="1"></div>
@@ -529,7 +529,7 @@
             <div class="run-row"><label>测试集</label><select id="run-testset"><option value="evaluation_examples/test_small.json" selected>test_small · 39 个任务</option><option value="evaluation_examples/test_one.json">test_one · 3 个任务</option><option value="evaluation_examples/test_all.json">test_all · 369 个任务</option></select></div>
             <div class="run-row"><label>任务领域</label><select id="run-domain"></select></div>
             <div class="run-row"><label>任务</label><select id="run-task"></select></div>
-            <div class="form-two"><div class="run-row"><label>最大步数</label><input id="run-maxsteps" type="number" value="20" min="1" max="200"></div><div class="run-row"><label>历史步数</label><input id="run-maxtraj" type="number" value="3" min="1" max="16"></div></div>
+            <div class="form-two"><div class="run-row"><label>最大步数</label><input id="run-maxsteps" type="number" value="25" min="1" max="200"></div><div class="run-row"><label>历史步数</label><input id="run-maxtraj" type="number" value="3" min="1" max="16"></div></div>
             <label class="checkbox-row"><input id="run-manual" type="checkbox">人工操作虚拟机，结束后运行评测</label>
             <button id="btn-start" class="run-btn primary-launch">启动任务<svg><use href="#i-arrow"/></svg></button>
           </div>
@@ -2185,7 +2185,7 @@ async function startLocalTask() {
     knowledge_method: document.getElementById('run-knowledge-method').value,
     knowledge_jev_url: document.getElementById('run-knowledge-jev-url').value.trim(),
     task: task,
-    max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
+    max_steps: parseInt(document.getElementById('local-maxsteps').value) || 25,
     operation_timeout_s: Number(document.getElementById('local-operation-timeout').value),
     download_max_mib: Number(document.getElementById('local-download-max-mib').value),
     workspace_dir: workspaceDir,

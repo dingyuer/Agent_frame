@@ -1,5 +1,6 @@
 """Small, step-scoped policy input; keep the original user instruction intact."""
 import json
+from urllib.parse import urlsplit
 from datetime import datetime
 
 from .actions import ACTION_REGISTRY, BASIC_ACTIONS
@@ -177,12 +178,60 @@ def short_text(value, limit=180):
     return ' '.join(str(value or '').split())[:limit]
 
 
-def current_brief(state, public_checks=(), operation_facts=()):
+def navigation_brief(task, step, knowledge=None):
+    """Carry execution operands from the selected snapshot, not the full KB/plan."""
+    predicates = (step or {}).get('verification') or []
+    targets = []
+    hosts = set()
+    for check in predicates:
+        kind = check.get('kind')
+        value = check.get('host' if kind == 'url_host' else 'url', '')
+        if kind not in {'url_host', 'url_equals'} or not value:
+            continue
+        targets.append(('本步目标域名：' if kind == 'url_host' else '本步目标网址：') + value)
+        hosts.add(value.casefold() if kind == 'url_host' else (urlsplit(value).hostname or '').casefold())
+    query = (task + ' ' + str((step or {}).get('goal', ''))).casefold()
+    ranked = []
+    for entry in (knowledge or {}).get('entries', []):
+        url = entry.get('url') or ''
+        if not entry.get('enabled', True) or not url:
+            continue
+        terms = [entry.get('title', ''), *entry.get('aliases', []), *entry.get('keywords', [])]
+        score = sum(1 for term in terms if term and term.casefold() in query)
+        if (urlsplit(url).hostname or '').casefold() in hosts:
+            score += 100
+        if url.casefold() in query:
+            score += 100
+        ranked.append((score, entry))
+    # Ranking only orders the already selected snapshot; it does not require a
+    # second lexical match after semantic selection. Keep URLs whole.
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    refs, size = [], 0
+    for _, entry in ranked:
+        ref = json.dumps({'名称': short_text(entry.get('title'), 80), '网址': entry['url']}, ensure_ascii=False)
+        if size + len(ref) > 4000 or len(refs) >= 12:
+            continue
+        refs.append(ref)
+        size += len(ref)
+    lines = list(dict.fromkeys(targets))
+    if refs:
+        lines.append('已知入口（本轮选中知识，仅作导航参考）：\n' + '\n'.join(refs))
+        if len(refs) < len(ranked):
+            lines.append('其余知识入口已省略；未列出不代表不存在。')
+    if lines:
+        lines.append('原始任务明确指定的网址/目标优先于知识和计划；冲突时按原任务处理并报告冲突。'
+                     '简称有已知入口时复用其完整网址，不猜其他公司的同名网站；多个同名入口无法区分时先澄清。'
+                     '目标域名是目的地提示，不是完整URL，也不是完成证据；是否到达仍由系统核查。')
+    return lines
+
+
+def current_brief(state, public_checks=(), operation_facts=(), *, knowledge=None):
     """Expose the current goal and a bounded corrective hint, never the contract."""
     step = state.queue.current if state.queue else None
     lines = [short_text((step or {}).get('goal') or '核对原始任务的全部要求，满足后请求结束', 600)]
     if step and step.get('expected_evidence'):
         lines.append('本步骤预期：' + short_text(step['expected_evidence'], 400))
+    lines.extend(navigation_brief(state.task, step, knowledge))
     lines.append('本次系统时间：' + datetime.now().astimezone().isoformat(timespec='seconds') + '；网页发布日期不等于查询日期。')
     from .report_delivery import observed_navigation_hints
     hints = observed_navigation_hints(state)

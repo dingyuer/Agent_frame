@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 MAX_RECENT_EVENTS = 3
 MAX_FAILURES = 3
-MAX_ACTION_HISTORY = 20      # 动作历史渲染给模型时保留最近 N 条（覆盖默认 max_steps=20）
+MAX_ACTION_HISTORY = 20      # 动作历史渲染给模型时保留最近 N 条
 
 
 @dataclass

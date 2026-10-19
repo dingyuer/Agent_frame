@@ -101,7 +101,7 @@ class GroundingConfig:
 @dataclass
 class AgentConfig:
     """智能体循环的超参。"""
-    max_steps: int = 20
+    max_steps: int = 25
     max_retries: int = 3
     enable_reflection: bool = True
     early_stop_repeat: int = 3

@@ -1090,7 +1090,7 @@ def _start_local(cfg: dict, viz_port: int | None = None):
     ground_model = cfg.get("ground_model", "UI-Venus-2-9B")
     ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
     ground_api_key = cfg.get("ground_api_key") or "EMPTY"
-    max_steps = int(cfg.get("max_steps", 15))
+    max_steps = int(cfg.get("max_steps", 25))
     from osworld_agent.persistent_chrome import browser_settings, save_browser_settings
     saved_browser = browser_settings()
     session_mode = cfg.get('browser_session_mode', saved_browser['browser_session_mode'])
@@ -1275,7 +1275,7 @@ async def start_run(request: Request):
     ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
     ground_api_key = cfg.get("ground_api_key", "EMPTY")
     ground_type = cfg.get("ground_type", "ui-venus2")
-    max_steps = int(cfg.get("max_steps", 20))
+    max_steps = int(cfg.get("max_steps", 25))
 
     cmd = [
         _runner_python(), "-m", "osworld_agent.viz.runner",

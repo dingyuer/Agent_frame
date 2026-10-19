@@ -20,7 +20,7 @@ grounding_model:
 
 # ---------------- 智能体循环 ----------------
 agent:
-  max_steps: 20              # 单任务最大步数
+  max_steps: 25              # 单任务最大步数
   max_retries: 3             # 动作解析失败最多重试几次
   enable_reflection: true    # 是否开启反思（reflection）
   early_stop_repeat: 3       # 相同动作无进展阈值；重复执行失败会提前进入恢复

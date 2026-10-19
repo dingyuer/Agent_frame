@@ -18,7 +18,7 @@ class Agent:
     """GUI 操作智能体（对外入口）。"""
 
     def __init__(self, decision_model: ChatModel, grounding: Grounding,
-                 env: Environment, max_steps: int = 20, max_retries: int = 5,
+                 env: Environment, max_steps: int = 25, max_retries: int = 5,
                  enable_reflection: bool = True, early_stop_repeat: int = 3,
                  code_agent_budget: int = 20, step_callback=None,
                  completion_spec=None, context_config=None, private_completion_spec=None,
