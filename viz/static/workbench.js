@@ -7,7 +7,7 @@ const label = {cli:'CLI',dom:'DOM',gui:'GUI',yes:'是',no:'否',waiting:'继续�
 const name = s => label[s] || s || '待确认';
 const endings={report_review_failed:'文字结果核查未通过',stalled:'未检测到进展',max_steps:'决策步数耗尽',planning_failed:'规划失败',task_timeout:'任务超时',completion_inconclusive:'完成证据不足',verification_changed:'最终复查未通过',agent_failed:'执行失败'};
 const phases={planning:'规划中',decision:'决策中',dispatch:'系统执行中',settlement:'等待环境就绪',step_review:'步骤核查中',final_review:'整项验收中',final_evaluation:'最终复查中',mode_selection:'选择操作模式',initial_observation:'获取初始观察',preprocess:'准备观察'};
-const purpose = {mode_selection:'操作模式选择',action_transition:'动作后联合核查',step_review:'子任务完成核查',final_review:'整项任务验收',page_readiness:'页面加载就绪',download_wait:'下载等待判断',paper_identity:'论文身份核查',user_report:'结果撰写',scene_routing:'操作模式选择',task_routing:'任务环境分类',tab_selection:'任务标签页选择',requirement_review:'要求核查'};
+const purpose = {report_review:'文字结果与来源核查',report_review_fallback:'独立文字语义复核',mode_selection:'操作模式选择',action_transition:'动作后联合核查',step_review:'子任务完成核查',final_review:'整项任务验收',page_readiness:'页面加载就绪',download_wait:'下载等待判断',paper_identity:'论文身份核查',user_report:'结果撰写',scene_routing:'操作模式选择',task_routing:'任务环境分类',tab_selection:'任务标签页选择',requirement_review:'要求核查'};
 const ms = n => n == null ? '—' : n < 1000 ? Math.round(n)+' ms' : (n/1000).toFixed(1)+' s';
 const empty = () => ({instruction:'等待任务启动',actions:[],revisions:[],outcome:{},metrics:{},report:{},unassigned_calls:[]});
 function downloadFiles(outcome) {

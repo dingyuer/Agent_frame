@@ -228,28 +228,39 @@ class StepReviewer:
 
     def visual_review(self, task, step, obs, execution_info, code, *, remaining_s=None):
         result = {"method": "model", "status": "unknown", "reason": "独立视觉核查模型不可用", "evidence": [], "latency_ms": 0}
+        packet = code.get('report_review')
+        if packet:
+            result['reason'] = '独立文字核查模型不可用，保留不确定'
         if self.model is None:
             return result
         cli_evidence = bool((getattr(obs, "info", None) or {}).get("cli_result") or (getattr(obs, "info", None) or {}).get("cli_checks"))
-        if obs is None or (not cli_evidence and (obs.screenshot is None or (obs.info or {}).get("screenshot_stale") or not getattr(self.model, "vision", True))):
+        if not packet and (obs is None or (not cli_evidence and (obs.screenshot is None or (obs.info or {}).get("screenshot_stale") or not getattr(self.model, "vision", True)))):
             result["reason"] = "缺少有效当前截图，不能进行视觉验收"
             return result
         if remaining_s is not None and remaining_s <= 0:
             result["reason"] = "任务等待预算已用尽"
             return result
-        info = obs.info or {}
+        info = (obs.info if obs else {}) or {}
         supplemental = {k: info[k] for k in ("cli_result", "cli_checks", "runtime_state", "artifacts", "pending_downloads", "dialog", "tabs", "active_surface", "initial_state") if k in info}
-        blocks = list(obs.context) + [{"kind": "supplemental", "text": json.dumps(supplemental, ensure_ascii=False)},
-                                     {"kind": "desktop_a11y", "text": obs.text or ""}]
+        blocks = list(obs.context if obs else []) + [{"kind": "supplemental", "text": json.dumps(supplemental, ensure_ascii=False)},
+                                     {"kind": "desktop_a11y", "text": (obs.text if obs else '') or ""}]
         # No policy claims or proposed final answer are supplied to the reviewer.
         required = json.dumps({"review_step": {k: step.get(k) for k in ("id", "goal", "expected_evidence", "verification", "planner_review_hint", "unresolved_requirements") if k in step},
                                "code_review": code, "execution": {k: execution_info.get(k) for k in ("status", "error_code", "action")}}, ensure_ascii=False)
         messages, raw, started = [], "", time.monotonic()
         try:
-            text, images, _ = self.compiler.compile(system=REVIEW_SYSTEM, task=task, memory="", auxiliary="", blocks=blocks,
-                required=required, images=[("动作后的当前截图", obs.screenshot)], require_image=not bool(info.get("cli_result") or info.get("cli_checks")), focus=step.get("goal", ""))
-            messages = [{"role": "system", "content": REVIEW_SYSTEM},
-                        self.model.build_vision_message("独立步骤核查\n" + text, images)]
+            if packet:
+                from .report_review import REPORT_INSTRUCTION
+                messages = [{'role': 'system', 'content': REPORT_INSTRUCTION +
+                    '你是独立审查员，不是正文撰写者。逐项检查全部 requirements；不要迎合先前结论。'
+                    '只输出 JSON: {"status":"passed|failed|unknown","reason":"具体缺项或判断理由",'
+                    '"evidence":["来源编号与支持或反驳正文的具体内容"]}。passed 必须有具体来源证据。'},
+                    {'role': 'user', 'content': json.dumps(packet, ensure_ascii=False)}]
+            else:
+                text, images, _ = self.compiler.compile(system=REVIEW_SYSTEM, task=task, memory="", auxiliary="", blocks=blocks,
+                    required=required, images=[("动作后的当前截图", obs.screenshot)], require_image=not bool(info.get("cli_result") or info.get("cli_checks")), focus=step.get("goal", ""))
+                messages = [{"role": "system", "content": REVIEW_SYSTEM},
+                            self.model.build_vision_message("独立步骤核查\n" + text, images)]
             cfg = getattr(getattr(self.model, "inner", self.model), "cfg", None)
             # ChatModel lazily creates its HTTP client. Each review respects remaining wall time.
             if cfg is not None and remaining_s is not None:
@@ -274,6 +285,8 @@ class StepReviewer:
         call.update(messages=copy.deepcopy(messages), response=raw, actor_role="verifier", policy_trainable=False,
                     provenance="sampled", review_step_id=step.get("id"), review_result=copy.deepcopy(result),
                     latency_ms=round((time.monotonic() - started) * 1000, 2))
+        if packet:
+            call.update(purpose='report_review_fallback', review_scope='text_report')
         if messages:
             self.calls.append(call)
         return result

@@ -369,7 +369,44 @@ class DecisionJudge:
                 'reason': judged.get('reason', ''), 'judgment': judged,
                 'policy_trainable': False, 'reward_valid': False}
 
+    def review_report(self, packet, step, *, remaining_s=None):
+        from ..report_review import REPORT_INSTRUCTION
+        requirements = packet['requirements']
+        questions = {'step': {'type': 'choice', 'criteria': RESULT_CHOICES,
+            'instructions': REPORT_INSTRUCTION + ' 原任务是否完整回答且所有实质性陈述有来源支持？'}}
+        for i, requirement in enumerate(requirements):
+            questions[f'coverage_{i+1}'] = {'type': 'choice', 'criteria': RESULT_CHOICES,
+                'instructions': REPORT_INSTRUCTION + ' 本题只核查这项要求：' + str(requirement)}
+        judged = self.decide(packet, questions, remaining_s=remaining_s)
+        answers = judged.get('answers', {})
+        for answer in answers.values():
+            # Even argmax mode must not turn a near tie into durable acceptance.
+            # Preserve raw probabilities and the configured selection policy.
+            if answer.get('label') in {'passed', 'failed'} and (
+                    answer.get('top_probability', 0) < .5 or answer.get('margin', 0) < self.config.margin):
+                answer.update(label='unknown', ambiguity_guard='文字验收选项接近，需独立语义复核')
+        coverage = [{'requirement': r, 'status': answers.get(f'coverage_{i+1}', {}).get('label', 'unknown')}
+                    for i, r in enumerate(requirements)]
+        coverage.append({'requirement': '全部回答与已观察来源一致，覆盖原始任务',
+                         'status': answers.get('step', {}).get('label', 'unknown')})
+        status = ('failed' if any(c['status'] == 'failed' for c in coverage) else
+                  'passed' if all(c['status'] == 'passed' for c in coverage) else 'unknown')
+        result = {'method': 'decision_model', 'status': status, 'step_outcome': status,
+                  'review_scope': 'text_report', 'coverage': coverage,
+                  'reason': {'passed': 'Jev 已核对文字结果与已观察来源，原始要求满足',
+                             'failed': 'Jev 文字核查发现内容或要求未满足，需修订正文或补充来源',
+                             'unknown': 'Jev 文字核查证据不足或选项接近，需要独立语义复核'}[status],
+                  'evidence': ['文字与来源快照 SHA256: ' + packet['evidence_digest']],
+                  'evidence_digest': packet['evidence_digest'], 'judgment': judged,
+                  'latency_ms': judged['latency_ms'], 'model_request_ms': judged['timing_ms']['request'],
+                  'model': judged['model'], 'model_based': True, 'reward_valid': False}
+        self.last_call.update(purpose='report_review', plan_step_id=step.get('id'),
+                              review_scope='text_report', review_result={k: result[k] for k in ('status', 'reason', 'coverage')})
+        return result
+
     def review(self, task, step, before, after, execution, code, *, remaining_s=None, checkpoints=()):
+        if code.get('report_review'):
+            return self.review_report(code['report_review'], step, remaining_s=remaining_s)
         review_started = time.monotonic()
         cli = bool((getattr(after, 'info', None) or {}).get('cli_result') or code.get('file_checks'))
         if after is None or (not cli and (after.screenshot is None or (after.info or {}).get('screenshot_stale'))):

@@ -197,7 +197,8 @@ class Pipeline:
             result = self._run(task, result)
             delivery = getattr(self, '_report_delivery', {})
             if delivery:
-                delivery['verification_status'] = 'passed' if result.success else 'not_passed'
+                delivery['verification_status'] = ('passed' if result.success else
+                    'unknown' if result.termination_reason == 'completion_inconclusive' else 'not_passed')
                 result.run_manifest['report_delivery'] = copy.deepcopy(delivery)
                 if delivery.get('text'):
                     result.final_answer = delivery['text']
@@ -265,7 +266,7 @@ class Pipeline:
         source_hash = hashlib.sha256()
         for name in ("pipeline.py", "pipeline_types.py", "pipeline_format.py", "plan_compiler.py", "knowledge_base.py", "knowledge_selection.py", "replanning.py", "run_metrics.py",
                      "model/grounding_usage.py", "model/grounding.py", "adapters/qwen_grounding.py", "adapters/uitars_grounding.py", "adapters/uivenus2_grounding.py",
-                     "planning_service.py", "phase_timing.py", "parallel_work.py", "download_review_scope.py", "settlement.py", "review_service.py", "progress_controller.py",
+                     "planning_service.py", "phase_timing.py", "parallel_work.py", "download_review_scope.py", "report_delivery.py", "report_review.py", "settlement.py", "review_service.py", "progress_controller.py",
                      "browser_interaction.py", "download_click_guard.py", "browser_profile.py", "persistent_chrome.py", "artifact_download.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
                      "execution_queue.py", "judge_evidence.py", "model/judge_selection.py", "step_verifier.py", "step_progress.py", "decision_context.py", "decision_modes.py", "browser_feedback.py", "paper_search.py", "scholar_search.py", "browser_results.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py", "desktop_readiness.py", "desktop_capture.py", "windows_text.py",
                      "adapters/windows_env.py", "adapters/vmware_env.py", "task_specs.py", "paper_sources.py", "paper_workflow.py", "paper_identity.py", "paper_resolver.py", "cli_executor.py", "adapters/cli_env.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
@@ -1500,6 +1501,16 @@ class Pipeline:
                 result.termination_reason = "evaluation_requested"
                 result.final_answer = execution.answer
                 should_break = True
+            elif (report_required and state.final_review_state.get('report', {}).get('review_scope') == 'text_report'
+                  and state.final_review_state.get('report', {}).get('status') == 'unknown'
+                  and state.final_review_state.get('report', {}).get('method') != 'code'):
+                result.termination_reason = 'completion_inconclusive'
+                result.final_answer = '正文与来源已保留，独立语义审查仍无法确认完成；停止对同一文字证据重复判断。'
+                should_break = True
+            elif report_required and state.final_review_state.get('repeated_unchanged'):
+                result.termination_reason = 'completion_inconclusive'
+                result.final_answer = '正文与来源已保留，但语义核查仍不确定；相同证据不再重复审查或重新浏览。'
+                should_break = True
             elif state.download_facts and state.final_review_state.get('repeated_unchanged'):
                 # A repeated finish request cannot create new evidence. Keep
                 # the file result explicit and stop an unchanged semantic
@@ -2217,13 +2228,16 @@ class Pipeline:
                 self._reviewed_download_facts, state.download_facts):
             self._model_final_report = None
             return False, '已接受验收所依据的下载文件丢失或改变，原成功结论失效'
-        fingerprint = self._finish_evidence_fingerprint(state.obs, state.download_facts)
+        from .report_review import text_only_task, delivery_digest
+        text_review = report_required and text_only_task(state.task, code)
+        fingerprint = (delivery_digest(state.task, state.report_delivery) if text_review else
+                       self._finish_evidence_fingerprint(state.obs, state.download_facts))
         previous = state.final_review_state
-        if (state.download_facts and previous.get('fingerprint') == fingerprint
+        if ((state.download_facts or text_review) and previous.get('fingerprint') == fingerprint
                 and previous.get('report', {}).get('status') == 'unknown'):
             previous['repeated_unchanged'] = True
             self._publish_diagnostic('finish_review_unchanged',
-                reason='下载收据与页面证据未变化，不重复模型验收或重新规划下载',
+                reason='文字与来源快照未变化，不重复验收或重新浏览' if text_review else '下载收据与页面证据未变化，不重复模型验收或重新规划下载',
                 download_facts=state.download_facts)
             return False, previous['report']['reason']
         state.final_review_state = {'repeated_unchanged': False}
@@ -2257,7 +2271,8 @@ class Pipeline:
         if receipt_scope:
             self._model_final_report['revalidation_scope'] = 'named_download_receipts'
             self._model_final_report['receipt_ids'] = receipt_scope
-        self._reviewed_observation = self._finish_evidence_fingerprint(state.obs, submitted_facts)
+        self._reviewed_observation = (delivery_digest(state.task, state.report_delivery) if text_review else
+                                      self._finish_evidence_fingerprint(state.obs, submitted_facts))
         state.final_review_state = {'fingerprint': self._reviewed_observation,
             'report': copy.deepcopy(reviewed), 'repeated_unchanged': False}
         return reviewed["status"] == "passed", reviewed["reason"]
@@ -2504,7 +2519,7 @@ class Pipeline:
         if not getattr(self.env, "evaluation_available", False):
             fresh = None
             fresh_applied = False
-            if self._model_final_report:
+            if self._model_final_report and self._model_final_report.get('review_scope') != 'text_report':
                 report, download_facts, fresh = self._parallel_final_snapshot()
                 # Final page predicates still require the newly captured page,
                 # even when a failed file proof prevents another model review.
@@ -2526,31 +2541,41 @@ class Pipeline:
             if model_report and self._model_review_allowed(report) and (report.get("status") != "passed" or getattr(self, "_report_required", False)):
                 # Observe again after callbacks; revoke/review if visible evidence changed.
                 state = self._reviewed_state
-                if fresh is None:
-                    fresh = self._observe()
-                if not fresh_applied:
-                    self.completion.observe(fresh)
-                    report = self.completion.evaluate()
-                if facts := self.completion.download_facts():
-                    report['download_facts'] = facts
-                if self._download_proof_invalidated(self._reviewed_download_facts, report.get('download_facts', [])):
-                    model_report = self._model_final_report = None
-                    report['reason'] = '补充最终观察时下载文件已丢失或改变，原成功结论失效'
-                elif not self._model_review_allowed(report):
-                    model_report = None
-                elif (model_report.get('revalidation_scope') == 'named_download_receipts'
-                      and set(model_report.get('receipt_ids', [])) == set(named_download_receipts(state.task, report.get('download_facts', [])))
-                      and report.get('download_facts', []) == self._reviewed_download_facts):
-                    # The original whole-task model review is retained, not promoted
-                    # to deterministic success. Code re-read the same file above.
-                    # Notification disappearance is unrelated to this durable result.
-                    self._publish_diagnostic('final_review_reused',
-                        reason='指定文件的收据与内容未变，复用已通过的整任务语义核查；文件仍由代码重新检查',
-                        receipt_ids=model_report['receipt_ids'])
-                elif self._finish_evidence_fingerprint(fresh, report.get('download_facts', [])) != self._reviewed_observation:
-                    state.obs = fresh
-                    confirmed, _ = self._verify_finish(state, "")
-                    model_report = self._model_final_report if confirmed else None
+                if model_report.get('review_scope') == 'text_report':
+                    from .report_review import delivery_digest
+                    if delivery_digest(state.task, state.report_delivery) != model_report.get('evidence_digest'):
+                        confirmed, _ = self._verify_finish(state, "")
+                        model_report = self._model_final_report if confirmed else None
+                    else:
+                        self._publish_diagnostic('final_review_reused',
+                            reason='文字正文与已观察来源快照未变，复用已通过的语义审查；动态页面变化不使文字交付失效',
+                            evidence_digest=model_report['evidence_digest'], review_scope='text_report')
+                else:
+                    if fresh is None:
+                        fresh = self._observe()
+                    if not fresh_applied:
+                        self.completion.observe(fresh)
+                        report = self.completion.evaluate()
+                    if facts := self.completion.download_facts():
+                        report['download_facts'] = facts
+                    if self._download_proof_invalidated(self._reviewed_download_facts, report.get('download_facts', [])):
+                        model_report = self._model_final_report = None
+                        report['reason'] = '补充最终观察时下载文件已丢失或改变，原成功结论失效'
+                    elif not self._model_review_allowed(report):
+                        model_report = None
+                    elif (model_report.get('revalidation_scope') == 'named_download_receipts'
+                          and set(model_report.get('receipt_ids', [])) == set(named_download_receipts(state.task, report.get('download_facts', [])))
+                          and report.get('download_facts', []) == self._reviewed_download_facts):
+                        # The original whole-task model review is retained, not promoted
+                        # to deterministic success. Code re-read the same file above.
+                        # Notification disappearance is unrelated to this durable result.
+                        self._publish_diagnostic('final_review_reused',
+                            reason='指定文件的收据与内容未变，复用已通过的整任务语义核查；文件仍由代码重新检查',
+                            receipt_ids=model_report['receipt_ids'])
+                    elif self._finish_evidence_fingerprint(fresh, report.get('download_facts', [])) != self._reviewed_observation:
+                        state.obs = fresh
+                        confirmed, _ = self._verify_finish(state, "")
+                        model_report = self._model_final_report if confirmed else None
                 if model_report:
                     result.success = True
                     result.evaluation_available = False

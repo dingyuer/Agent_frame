@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 def wants_report(task):
     # Literal content to write/type is data, not an extra report request.
     task = re.sub(r'(?:写入|输入|内容为)\s*[「“"](.*?)[」”"]', '', str(task), flags=re.S)
+    if re.search(r'(?:可以|能够|能)(?:做|干|用来做)什么|(?:网站|系统|平台|页面).{0,20}(?:用途|功能|能做什么)|\bwhat\s+can\b|\bwhat\s+(?:is|does)\b.{0,50}\b(?:for|do)\b', task, re.I):
+        return True
     return bool(re.search(r'(?:展示|给出|输出|显示|提供).{0,30}(?:表格|名单|名称|排名|分数|信息|结果)|(?:有哪些|都有哪些|哪些团队|哪些模型)|总结|汇总|对比|比较|分析|调研|列出|告诉我|整理.{0,12}(?:信息|结果|要点)|(?:生成|撰写|写一份).{0,8}报告|\b(?:summari[sz]e|compare|analy[sz]e|report on)\b', str(task), re.I))
 
 

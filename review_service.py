@@ -75,6 +75,17 @@ class ReviewService:
 
     def _review_visual(self, state, step, execution_info, code, identity, before=None):
         from .report_delivery import report_system_evidence
+        from .report_review import text_only_task, review_packet
+        text_review = (step.get('id') in {'whole_task', 'final'}
+                       and bool(getattr(state, 'report_delivery', None)) and text_only_task(state.task, code))
+        if text_review:
+            packet, error = review_packet(state.task, state.report_delivery)
+            if error:
+                report = {**identity, 'method': 'code', 'status': 'unknown', 'review_scope': 'text_report',
+                          'reason': error, 'evidence': []}
+                self._publish_review(report)
+                return report
+            code = {**code, 'report_review': packet}
         code = {**code, 'file_delivery_evidence': report_system_evidence(state),
                 'file_review_instruction': '写入成功只证明保存，不证明正文正确。对照真实读回正文、网页证据与用户要求核对名单及数量；总数与实际条目矛盾不能通过。读回是写入时快照，不代表之后未改变。'}
         if getattr(state, 'report_sources', None):
@@ -95,18 +106,20 @@ class ReviewService:
             return {**identity, **code}
         typed = None
         exclusive = self.decision_judge and self.decision_judge.config.review_mode == 'exclusive'
-        if self.decision_judge and (exclusive or step.get('id') not in {'whole_task', 'final'}):
-            self._publish_review({**identity, 'method': 'decision_model', 'status': 'running', 'reason': 'Decision 评估器正在核查动作前后证据'})
+        if self.decision_judge and (text_review or exclusive or step.get('id') not in {'whole_task', 'final'}):
+            self._publish_review({**identity, 'method': 'decision_model', 'status': 'running',
+                'reason': 'Jev 正在核对文字结果与已观察来源' if text_review else 'Decision 评估器正在核查动作前后证据'})
             typed = self.decision_judge.review(state.task, step, before, state.obs, execution_info, code,
                                                remaining_s=self._task_time_remaining(), checkpoints=state.judge_checkpoints)
             self._record_typed_judge()
-            if exclusive:
+            if exclusive and not text_review:
                 typed = self._recheck_jev(state, step, execution_info, code, typed, before, identity)
             self._publish_review({**identity, **typed})
             state.routing_hint['surface'] = typed.get('judgment', {}).get('answers', {}).get('surface', {})
-            if exclusive or typed['status'] in {'passed', 'failed'}:
+            if typed['status'] in {'passed', 'failed'} or (exclusive and not text_review):
                 return {**identity, **typed}
-        self._publish_review({**identity, "method": "model", "status": "running", "reason": "独立核查截图与补充证据"})
+        self._publish_review({**identity, "method": "model", "status": "running",
+            "reason": "独立文字审查：核对答案与来源，不重新操作网页" if text_review else "独立核查截图与补充证据"})
         previous = len(self.reviewer.calls)
         report = self.reviewer.visual_review(state.task, step, state.obs, execution_info, code,
                                              remaining_s=self._task_time_remaining())
@@ -116,5 +129,9 @@ class ReviewService:
         if typed:
             report['decision_judgment'] = typed
             report['latency_ms'] = round(report.get('latency_ms', 0) + typed.get('latency_ms', 0), 2)
+        if text_review:
+            report['review_scope'] = 'text_report'
+            report['evidence_digest'] = packet['evidence_digest']
+            report['coverage'] = [{'requirement': '核对文字回答的覆盖、来源和范围', 'status': report['status']}]
         self._publish_review(report)
         return report
