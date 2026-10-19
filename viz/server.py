@@ -20,6 +20,9 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel
 
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response
@@ -863,6 +866,30 @@ def _read_local_traj(run):
 async def local_traj(run: str):
     """返回某个本地运行的轨迹；磁盘扫描与解析在后台线程执行。"""
     return await asyncio.to_thread(_read_local_traj, run)
+
+
+class ResultFileAction(BaseModel):
+    run: str
+    artifact_id: str
+    operation: Literal['open', 'reveal']
+    scope: Literal['history', 'live'] = 'history'
+
+
+@app.post('/local/result-file')
+async def result_file_action(body: ResultFileAction):
+    from .result_files import open_download
+    if body.scope == 'live':
+        if body.run != _workbench_run:
+            return {'ok': False, 'error': '当前运行已切换，请从本机轨迹打开原任务。'}
+        outcome = next((p['record'].get('outcome', {}) for p in reversed(list(_workbench_cache.values()))
+                        if p.get('event') == 'workbench_record'
+                        and p.get('record', {}).get('event_type') == 'episode_end'), {})
+    else:
+        data = await asyncio.to_thread(_read_local_traj, body.run)
+        if not data.get('ok'):
+            return {'ok': False, 'error': '轨迹不存在，无法核实下载文件。'}
+        outcome = data.get('workbench', {}).get('outcome', {})
+    return await asyncio.to_thread(open_download, outcome, body.artifact_id, body.operation)
 
 
 @app.get("/local/shot")

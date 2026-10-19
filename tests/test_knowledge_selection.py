@@ -113,14 +113,20 @@ def test_pipeline_passes_selection_to_planner_and_reuses_snapshot_on_replan(monk
     assert received[1]==received[0]
 
 
-def test_selected_knowledge_reaches_actual_planner_prompt():
+@pytest.mark.parametrize('repair', [False, True])
+def test_selected_knowledge_reaches_actual_planner_prompt(repair):
     from test_planning_service import Model as Planner, VALID, state, service, accepting
-    model=Planner([VALID]);events=[];planner,record=service(model,events)
+    proposal = {**VALID, 'strategy_change': '旧公告入口失效，改从当前首页核实新的公告链接'} if repair else VALID
+    model=Planner([proposal]);events=[];planner,record=service(model,events)
     selection=select_knowledge('查询',snapshot(entry(),entry('off',enabled=False)))
-    assert planner.plan('查询',state(),{'checks':[]},[],[],{},accepting(events,record,[]),knowledge=selection)
+    current = state()
+    current.memory.failure_memory = ['旧公告入口返回 404']
+    assert planner.plan('查询',current,{'checks':[]},[],[],{},accepting(events,record,[]),knowledge=selection,repair=repair)
     prompt=model.calls[0][0][0]['content']
     assert 'https://campus.example.test' in prompt and '通知位于公告栏目' in prompt
     assert '"id": "off"' not in prompt
+    if repair:
+        assert '旧公告入口返回 404' in prompt and 'strategy_change' in prompt
 
 
 def test_failed_jev_batch_preserves_previous_calls_for_usage_accounting():

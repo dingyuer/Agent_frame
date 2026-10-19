@@ -114,3 +114,15 @@
 .wb-report-text hr{height:0;border:0;border-top:1px solid #e8ecf2;margin:18px 0}
 .wb-plan-history .wb-detail-body{padding:0 0 10px}.wb-plan-history .wb-unassigned{display:flex;gap:7px;align-items:center;min-width:0;font-size:12px}
 .wb-plan-history .wb-unassigned small{margin-left:auto;white-space:nowrap;font-size:10px;color:#8a94a1}
+
+.wb-result-files{margin-bottom:18px;border-bottom:1px solid var(--wb-line);padding-bottom:8px}
+.wb-result-files>header{font-size:13px;font-weight:600;display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}
+.wb-result-files>header small{font-size:11px;font-weight:400;color:#8290a3}
+.wb-result-file{padding:12px 0;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;border-bottom:1px solid #eef1f6}
+.wb-result-file>div{min-width:0;flex:1 1 200px;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline}
+.wb-result-file strong{font-size:13px;font-weight:500;overflow-wrap:anywhere}
+.wb-result-file small{font-size:11px;color:#8290a3}
+.wb-result-file span{flex-basis:100%;font-size:11px;color:#8290a3;overflow-wrap:anywhere}
+.wb-result-file nav{display:flex;gap:6px;flex-wrap:wrap}
+.wb-result-file nav button{font-size:12px;padding:5px 8px;color:#396ee6;background:#f6f8ff;border-color:#e5ebf7;white-space:nowrap}
+.wb-file-message{font-size:12px;line-height:1.6;color:#65748b;margin:8px 0;overflow-wrap:anywhere}.wb-file-message:empty{display:none}
